@@ -92,6 +92,7 @@ func run(log *slog.Logger) error {
 		Concurrency:    envInt("CARTESIA_CONCURRENCY", 2),
 		DailyChars:     envLimit("DAILY_CHAR_LIMIT", 2000),
 		DailyAudioSecs: envLimit("DAILY_TRANSCRIBE_MINUTES", 10) * 60,
+		DailyCreations: envLimit("DAILY_VOICE_CREATIONS", 3),
 	}, log)
 	log.Info("Ellie Studio starting", "cartesia_version", cartesia.APIVersion, "default_voice", store.Defaults().VoiceName)
 	return b.Run(ctx)

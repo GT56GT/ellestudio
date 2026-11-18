@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"html"
 	"mime"
+	"net/url"
 	"strings"
 	"time"
 
@@ -111,14 +112,15 @@ func (b *Bot) voicesScreen(ctx context.Context, uid int64, s *browseSession) scr
 
 	var visible []cartesia.Voice
 	for _, v := range res.Data {
-		if b.canUseVoice(uid, v) {
+		if b.canList(uid, v) && (!owned || b.isAdmin(uid) || isMine(uid, v)) {
 			visible = append(visible, v)
 		}
 	}
 	k := &keys{}
 	switch {
-	case len(visible) == 0 && owned && !b.isAdmin(uid):
-		sb.WriteString("You haven't created any voices yet. Voices other people create stay private to them.")
+	case len(visible) == 0 && owned && !b.isAdmin(uid) && !hasNext:
+		sb.WriteString("You haven't created any voices yet.\nClone your own voice in a minute, then share it with anyone using its link.")
+		k.row(btn(icCreate+" Clone a voice", "do:clone"))
 	case len(visible) == 0 && hasNext:
 		sb.WriteString("Nothing to show on this page. Tap Next ▶ to keep looking.")
 	case len(visible) == 0:
@@ -129,7 +131,7 @@ func (b *Bot) voicesScreen(ctx context.Context, uid int64, s *browseSession) scr
 		if v.Tagline != "" {
 			sb.WriteString(" — " + html.EscapeString(v.Tagline))
 		}
-		sb.WriteString("\n<i>" + html.EscapeString(voiceFacts(v)) + "</i>\n\n")
+		sb.WriteString("\n<i>" + html.EscapeString(voiceFacts(v, isMine(uid, v))) + "</i>\n\n")
 		if len("vc:"+v.ID) > 64 {
 			continue
 		}
@@ -147,21 +149,19 @@ func (b *Bot) voicesScreen(ctx context.Context, uid int64, s *browseSession) scr
 		btn(mark("All", gender == ""), "vf:all"),
 		btn(mark("♀", gender == "feminine"), "vf:feminine"),
 		btn(mark("♂", gender == "masculine"), "vf:masculine"),
-		btn(mark("Mine", owned), "vm"),
+		btn(mark("🗂 Mine", owned), "vm"),
 	)
-	search := btn("🔍 Search", "do:search")
+	k.row(btn("🔍 Search", "do:search"), btn("🔑 Voice ID", "do:voiceid"))
 	if query != "" {
-		k.row(search, btn(icCancel+" Clear search", "vq"))
+		k.row(btn(icCancel+" Clear search", "vq"))
 	} else if cur.VoiceID != "" {
-		k.row(search, btn("ℹ️ About "+truncate(orDefault(cur.VoiceName, "my voice"), 14), "vc:"+cur.VoiceID))
-	} else {
-		k.row(search)
+		k.row(btn("ℹ️ About "+truncate(orDefault(cur.VoiceName, "my voice"), 20), "vc:"+cur.VoiceID))
 	}
 	k.nav("", "")
 	return screen{strings.TrimRight(sb.String(), "\n"), k.build()}
 }
 
-func voiceFacts(v cartesia.Voice) string {
+func voiceFacts(v cartesia.Voice, mine bool) string {
 	var f []string
 	if v.Language != "" {
 		f = append(f, v.Language)
@@ -175,8 +175,11 @@ func voiceFacts(v cartesia.Voice) string {
 	if v.IsPro {
 		f = append(f, "pro clone")
 	}
-	if v.IsOwner {
+	switch {
+	case mine:
 		f = append(f, "yours")
+	case v.IsOwner:
+		f = append(f, "shared with you")
 	}
 	return strings.Join(f, " · ")
 }
@@ -220,9 +223,6 @@ func (b *Bot) selectVoice(ctx context.Context, uid int64, id string) (*cartesia.
 	if err != nil {
 		return nil, err
 	}
-	if !b.canUseVoice(uid, *v) {
-		return nil, errPrivateVoice
-	}
 	if _, err := b.store.Update(uid, func(s *Settings) { s.VoiceID, s.VoiceName = v.ID, v.Name }); err != nil {
 		return nil, err
 	}
@@ -230,7 +230,7 @@ func (b *Bot) selectVoice(ctx context.Context, uid int64, id string) (*cartesia.
 }
 
 func voiceChosenScreen(v *cartesia.Voice) screen {
-	text := header(icOK, "Now speaking as "+v.Name, voiceFacts(*v)) + "Send any text to hear it, or try a sample."
+	text := header(icOK, "Now speaking as "+v.Name, voiceFacts(*v, false)) + "Send any text to hear it, or try a sample."
 	k := (&keys{}).
 		row(btn(icPlay+" Hear a sample", "do:sample"), btn(icStyle+" Style", "nav:style")).
 		nav("Voices", "nav:voices")
@@ -267,13 +267,14 @@ func (b *Bot) voiceCard(ctx context.Context, uid int64, id string) screen {
 	if err != nil {
 		return errorScreen(err)
 	}
-	if !b.canUseVoice(uid, *v) {
-		return errorScreen(errPrivateVoice)
-	}
 	current := b.store.Get(uid).VoiceID == v.ID
-	text := voiceDetails(v)
-	if current {
+	mine := isMine(uid, *v)
+	text := voiceDetails(v, mine)
+	switch {
+	case current:
 		text += "\n" + icOK + " <i>This is your current voice.</i>"
+	case v.IsOwner && !mine:
+		text += "\n🔗 <i>Someone shared this voice with you. It isn't listed in anyone's library.</i>"
 	}
 	k := &keys{}
 	if current {
@@ -281,12 +282,8 @@ func (b *Bot) voiceCard(ctx context.Context, uid int64, id string) screen {
 	} else {
 		k.row(btn(icOK+" Use this voice", "v:"+v.ID), btn("🔊 Preview", "p:"+v.ID))
 	}
-	if b.isAdmin(uid) {
-		if v.IsOwner && current {
-			k.row(btn("✏️ Rename", "do:rename"), btn("🗑 Delete", "dv:"+v.ID))
-		} else if v.IsOwner {
-			k.row(btn("🗑 Delete", "dv:"+v.ID))
-		}
+	if b.canManage(uid, *v) {
+		k.row(btn("🔗 Share", "sh:"+v.ID), btn("✏️ Rename", "rn:"+v.ID), btn("🗑 Delete", "dv:"+v.ID))
 		if current {
 			k.row(btn(icLocalize+" Localize into another accent", "nav:localize"))
 		}
@@ -295,13 +292,13 @@ func (b *Bot) voiceCard(ctx context.Context, uid int64, id string) screen {
 	return screen{text, k.build()}
 }
 
-func voiceDetails(v *cartesia.Voice) string {
+func voiceDetails(v *cartesia.Voice, mine bool) string {
 	var sb strings.Builder
 	sb.WriteString(header(icStudio, v.Name, v.Tagline))
 	if d := cleanDescription(v.Description); d != "" {
 		sb.WriteString(html.EscapeString(truncate(d, 400)) + "\n\n")
 	}
-	if f := voiceFacts(*v); f != "" {
+	if f := voiceFacts(*v, mine); f != "" {
 		sb.WriteString(html.EscapeString(f) + "\n")
 	}
 	if len(v.Accents) > 0 {
@@ -327,10 +324,6 @@ func (b *Bot) sendPreview(ctx context.Context, uid, chatID, replyTo int64, id st
 	v, err := b.ct.GetVoice(ctx, id, true)
 	if err != nil {
 		b.sendScreen(ctx, chatID, replyTo, errorScreen(err))
-		return
-	}
-	if !b.canUseVoice(uid, *v) {
-		b.sendScreen(ctx, chatID, replyTo, errorScreen(errPrivateVoice))
 		return
 	}
 	if v.PreviewFileURL == "" {
@@ -416,9 +409,6 @@ func (b *Bot) replyHTMLLines(ctx context.Context, m *telegram.Message, lines []s
 // ---------------------------------------------------------------- localize
 
 func (b *Bot) localizeScreen(ctx context.Context, uid int64) screen {
-	if !b.isAdmin(uid) {
-		return b.createScreen(uid)
-	}
 	s := b.store.Get(uid)
 	if s.VoiceID == "" {
 		return noVoiceScreen()
@@ -426,6 +416,12 @@ func (b *Bot) localizeScreen(ctx context.Context, uid int64) screen {
 	v, err := b.ct.GetVoice(ctx, s.VoiceID, false)
 	if err != nil {
 		return errorScreen(err)
+	}
+	if !b.canManage(uid, *v) {
+		return screen{header(icLocalize, "Localize a voice", "") +
+			"You can localize voices you created. <b>" + html.EscapeString(v.Name) + "</b> isn't one of them.\n\n" +
+			"Clone your own voice first, then make it sound native in another accent.",
+			(&keys{}).row(btn(icCreate+" Clone a voice", "do:clone")).nav("Create", "nav:create").build()}
 	}
 	accents, err := b.ct.ListAccents(ctx, cartesia.AccentFilter{LocalizableOnly: true, Language: v.Language})
 	if err != nil {
@@ -454,17 +450,27 @@ func (b *Bot) localizeScreen(ctx context.Context, uid int64) screen {
 // message that is redrawn with the progress and then the result.
 func (b *Bot) runLocalize(ctx context.Context, uid int64, target *telegram.Message, accent string) {
 	draw := func(s screen) { b.editHTML(ctx, target, s.text, s.kb) }
-	if !b.isAdmin(uid) {
-		draw(b.createScreen(uid))
-		return
-	}
 	s := b.store.Get(uid)
 	if s.VoiceID == "" {
 		draw(noVoiceScreen())
 		return
 	}
+	src, err := b.ct.GetVoice(ctx, s.VoiceID, false)
+	if err != nil {
+		draw(errorScreen(err))
+		return
+	}
+	if !b.canManage(uid, *src) {
+		draw(errorScreen(errNotYourVoice))
+		return
+	}
+	if ok, ls := b.spendMake(uid); !ok {
+		draw(ls)
+		return
+	}
 	draw(screen{header(icWait, "Localizing "+orDefault(s.VoiceName, "your voice"), "") + "This usually takes 10–30 seconds.", nil})
 	if !b.acquire(ctx) {
+		b.refundMake(uid)
 		return
 	}
 	tctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
@@ -475,29 +481,68 @@ func (b *Bot) runLocalize(ctx context.Context, uid int64, target *telegram.Messa
 	cancel()
 	b.release()
 	if err != nil {
+		b.refundMake(uid)
 		draw(errorScreen(err))
 		return
 	}
 	if _, err := b.store.Update(uid, func(st *Settings) { st.VoiceID, st.VoiceName = v.ID, v.Name }); err != nil {
 		b.log.Warn("save settings", "err", err)
 	}
-	draw(createdScreen(icLocalize, v.Name, v.ID))
+	draw(b.createdScreen(icLocalize, v.Name, v.ID))
 }
 
 // createdScreen confirms a new voice (clone or localize).
-func createdScreen(icon, name, id string) screen {
+func (b *Bot) createdScreen(icon, name, id string) screen {
 	text := header(icon, name+" is ready", "It's now your current voice") +
-		"ID: <code>" + html.EscapeString(id) + "</code>\n\nSend any text to hear it."
-	k := (&keys{}).row(btn(icPlay+" Hear a sample", "do:sample"), btn(icStyle+" Style", "nav:style")).nav("", "")
+		"Send any text to hear it.\n\n" +
+		"🔒 Only you see it in your library.\n🔗 Anyone you give its link or ID can use it:\n" +
+		"<code>" + html.EscapeString(id) + "</code>"
+	k := (&keys{}).
+		row(btn(icPlay+" Hear a sample", "do:sample"), btn("🔗 Share", "sh:"+id)).
+		row(btn("🗂 My voices", "do:mine"), btn(icStyle+" Style", "nav:style")).
+		nav("", "")
 	return screen{text, k.build()}
+}
+
+// ---------------------------------------------------------------- share
+
+// shareScreen gives the creator a tap-to-open link and the raw voice ID.
+func (b *Bot) shareScreen(ctx context.Context, uid int64, id string) screen {
+	v, err := b.ct.GetVoice(ctx, id, false)
+	if err != nil {
+		return errorScreen(err)
+	}
+	if !b.canManage(uid, *v) {
+		return errorScreen(errNotYourVoice)
+	}
+	link := b.shareLink(v.ID)
+	text := header("🔗", "Share "+v.Name, "Anyone with this link or ID can use the voice") +
+		"<b>Link</b> (opens Ellie on this voice):\n" + html.EscapeString(link) + "\n\n" +
+		"<b>Voice ID</b> (paste it into Ellie):\n<code>" + html.EscapeString(v.ID) + "</code>\n\n" +
+		"<i>It still won't appear in anyone's library, and only you can rename or delete it.</i>"
+	share := "https://t.me/share/url?url=" + url.QueryEscape(link) +
+		"&text=" + url.QueryEscape("🎙 Try my voice \""+v.Name+"\" in Ellie Studio")
+	k := (&keys{}).
+		row(telegram.InlineKeyboardButton{Text: "📤 Send to a friend", URL: share}).
+		nav("Voice", "vc:"+v.ID)
+	return screen{text, k.build()}
+}
+
+// openVoiceRef shows the card for a voice someone pasted or linked.
+func (b *Bot) openVoiceRef(ctx context.Context, chatID, replyTo, uid int64, id string) {
+	s := b.voiceCard(ctx, uid, id)
+	b.sendScreen(ctx, chatID, replyTo, s)
 }
 
 // ---------------------------------------------------------------- rename / delete
 
 func (b *Bot) renameVoice(ctx context.Context, m *telegram.Message, id, name string) {
-	if !b.isAdmin(m.From.ID) {
-		s := noticeScreen(icLock, "Rename voice", "Only studio admins can rename voices.")
-		b.replyHTML(ctx, m, s.text, s.kb)
+	cur, err := b.ct.GetVoice(ctx, id, false)
+	if err == nil && !b.canManage(m.From.ID, *cur) {
+		err = errNotYourVoice
+	}
+	if err != nil {
+		b.fail(ctx, m, "rename", err)
 		return
 	}
 	v, err := b.ct.UpdateVoice(ctx, id, cartesia.UpdateVoiceRequest{Name: strings.TrimSpace(name)})
@@ -518,15 +563,12 @@ func (b *Bot) renameVoice(ctx context.Context, m *telegram.Message, id, name str
 }
 
 func (b *Bot) deleteConfirmScreen(ctx context.Context, uid int64, id string) screen {
-	if !b.isAdmin(uid) {
-		return noticeScreen(icLock, "Delete voice", "Only studio admins can delete voices.")
-	}
 	v, err := b.ct.GetVoice(ctx, id, false)
 	if err != nil {
 		return errorScreen(err)
 	}
-	if !v.IsOwner {
-		return screen{header("🗑", "Can't delete "+v.Name, "") + "You can only delete voices your studio created.",
+	if !b.canManage(uid, *v) {
+		return screen{header("🗑", "Can't delete "+v.Name, "") + "You can only delete voices you created.",
 			(&keys{}).nav("Voice", "vc:"+v.ID).build()}
 	}
 	text := header("🗑", "Delete "+v.Name+"?", "") + "This removes the voice for good. It can't be undone."
@@ -535,11 +577,14 @@ func (b *Bot) deleteConfirmScreen(ctx context.Context, uid int64, id string) scr
 }
 
 func (b *Bot) deleteVoice(ctx context.Context, q *telegram.CallbackQuery, id string) {
-	if !b.isAdmin(q.From.ID) {
-		_ = b.tg.AnswerCallbackQuery(ctx, q.ID, "Only studio admins can delete voices.")
-		return
+	v, err := b.ct.GetVoice(ctx, id, false)
+	if err == nil && !b.canManage(q.From.ID, *v) {
+		err = errNotYourVoice
 	}
-	if err := b.ct.DeleteVoice(ctx, id); err != nil {
+	if err == nil {
+		err = b.ct.DeleteVoice(ctx, id)
+	}
+	if err != nil {
 		_ = b.tg.AnswerCallbackQuery(ctx, q.ID, "Delete failed")
 		b.show(ctx, q, errorScreen(err))
 		return

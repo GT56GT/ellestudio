@@ -27,11 +27,12 @@ type Settings struct {
 	UsageDay  string `json:"usage_day,omitempty"`
 	UsedChars int    `json:"used_chars,omitempty"`
 	UsedSecs  int    `json:"used_secs,omitempty"`
+	UsedMakes int    `json:"used_makes,omitempty"` // voices created today
 }
 
 // Usage is what a user has spent today.
 type Usage struct {
-	Chars, Secs int
+	Chars, Secs, Makes int
 }
 
 // usageToday returns v's usage for day, treating an older day as zero.
@@ -39,7 +40,7 @@ func usageToday(v Settings, day string) Usage {
 	if v.UsageDay != day {
 		return Usage{}
 	}
-	return Usage{v.UsedChars, v.UsedSecs}
+	return Usage{v.UsedChars, v.UsedSecs, v.UsedMakes}
 }
 
 // Spend atomically adds chars and secs to a user's usage for day, unless that
@@ -56,7 +57,7 @@ func (s *Store) Spend(uid int64, day string, chars, secs, charLimit, secLimit in
 	}
 	u.Chars += chars
 	u.Secs += secs
-	v.UsageDay, v.UsedChars, v.UsedSecs = day, u.Chars, u.Secs
+	v.UsageDay, v.UsedChars, v.UsedSecs, v.UsedMakes = day, u.Chars, u.Secs, u.Makes
 	s.data[uid] = v
 	return true, u, s.saveLocked()
 }
@@ -73,6 +74,33 @@ func (s *Store) Refund(uid int64, day string, chars, secs int) {
 	v.UsedSecs = max(0, v.UsedSecs-secs)
 	s.data[uid] = v
 	_ = s.saveLocked()
+}
+
+// SpendMake records one new voice for day unless that would pass limit
+// (0 = unlimited). It returns whether it was recorded and today's usage.
+func (s *Store) SpendMake(uid int64, day string, limit int) (bool, Usage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v := s.data[uid]
+	u := usageToday(v, day)
+	if limit > 0 && u.Makes+1 > limit {
+		return false, u, nil
+	}
+	u.Makes++
+	v.UsageDay, v.UsedChars, v.UsedSecs, v.UsedMakes = day, u.Chars, u.Secs, u.Makes
+	s.data[uid] = v
+	return true, u, s.saveLocked()
+}
+
+// RefundMake gives back a SpendMake (the creation failed).
+func (s *Store) RefundMake(uid int64, day string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if v, ok := s.data[uid]; ok && v.UsageDay == day && v.UsedMakes > 0 {
+		v.UsedMakes--
+		s.data[uid] = v
+		_ = s.saveLocked()
+	}
 }
 
 // UsageOn reports a user's usage for day.
@@ -173,7 +201,7 @@ func (s *Store) Reset(uid int64) error {
 	if !ok {
 		return nil
 	}
-	s.data[uid] = Settings{UsageDay: old.UsageDay, UsedChars: old.UsedChars, UsedSecs: old.UsedSecs}
+	s.data[uid] = Settings{UsageDay: old.UsageDay, UsedChars: old.UsedChars, UsedSecs: old.UsedSecs, UsedMakes: old.UsedMakes}
 	return s.saveLocked()
 }
 

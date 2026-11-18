@@ -323,18 +323,19 @@ func resetScreen() screen {
 }
 
 func (b *Bot) createScreen(uid int64) screen {
-	if !b.isAdmin(uid) {
-		text := header(icCreate, "Create", "") + icLock + " Creating and changing voices is limited to studio admins."
-		return screen{text, (&keys{}).nav("", "").build()}
-	}
-	s := b.store.Get(uid)
 	text := header(icCreate, "Create", "Make voices of your own") +
 		"🧬 <b>Clone</b> a voice from a short recording.\n" +
-		"🌍 <b>Localize</b> " + html.EscapeString(orDefault(s.VoiceName, "your voice")) + " into another accent.\n" +
-		"📖 <b>Pronunciation</b> teaches me how to say names and brands."
+		"🌍 <b>Localize</b> a voice you made into another accent.\n" +
+		"📖 <b>Pronunciation</b> teaches me how to say names and brands.\n\n" +
+		"🔒 What you make shows up only in <b>your</b> library.\n" +
+		"🔗 To let someone else use a voice, tap <b>Share</b> on it and send them the link or ID."
+	if !b.isAdmin(uid) && b.cfg.DailyCreations > 0 {
+		left := max(0, b.cfg.DailyCreations-b.store.UsageOn(uid, today()).Makes)
+		text += fmt.Sprintf("\n\n🎟 New voices left today: <b>%d of %d</b>", left, b.cfg.DailyCreations)
+	}
 	k := (&keys{}).
 		row(btn(icCreate+" Clone a voice", "do:clone"), btn(icLocalize+" Localize voice", "nav:localize")).
-		row(btn(icDict+" New dictionary", "do:newdict")).
+		row(btn("🗂 My voices", "do:mine"), btn(icDict+" New dictionary", "do:newdict")).
 		nav("", "")
 	return screen{text, k.build()}
 }
@@ -356,14 +357,19 @@ Everyone gets a daily allowance of speech and transcription. See what's left in 
 • Tap a name to use that voice
 • Tap 🔊 to hear a free preview first
 • Filter by ♀ / ♂, or 🔍 search by name or mood
-• "Mine" shows voices you created`},
+• 🗂 <b>Mine</b> shows voices you created (only you see them)
+• 🔑 <b>Voice ID</b> opens a voice someone shared with you. You can also just paste the ID or link into the chat.`},
 	{"listen", icListen + " Transcribing", "Transcribing", `Send a voice note, audio file or video note and I'll write it down.
 
 Set your language in 🎛 Style → 🌐 Language for the best accuracy.
 Under each transcript, 🔊 <b>Read aloud</b> speaks it back in your voice.`},
-	{"create", icCreate + " Cloning", "Cloning", `🧬 Create → Clone a voice:
+	{"create", icCreate + " Cloning & sharing", "Cloning & sharing", `🧬 Create → Clone a voice:
 1. Send a clean 5–15 second recording of one person
 2. Give the voice a name
+
+Your new voice appears only in <b>your</b> library (🎧 Voices → 🗂 Mine).
+
+<b>Sharing:</b> open the voice and tap 🔗 <b>Share</b>. Anyone you send the link or voice ID to can use it, but it never shows up in anyone else's library, and only you can rename or delete it.
 
 Use a quiet room and natural speech. Only clone voices you have permission to use.`},
 	{"commands", "⌨️ Commands", "Commands", `Everything has a button, but if you like typing:
@@ -371,6 +377,7 @@ Use a quiet room and natural speech. Only clone voices you have permission to us
 /menu home screen · /voices [search] · /style
 /emotion [name] · /speed 1.1 · /volume 1.2 · /lang fr
 /say text · /transcribe (reply to audio) · /clone name
+/voice ID-or-link opens a shared voice · /myvoices
 /accents · /localize accent · /rename name
 /dicts · /newdict · /detect · /status · /usage
 /cancel stops whatever you're in the middle of`},

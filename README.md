@@ -35,7 +35,10 @@ Leave `ALLOWED_USER_IDS` empty and keep your own ID in `ADMIN_USER_IDS`. Then:
 
 - Each user gets a **daily allowance**: `DAILY_CHAR_LIMIT` characters of speech (default 2,000) and `DAILY_TRANSCRIBE_MINUTES` minutes of transcription and watermark checks (default 10). It resets at midnight UTC. Users see what's left in ⚙️ Studio, and a friendly screen tells them when it refreshes. Failed requests are refunded. Resetting settings doesn't refill it. Admins are unlimited.
 - Each user runs **one request at a time**, so nobody can tie up the shared Cartesia slots.
-- Cloning, localizing, renaming and deleting voices, creating dictionaries, and usage stay **admin-only**.
+- **Everyone can clone** (and localize their own voices), up to `DAILY_VOICE_CREATIONS` new voices a day (default 3). Anyone can create pronunciation dictionaries.
+- **Voices are unlisted, and the ID is the key.** Your library shows Cartesia's public voices plus voices *you* made, never anyone else's. To share one, open it and tap 🔗 **Share**. You get a link (`t.me/EllieStudioBot?start=v_<id>`) and the voice ID. Whoever has either can use the voice: tapping the link, pasting it, or pasting the ID opens the voice right away.
+- **Only the creator** (or an admin) can rename, delete, localize or share a voice. Ownership is a tag in the voice's Cartesia description, so it survives redeploys.
+- Usage stays admin-only.
 
 ## What it does
 

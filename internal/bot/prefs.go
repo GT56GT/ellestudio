@@ -17,8 +17,11 @@ var localeRe = regexp.MustCompile(`^[a-zA-Z]{2,3}(-[a-zA-Z]{2,4})?$`)
 
 // ---------------------------------------------------------------- welcome
 
-func (b *Bot) welcome(ctx context.Context, m *telegram.Message) {
+// welcome greets the user, pins the menu, then shows Home — or, when they
+// arrived through a share link (/start v_<id>), the shared voice.
+func (b *Bot) welcome(ctx context.Context, m *telegram.Message, startArg string) {
 	uid := m.From.ID
+	sharedID, shared := parseVoiceRef(startArg)
 	name := html.EscapeString(orDefault(m.From.FirstName, "there"))
 	var text string
 	if !b.store.Known(uid) {
@@ -27,6 +30,10 @@ func (b *Bot) welcome(ctx context.Context, m *telegram.Message) {
 			"2️⃣ <b>Send a voice note</b> and I'll write it down\n" +
 			"3️⃣ <b>Use the menu below</b> to change voice and style anytime\n\n" +
 			"Start with ▶️ <b>Hear a sample</b> on the card below."
+		if shared {
+			text = "👋 <b>Hi " + name + ", I'm Ellie!</b>\nSomeone shared a voice with you. It's on the card below: " +
+				"tap <b>✅ Use this voice</b>, then send me any text to hear it."
+		}
 		if _, err := b.store.Update(uid, func(*Settings) {}); err != nil {
 			b.log.Warn("save settings", "err", err)
 		}
@@ -37,6 +44,10 @@ func (b *Bot) welcome(ctx context.Context, m *telegram.Message) {
 		ChatID: m.Chat.ID, Text: text, ParseMode: "HTML", ReplyMarkup: menuKeyboard(),
 	}); err != nil {
 		b.log.Warn("sendMessage failed", "err", err)
+	}
+	if shared {
+		b.sendScreen(ctx, m.Chat.ID, 0, b.voiceCard(ctx, uid, sharedID))
+		return
 	}
 	b.sendScreen(ctx, m.Chat.ID, 0, b.homeScreen(uid))
 }
@@ -55,7 +66,7 @@ func (b *Bot) command(ctx context.Context, m *telegram.Message, cmd, args string
 
 	switch cmd {
 	case "start":
-		b.welcome(ctx, m)
+		b.welcome(ctx, m, args)
 	case "menu", "home":
 		send(b.homeScreen(uid))
 	case "help":
@@ -72,6 +83,9 @@ func (b *Bot) command(ctx context.Context, m *telegram.Message, cmd, args string
 		owned := true
 		b.openVoices(ctx, chat, uid, args, &owned)
 	case "voice":
+		if id, ok := parseVoiceRef(args); ok {
+			args = id
+		}
 		if args != "" {
 			v, err := b.selectVoice(ctx, uid, args)
 			if err != nil {
@@ -161,10 +175,6 @@ func (b *Bot) command(ctx context.Context, m *telegram.Message, cmd, args string
 	case "dicts":
 		send(b.dictsScreen(ctx, uid))
 	case "newdict":
-		if !b.isAdmin(uid) {
-			send(b.createScreen(uid))
-			return
-		}
 		if args == "" {
 			b.startFlow(ctx, chat, uid, flowDictName)
 			return
@@ -359,9 +369,7 @@ func (b *Bot) dictsScreen(ctx context.Context, uid int64) screen {
 		}
 	}
 	k.row(btn(mark("🚫 No dictionary", cur == ""), "d:-"))
-	if b.isAdmin(uid) {
-		k.row(btn(icDict+" New dictionary", "do:newdict"))
-	}
+	k.row(btn(icDict+" New dictionary", "do:newdict"))
 	k.nav("", "")
 	return screen{text, k.build()}
 }
@@ -480,7 +488,7 @@ func (b *Bot) handleCallback(ctx context.Context, q *telegram.CallbackQuery) {
 	ack := func(text string) { _ = b.tg.AnswerCallbackQuery(ctx, q.ID, text) }
 	// Any button other than Cancel or one that starts a guided step leaves
 	// the step, so a later text message is never mistaken for its answer.
-	if kind != "cancel" && !(kind == "do" && contains([]string{"search", "clone", "newdict", "rename"}, val)) {
+	if kind != "cancel" && !(kind == "do" && contains([]string{"search", "clone", "newdict", "rename", "voiceid"}, val)) {
 		b.clearFlow(uid)
 	}
 	// as is a message stand-in so speech handlers can answer in this chat.
@@ -510,6 +518,12 @@ func (b *Bot) handleCallback(ctx context.Context, q *telegram.CallbackQuery) {
 		b.show(ctx, q, b.deleteConfirmScreen(ctx, uid, val))
 	case "dvy":
 		b.deleteVoice(ctx, q, val)
+	case "sh":
+		ack("")
+		b.show(ctx, q, b.shareScreen(ctx, uid, val))
+	case "rn":
+		ack("")
+		b.startRename(ctx, q.Message.Chat.ID, uid, val)
 	case "loc":
 		ack("Creating your localized voice…")
 		if q.Message.Text == "" { // pressed under audio: draw into a fresh message
@@ -689,6 +703,13 @@ func (b *Bot) action(ctx context.Context, q *telegram.CallbackQuery, as *telegra
 	case "rename":
 		ack("")
 		b.startFlow(ctx, chat, uid, flowRename)
+	case "voiceid":
+		ack("")
+		b.startFlow(ctx, chat, uid, flowVoiceID)
+	case "mine":
+		ack("")
+		owned := true
+		b.openVoices(ctx, chat, uid, "", &owned)
 	default:
 		ack("")
 	}

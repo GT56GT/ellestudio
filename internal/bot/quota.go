@@ -47,7 +47,31 @@ func fmtMinutes(secs int) string {
 }
 
 func (b *Bot) limited(uid int64) bool {
-	return !b.isAdmin(uid) && (b.cfg.DailyChars > 0 || b.cfg.DailyAudioSecs > 0)
+	return !b.isAdmin(uid) && (b.cfg.DailyChars > 0 || b.cfg.DailyAudioSecs > 0 || b.cfg.DailyCreations > 0)
+}
+
+// spendMake reserves one voice creation; on refusal it returns the screen.
+func (b *Bot) spendMake(uid int64) (bool, screen) {
+	if b.isAdmin(uid) {
+		return true, screen{}
+	}
+	ok, u, err := b.store.SpendMake(uid, today(), b.cfg.DailyCreations)
+	if err != nil {
+		b.log.Warn("save usage", "err", err)
+	}
+	if ok {
+		return true, screen{}
+	}
+	body := fmt.Sprintf("You've created <b>%d</b> of your <b>%d</b> voices for today.", u.Makes, b.cfg.DailyCreations) +
+		"\n\n🔄 You can make more in <b>" + fmtWait(untilReset()) + "</b> (midnight UTC). Your existing voices still work."
+	k := (&keys{}).row(btn("🗂 My voices", "do:mine")).nav("", "")
+	return false, screen{header("🎟", "Daily voice limit reached", "") + body, k.build()}
+}
+
+func (b *Bot) refundMake(uid int64) {
+	if !b.isAdmin(uid) {
+		b.store.RefundMake(uid, today())
+	}
 }
 
 // spendChars reserves n spoken characters; false means over the allowance.
@@ -92,6 +116,9 @@ func (b *Bot) allowanceLines(uid int64) string {
 	}
 	if b.cfg.DailyAudioSecs > 0 {
 		out += field("🎟", "Transcription left today", fmtMinutes(max(0, b.cfg.DailyAudioSecs-u.Secs))+" of "+fmtMinutes(b.cfg.DailyAudioSecs))
+	}
+	if b.cfg.DailyCreations > 0 {
+		out += field("🎟", "New voices left today", strconv.Itoa(max(0, b.cfg.DailyCreations-u.Makes))+" of "+strconv.Itoa(b.cfg.DailyCreations))
 	}
 	return out
 }

@@ -40,6 +40,9 @@ type Config struct {
 	// DailyAudioSecs caps seconds of audio transcribed or checked per user
 	// per UTC day (0 = unlimited). Admins are exempt from both.
 	DailyAudioSecs int
+	// DailyCreations caps new voices (clones + localizations) per user per
+	// UTC day (0 = unlimited). Admins are exempt.
+	DailyCreations int
 }
 
 // Bot is the running studio.
@@ -59,6 +62,7 @@ type Bot struct {
 	flows    map[int64]*flow   // guided steps in progress
 	recent   map[int64]*recent // last spoken text / transcript, for Again and Read aloud
 	busy     map[int64]bool    // users with a Cartesia job running
+	username string            // the bot's @username, for share links
 }
 
 // recent remembers what a user last heard or transcribed.
@@ -122,6 +126,7 @@ func (b *Bot) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("telegram getMe (check TELEGRAM_BOT_TOKEN): %w", err)
 	}
+	b.username = me.Username
 	b.log.Info("connected to Telegram", "bot", "@"+me.Username)
 	if err := b.tg.SetMyCommands(ctx, Commands); err != nil {
 		b.log.Warn("setMyCommands failed", "err", err)

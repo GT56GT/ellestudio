@@ -387,15 +387,6 @@ func TestPrivateStudioRejectsStrangers(t *testing.T) {
 	}
 }
 
-func TestAdminOnlyCommands(t *testing.T) {
-	fx := newFixture(t, Config{AdminUsers: map[int64]bool{1: true}})
-	fx.bot.handleUpdate(context.Background(), msg(2, "/deletevoice v-new"))
-	m := fx.tg.find("sendMessage")
-	if len(m) != 1 || !strings.Contains(m[0].JSON["text"].(string), "Only studio admins") {
-		t.Fatalf("non-admin delete should be refused, got %+v", m)
-	}
-}
-
 func TestVoiceButtonSelectsVoice(t *testing.T) {
 	fx := newFixture(t, Config{})
 	fx.bot.handleUpdate(context.Background(), telegram.Update{CallbackQuery: &telegram.CallbackQuery{
@@ -612,49 +603,6 @@ func TestOwnerTag(t *testing.T) {
 	}
 }
 
-func TestVoicesArePrivateToTheirCreator(t *testing.T) {
-	fx := newFixture(t, Config{AdminUsers: map[int64]bool{1: true}})
-	ctx := context.Background()
-
-	list := fx.bot.voicesScreen(ctx, 7, fx.bot.resetSession(7, "", nil))
-	for _, want := range []string{"Nova", "My Clone"} {
-		if !strings.Contains(list.text, want) {
-			t.Errorf("user 7 should see %q", want)
-		}
-	}
-	for _, hidden := range []string{"Someone Else", "Old Clone"} {
-		if strings.Contains(list.text, hidden) {
-			t.Errorf("user 7 must not see %q (someone else's / untagged clone)", hidden)
-		}
-	}
-
-	fx.bot.handleUpdate(ctx, press(7, "v:v-secret"))
-	if fx.bot.store.Get(7).VoiceID == "v-secret" {
-		t.Fatal("user 7 must not be able to choose someone else's voice")
-	}
-	fx.bot.handleUpdate(ctx, msg(7, "/voice v-secret"))
-	if fx.bot.store.Get(7).VoiceID == "v-secret" || !strings.Contains(fx.tg.lastText(), "private") {
-		t.Fatalf("/voice with another user's ID must be refused: %q", fx.tg.lastText())
-	}
-	if card := fx.bot.voiceCard(ctx, 7, "v-secret"); !strings.Contains(card.text, "private") {
-		t.Errorf("voice card should be refused: %q", card.text)
-	}
-	fx.bot.handleUpdate(ctx, press(7, "p:v-secret"))
-	if len(fx.tg.find("sendAudio")) != 0 {
-		t.Fatal("previewing someone else's voice must be refused")
-	}
-
-	fx.bot.handleUpdate(ctx, press(7, "v:v-mine"))
-	if fx.bot.store.Get(7).VoiceID != "v-mine" {
-		t.Fatal("user 7 should be able to use their own clone")
-	}
-
-	admin := fx.bot.voicesScreen(ctx, 1, fx.bot.resetSession(1, "", nil))
-	if !strings.Contains(admin.text, "Someone Else") || !strings.Contains(admin.text, "Old Clone") {
-		t.Error("admins see every voice")
-	}
-}
-
 func TestDictionariesArePrivate(t *testing.T) {
 	fx := newFixture(t, Config{AdminUsers: map[int64]bool{1: true}})
 	fx.bot.handleUpdate(context.Background(), press(7, "d:d-secret"))
@@ -670,5 +618,129 @@ func TestClonesAreTaggedWithTheirCreator(t *testing.T) {
 	fx.bot.handleUpdate(context.Background(), u)
 	if owner, ok := ownerOf(fx.cloneDesc); !ok || owner != 1 {
 		t.Fatalf("clone description %q should carry the creator's tag", fx.cloneDesc)
+	}
+}
+
+func TestOnlyTheCreatorManagesAVoice(t *testing.T) {
+	fx := newFixture(t, Config{AdminUsers: map[int64]bool{1: true}})
+	ctx := context.Background()
+	if s := fx.bot.deleteConfirmScreen(ctx, 7, "v-secret"); !strings.Contains(s.text, "only delete voices you created") {
+		t.Errorf("deleting someone else's voice must be refused: %q", s.text)
+	}
+	if s := fx.bot.deleteConfirmScreen(ctx, 7, "v-mine"); !strings.Contains(s.text, "Delete My Clone?") {
+		t.Errorf("the creator should be asked to confirm: %q", s.text)
+	}
+	if s := fx.bot.shareScreen(ctx, 7, "v-secret"); !strings.Contains(s.text, "Only the person who created") {
+		t.Errorf("sharing someone else's voice must be refused: %q", s.text)
+	}
+	card := fx.bot.voiceCard(ctx, 7, "v-secret")
+	kb, _ := json.Marshal(card.kb)
+	if strings.Contains(string(kb), "sh:") || strings.Contains(string(kb), "dv:") {
+		t.Errorf("a shared voice's card must not offer Share/Delete: %s", kb)
+	}
+}
+
+func TestVoicesAreUnlistedButOpenByID(t *testing.T) {
+	fx := newFixture(t, Config{AdminUsers: map[int64]bool{1: true}})
+	ctx := context.Background()
+
+	// The library shows public voices and your own, never anyone else's.
+	list := fx.bot.voicesScreen(ctx, 7, fx.bot.resetSession(7, "", nil))
+	for _, want := range []string{"Nova", "My Clone"} {
+		if !strings.Contains(list.text, want) {
+			t.Errorf("user 7 should see %q", want)
+		}
+	}
+	for _, hidden := range []string{"Someone Else", "Old Clone"} {
+		if strings.Contains(list.text, hidden) {
+			t.Errorf("%q must not be listed for user 7", hidden)
+		}
+	}
+	owned := true
+	mine := fx.bot.voicesScreen(ctx, 7, fx.bot.resetSession(7, "", &owned))
+	if !strings.Contains(mine.text, "My Clone") || strings.Contains(mine.text, "Nova") {
+		t.Errorf("🗂 Mine should list only user 7's creations: %q", mine.text)
+	}
+
+	// But the ID is the key: pasting it opens the voice instead of reading it aloud.
+	fx.bot.handleUpdate(ctx, msg(7, "v-secret-is-not-a-uuid"))
+	fx.ttsIn = nil
+	id := "a0e99841-438c-4a64-b679-ae501e7d6091"
+	fx.bot.handleUpdate(ctx, msg(7, id))
+	if fx.ttsIn != nil {
+		t.Fatal("a pasted voice ID must not be spoken")
+	}
+	fx.bot.handleUpdate(ctx, msg(7, "https://t.me/EllieStudioBot?start=v_"+strings.ToUpper(id)))
+	if fx.ttsIn != nil {
+		t.Fatal("a pasted share link must not be spoken")
+	}
+
+	// Choosing an unlisted voice by its ID works.
+	fx.bot.handleUpdate(ctx, press(7, "v:v-secret"))
+	if fx.bot.store.Get(7).VoiceID != "v-secret" {
+		t.Fatal("anyone with the ID should be able to use the voice")
+	}
+	card := fx.bot.voiceCard(ctx, 7, "v-secret")
+	if !strings.Contains(card.text, "shared with you") {
+		t.Errorf("card should explain it was shared: %q", card.text)
+	}
+
+	admin := fx.bot.voicesScreen(ctx, 1, fx.bot.resetSession(1, "", nil))
+	if !strings.Contains(admin.text, "Someone Else") || !strings.Contains(admin.text, "Old Clone") {
+		t.Error("admins see every voice")
+	}
+}
+
+func TestParseVoiceRef(t *testing.T) {
+	id := "a0e99841-438c-4a64-b679-ae501e7d6091"
+	for _, in := range []string{id, strings.ToUpper(id), "v_" + id, "https://t.me/EllieStudioBot?start=v_" + id, "  " + id + "\n"} {
+		if got, ok := parseVoiceRef(in); !ok || got != id {
+			t.Errorf("parseVoiceRef(%q) = %q, %v", in, got, ok)
+		}
+	}
+	for _, in := range []string{"hello there", "my voice is " + id, "https://example.com", id + "x", ""} {
+		if _, ok := parseVoiceRef(in); ok {
+			t.Errorf("parseVoiceRef(%q) should not match", in)
+		}
+	}
+}
+
+func TestShareLinkOpensTheVoice(t *testing.T) {
+	fx := newFixture(t, Config{AdminUsers: map[int64]bool{1: true}})
+	share := fx.bot.shareScreen(context.Background(), 7, "v-mine")
+	if !strings.Contains(share.text, "?start=v_v-mine") || !strings.Contains(share.text, "<code>v-mine</code>") {
+		t.Errorf("share screen should give the link and the ID: %q", share.text)
+	}
+	kb, _ := json.Marshal(share.kb)
+	if !strings.Contains(string(kb), "t.me/share/url") {
+		t.Errorf("share screen should offer a Send to a friend button: %s", kb)
+	}
+	id := "a0e99841-438c-4a64-b679-ae501e7d6091"
+	fx.bot.handleUpdate(context.Background(), msg(8, "/start v_"+id))
+	sent := fx.tg.find("sendMessage")
+	if len(sent) != 2 || !strings.Contains(sent[0].JSON["text"].(string), "shared a voice") {
+		t.Fatalf("a share link should greet and open the voice, got %d messages", len(sent))
+	}
+}
+
+func TestAnyoneCanCloneWithinTheDailyLimit(t *testing.T) {
+	fx := newFixture(t, Config{AdminUsers: map[int64]bool{1: true}, DailyCreations: 1})
+	ctx := context.Background()
+	clone := func(name string) {
+		u := msg(7, "/clone "+name)
+		u.Message.Voice = &telegram.Voice{FileID: "f1", Duration: 8, FileSize: 16}
+		fx.bot.handleUpdate(ctx, u)
+	}
+	clone("First")
+	if !fx.cloned {
+		t.Fatal("a regular user should be able to clone")
+	}
+	if owner, ok := ownerOf(fx.cloneDesc); !ok || owner != 7 {
+		t.Errorf("the clone should be tagged with user 7: %q", fx.cloneDesc)
+	}
+	fx.cloned = false
+	clone("Second")
+	if fx.cloned || !strings.Contains(fx.tg.lastText(), "Daily voice limit reached") {
+		t.Fatalf("the second clone should hit the daily limit: %q", fx.tg.lastText())
 	}
 }

@@ -63,6 +63,11 @@ func (b *Bot) handleMessage(ctx context.Context, m *telegram.Message) {
 		b.continueFlow(ctx, m, f, text, a, hasAudio)
 		return
 	}
+	if id, ok := parseVoiceRef(text); ok && !hasAudio {
+		// A pasted voice ID or share link opens that voice instead of being read aloud.
+		b.openVoiceRef(ctx, m.Chat.ID, m.MessageID, uid, id)
+		return
+	}
 	switch {
 	case hasAudio:
 		b.transcribe(ctx, m, a)
@@ -106,11 +111,6 @@ func (b *Bot) audioCommand(ctx context.Context, m *telegram.Message, cmd string,
 	case "detect":
 		b.detect(ctx, m, a)
 	case "clone":
-		if !b.isAdmin(m.From.ID) {
-			s := b.createScreen(m.From.ID)
-			b.replyHTML(ctx, m, s.text, s.kb)
-			return
-		}
 		if strings.TrimSpace(args) == "" {
 			b.setFlow(m.From.ID, &flow{kind: flowCloneName, clip: a})
 			s := clonePromptName()
@@ -524,20 +524,26 @@ func (b *Bot) transcribe(ctx context.Context, m *telegram.Message, a audioRef) {
 
 func (b *Bot) runClone(ctx context.Context, m *telegram.Message, a audioRef, name string) {
 	uid := m.From.ID
-	if !b.isAdmin(uid) {
-		s := b.createScreen(uid)
-		b.replyHTML(ctx, m, s.text, s.kb)
+	if !b.begin(uid) {
+		b.busyNotice(ctx, m)
+		return
+	}
+	defer b.end(uid)
+	if ok, ls := b.spendMake(uid); !ok {
+		b.replyHTML(ctx, m, ls.text, ls.kb)
 		return
 	}
 	name = strings.TrimSpace(name)
 	pr := b.startProgress(ctx, m, "Cloning <b>"+html.EscapeString(name)+"</b>… this takes a few seconds.")
 	data, filename, err := b.fetchAudio(ctx, a, cartesia.MaxCloneClipBytes)
 	if err != nil {
+		b.refundMake(uid)
 		pr.finish(ctx, m.Chat.ID, errorScreen(err))
 		return
 	}
 	lang := orDefault(baseLang(b.store.Get(uid).Language), "en")
 	if !b.acquire(ctx) {
+		b.refundMake(uid)
 		return
 	}
 	tctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
@@ -551,13 +557,14 @@ func (b *Bot) runClone(ctx context.Context, m *telegram.Message, a audioRef, nam
 	cancel()
 	b.release()
 	if err != nil {
+		b.refundMake(uid)
 		pr.finish(ctx, m.Chat.ID, errorScreen(err))
 		return
 	}
 	if _, err := b.store.Update(uid, func(st *Settings) { st.VoiceID, st.VoiceName = v.ID, v.Name }); err != nil {
 		b.log.Warn("save settings", "err", err)
 	}
-	pr.finish(ctx, m.Chat.ID, createdScreen(icCreate, v.Name, v.ID))
+	pr.finish(ctx, m.Chat.ID, b.createdScreen(icCreate, v.Name, v.ID))
 }
 
 // ---------------------------------------------------------------- watermark

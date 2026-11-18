@@ -23,6 +23,7 @@ const (
 	flowDictName
 	flowDictItems
 	flowRename
+	flowVoiceID
 )
 
 const flowTTL = 15 * time.Minute
@@ -115,6 +116,16 @@ func dictPromptItems(name, problem string) screen {
 	return screen{text, cancelKeys()}
 }
 
+func voiceIDPrompt(problem string) screen {
+	text := header("🔑", "Open a voice by ID", "") +
+		"Paste a <b>voice ID</b> or a <b>share link</b> someone sent you, like:\n" +
+		"<code>a0e99841-438c-4a64-b679-ae501e7d6091</code>"
+	if problem != "" {
+		text += "\n\n" + icWarn + " " + html.EscapeString(problem)
+	}
+	return screen{text, cancelKeys()}
+}
+
 func renamePrompt(current string) screen {
 	return screen{
 		header("✏️", "Rename voice", "") + "What should <b>" + html.EscapeString(current) + "</b> be called now?",
@@ -130,28 +141,36 @@ func (b *Bot) startFlow(ctx context.Context, chatID, uid int64, kind flowKind) {
 	case flowSearch:
 		b.setFlow(uid, &flow{kind: flowSearch})
 		b.sendScreen(ctx, chatID, 0, searchPrompt())
-	case flowCloneClip, flowDictName, flowRename:
-		if !b.isAdmin(uid) {
-			b.sendScreen(ctx, chatID, 0, b.createScreen(uid))
-			return
-		}
-		switch kind {
-		case flowCloneClip:
-			b.setFlow(uid, &flow{kind: flowCloneClip})
-			b.sendScreen(ctx, chatID, 0, clonePromptClip())
-		case flowDictName:
-			b.setFlow(uid, &flow{kind: flowDictName})
-			b.sendScreen(ctx, chatID, 0, dictPromptName())
-		case flowRename:
-			s := b.store.Get(uid)
-			if s.VoiceID == "" {
-				b.sendScreen(ctx, chatID, 0, noVoiceScreen())
-				return
-			}
-			b.setFlow(uid, &flow{kind: flowRename, voiceID: s.VoiceID})
-			b.sendScreen(ctx, chatID, 0, renamePrompt(orDefault(s.VoiceName, "this voice")))
-		}
+	case flowVoiceID:
+		b.setFlow(uid, &flow{kind: flowVoiceID})
+		b.sendScreen(ctx, chatID, 0, voiceIDPrompt(""))
+	case flowCloneClip:
+		b.setFlow(uid, &flow{kind: flowCloneClip})
+		b.sendScreen(ctx, chatID, 0, clonePromptClip())
+	case flowDictName:
+		b.setFlow(uid, &flow{kind: flowDictName})
+		b.sendScreen(ctx, chatID, 0, dictPromptName())
+	case flowRename:
+		b.startRename(ctx, chatID, uid, b.store.Get(uid).VoiceID)
 	}
+}
+
+// startRename asks for a new name for a voice the user created.
+func (b *Bot) startRename(ctx context.Context, chatID, uid int64, id string) {
+	if id == "" {
+		b.sendScreen(ctx, chatID, 0, noVoiceScreen())
+		return
+	}
+	v, err := b.ct.GetVoice(ctx, id, false)
+	if err == nil && !b.canManage(uid, *v) {
+		err = errNotYourVoice
+	}
+	if err != nil {
+		b.sendScreen(ctx, chatID, 0, errorScreen(err))
+		return
+	}
+	b.setFlow(uid, &flow{kind: flowRename, voiceID: v.ID})
+	b.sendScreen(ctx, chatID, 0, renamePrompt(v.Name))
 }
 
 // ---------------------------------------------------------------- continuing flows
@@ -177,6 +196,15 @@ func (b *Bot) continueFlow(ctx context.Context, m *telegram.Message, f *flow, te
 	}
 
 	switch f.kind {
+	case flowVoiceID:
+		id, ok := parseVoiceRef(text)
+		if !ok {
+			s := voiceIDPrompt("That doesn't look like a voice ID or share link. Check it and paste it again.")
+			b.replyHTML(ctx, m, s.text, s.kb)
+			return
+		}
+		b.clearFlow(uid)
+		b.openVoiceRef(ctx, m.Chat.ID, m.MessageID, uid, id)
 	case flowSearch:
 		b.clearFlow(uid)
 		b.openVoices(ctx, m.Chat.ID, uid, text, nil)
