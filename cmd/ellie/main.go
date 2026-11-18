@@ -86,10 +86,12 @@ func run(log *slog.Logger) error {
 	resolveDefaultVoice(ctx, log, ct, store)
 
 	b := bot.New(tg, ct, store, bot.Config{
-		AllowedUsers: allowed,
-		AdminUsers:   admins,
-		MaxTTSChars:  envInt("MAX_TTS_CHARS", 1500),
-		Concurrency:  envInt("CARTESIA_CONCURRENCY", 2),
+		AllowedUsers:   allowed,
+		AdminUsers:     admins,
+		MaxTTSChars:    envInt("MAX_TTS_CHARS", 1500),
+		Concurrency:    envInt("CARTESIA_CONCURRENCY", 2),
+		DailyChars:     envLimit("DAILY_CHAR_LIMIT", 2000),
+		DailyAudioSecs: envLimit("DAILY_TRANSCRIBE_MINUTES", 10) * 60,
 	}, log)
 	log.Info("Ellie Studio starting", "cartesia_version", cartesia.APIVersion, "default_voice", store.Defaults().VoiceName)
 	return b.Run(ctx)
@@ -189,6 +191,14 @@ func parseIDs(s string) (map[int64]bool, error) {
 
 func envOr(k, d string) string {
 	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return d
+}
+
+// envLimit reads a daily limit where 0 means unlimited and unset means d.
+func envLimit(k string, d int) int {
+	if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv(k))); err == nil && v >= 0 {
 		return v
 	}
 	return d

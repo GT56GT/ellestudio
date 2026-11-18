@@ -22,6 +22,64 @@ type Settings struct {
 	DictID    string  `json:"dict_id"`
 	DictName  string  `json:"dict_name"`
 	AsFile    bool    `json:"as_file"` // send audio files instead of voice notes
+
+	// Daily allowance bookkeeping (UTC day). Kept across /reset.
+	UsageDay  string `json:"usage_day,omitempty"`
+	UsedChars int    `json:"used_chars,omitempty"`
+	UsedSecs  int    `json:"used_secs,omitempty"`
+}
+
+// Usage is what a user has spent today.
+type Usage struct {
+	Chars, Secs int
+}
+
+// usageToday returns v's usage for day, treating an older day as zero.
+func usageToday(v Settings, day string) Usage {
+	if v.UsageDay != day {
+		return Usage{}
+	}
+	return Usage{v.UsedChars, v.UsedSecs}
+}
+
+// Spend atomically adds chars and secs to a user's usage for day, unless that
+// would pass a limit (a limit of 0 means unlimited). It returns whether the
+// spend happened and the usage afterwards (or as it stands, if refused).
+func (s *Store) Spend(uid int64, day string, chars, secs, charLimit, secLimit int) (bool, Usage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v := s.data[uid]
+	u := usageToday(v, day)
+	if (charLimit > 0 && chars > 0 && u.Chars+chars > charLimit) ||
+		(secLimit > 0 && secs > 0 && u.Secs+secs > secLimit) {
+		return false, u, nil
+	}
+	u.Chars += chars
+	u.Secs += secs
+	v.UsageDay, v.UsedChars, v.UsedSecs = day, u.Chars, u.Secs
+	s.data[uid] = v
+	return true, u, s.saveLocked()
+}
+
+// Refund gives back an earlier Spend (for example when generation failed).
+func (s *Store) Refund(uid int64, day string, chars, secs int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v, ok := s.data[uid]
+	if !ok || v.UsageDay != day {
+		return
+	}
+	v.UsedChars = max(0, v.UsedChars-chars)
+	v.UsedSecs = max(0, v.UsedSecs-secs)
+	s.data[uid] = v
+	_ = s.saveLocked()
+}
+
+// UsageOn reports a user's usage for day.
+func (s *Store) UsageOn(uid int64, day string) Usage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return usageToday(s.data[uid], day)
 }
 
 // Store keeps per-user Settings in memory and persists them as JSON.
@@ -106,11 +164,16 @@ func (s *Store) Update(uid int64, fn func(*Settings)) (Settings, error) {
 	return s.withDefaults(v), s.saveLocked()
 }
 
-// Reset forgets a user's settings.
+// Reset forgets a user's settings but keeps today's usage, so resetting can't
+// be used to refill a daily allowance.
 func (s *Store) Reset(uid int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.data, uid)
+	old, ok := s.data[uid]
+	if !ok {
+		return nil
+	}
+	s.data[uid] = Settings{UsageDay: old.UsageDay, UsedChars: old.UsedChars, UsedSecs: old.UsedSecs}
 	return s.saveLocked()
 }
 

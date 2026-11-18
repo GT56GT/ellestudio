@@ -81,11 +81,12 @@ func (f *fakeTelegram) find(method string) []tgCall {
 }
 
 type fixture struct {
-	bot    *Bot
-	tg     *fakeTelegram
-	ttsIn  map[string]any
-	sttIn  map[string]string
-	cloned bool
+	bot     *Bot
+	tg      *fakeTelegram
+	ttsIn   map[string]any
+	sttIn   map[string]string
+	cloned  bool
+	ttsFail bool
 }
 
 func press(uid int64, data string) telegram.Update {
@@ -118,6 +119,11 @@ func newFixture(t *testing.T, cfg Config) *fixture {
 	ctSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/tts/bytes":
+			if fx.ttsFail {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = io.WriteString(w, `{"error_code":null,"title":"Unexpected error","message":"boom","request_id":"r1"}`)
+				return
+			}
 			_ = json.NewDecoder(r.Body).Decode(&fx.ttsIn)
 			w.Header().Set("Content-Type", "audio/mpeg")
 			_, _ = io.WriteString(w, "ID3-mp3")
@@ -460,5 +466,92 @@ func TestStorePersists(t *testing.T) {
 	}
 	if err := s2.ForgetVoice("abc"); err != nil || s2.Get(42).VoiceID != "" {
 		t.Fatalf("ForgetVoice failed: %+v %v", s2.Get(42), err)
+	}
+}
+
+func TestDailyCharLimit(t *testing.T) {
+	fx := newFixture(t, Config{AdminUsers: map[int64]bool{1: true}, DailyChars: 10})
+	ctx := context.Background()
+
+	fx.bot.handleUpdate(ctx, msg(7, "hello"))
+	if fx.ttsIn == nil {
+		t.Fatal("5 of 10 characters should be spoken")
+	}
+	fx.ttsIn = nil
+	fx.bot.handleUpdate(ctx, msg(7, "hello world"))
+	if fx.ttsIn != nil {
+		t.Fatal("11 more characters must be refused")
+	}
+	if got := fx.tg.lastText(); !strings.Contains(got, "Daily limit reached") || !strings.Contains(got, "5</b> are left") {
+		t.Errorf("limit screen = %q", got)
+	}
+
+	if err := fx.bot.store.Reset(7); err != nil {
+		t.Fatal(err)
+	}
+	fx.bot.handleUpdate(ctx, msg(7, "sixsix"))
+	if fx.ttsIn != nil {
+		t.Fatal("resetting settings must not refill the allowance")
+	}
+
+	fx.bot.handleUpdate(ctx, msg(1, strings.Repeat("a", 50)))
+	if fx.ttsIn == nil {
+		t.Fatal("admins are exempt from the allowance")
+	}
+	if !strings.Contains(fx.bot.studioScreen(7).text, "5 of 10 characters") {
+		t.Errorf("studio should show what's left: %q", fx.bot.studioScreen(7).text)
+	}
+}
+
+func TestFailedSpeechIsRefunded(t *testing.T) {
+	fx := newFixture(t, Config{AdminUsers: map[int64]bool{1: true}, DailyChars: 10})
+	fx.ttsFail = true
+	fx.bot.handleUpdate(context.Background(), msg(7, "hello"))
+	if u := fx.bot.store.UsageOn(7, today()); u.Chars != 0 {
+		t.Fatalf("failed speech should be refunded, used = %d", u.Chars)
+	}
+	if !strings.Contains(fx.tg.lastText(), "Something went wrong") {
+		t.Errorf("error screen = %q", fx.tg.lastText())
+	}
+}
+
+func TestDailyTranscriptionLimit(t *testing.T) {
+	fx := newFixture(t, Config{AdminUsers: map[int64]bool{1: true}, DailyAudioSecs: 5})
+	ctx := context.Background()
+	voice := func(secs int) telegram.Update {
+		u := msg(7, "")
+		u.Message.Voice = &telegram.Voice{FileID: "f1", Duration: secs, FileSize: 16}
+		return u
+	}
+	fx.bot.handleUpdate(ctx, voice(2)) // fake STT reports 2.5s, so 3s are recorded
+	if fx.sttIn == nil {
+		t.Fatal("first recording should be transcribed")
+	}
+	if u := fx.bot.store.UsageOn(7, today()); u.Secs != 3 {
+		t.Errorf("usage should settle to the real duration (3s), got %d", u.Secs)
+	}
+	fx.sttIn = nil
+	fx.bot.handleUpdate(ctx, voice(3))
+	if fx.sttIn != nil {
+		t.Fatal("3s more would pass the 5s allowance")
+	}
+	if !strings.Contains(fx.tg.lastText(), "Daily limit reached") {
+		t.Errorf("limit screen = %q", fx.tg.lastText())
+	}
+}
+
+func TestOneRequestAtATime(t *testing.T) {
+	fx := newFixture(t, Config{})
+	if !fx.bot.begin(7) {
+		t.Fatal("first job should start")
+	}
+	fx.bot.handleUpdate(context.Background(), msg(7, "hello"))
+	if fx.ttsIn != nil || !strings.Contains(fx.tg.lastText(), "still working") {
+		t.Fatalf("a second job while busy should wait: %q", fx.tg.lastText())
+	}
+	fx.bot.end(7)
+	fx.bot.handleUpdate(context.Background(), msg(7, "hello"))
+	if fx.ttsIn == nil {
+		t.Fatal("after the first job ends, the next should run")
 	}
 }

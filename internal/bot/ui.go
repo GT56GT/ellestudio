@@ -305,7 +305,8 @@ func (b *Bot) studioScreen(uid int64) screen {
 		field(icStyle, "Style", styleSummary(s)) +
 		field(icModel, "Model", s.Model) +
 		field(icDict, "Pronunciation", orDefault(s.DictName, "none")) +
-		field(icOutput, "Output", outputLabel(s.AsFile))
+		field(icOutput, "Output", outputLabel(s.AsFile)) +
+		"\n" + b.allowanceLines(uid)
 	k := (&keys{}).
 		row(btn(icDict+" Pronunciation", "nav:dicts"), btn(icStyle+" Style", "nav:style")).
 		row(btn("📊 Service status", "nav:status"), btn("📈 Usage", "nav:usage")).
@@ -347,7 +348,9 @@ Under every voice note:
 🔁 <b>Again</b> makes it once more (try it after changing the style)
 🎭 <b>Emotion</b>, 🎧 <b>Voice</b>, 🎛 <b>Style</b> change how it sounds
 
-Tip: punctuation shapes delivery. Commas add pauses, "!" adds energy.`},
+Tip: punctuation shapes delivery. Commas add pauses, "!" adds energy.
+
+Everyone gets a daily allowance of speech and transcription. See what's left in ⚙️ Studio.`},
 	{"voices", icVoices + " Voices", "Voices", `Open 🎧 <b>Voices</b> to browse the library.
 
 • Tap a name to use that voice

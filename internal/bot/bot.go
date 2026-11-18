@@ -35,6 +35,11 @@ type Config struct {
 	Concurrency int
 	// PollTimeout is the getUpdates long-poll duration.
 	PollTimeout time.Duration
+	// DailyChars caps characters spoken per user per UTC day (0 = unlimited).
+	DailyChars int
+	// DailyAudioSecs caps seconds of audio transcribed or checked per user
+	// per UTC day (0 = unlimited). Admins are exempt from both.
+	DailyAudioSecs int
 }
 
 // Bot is the running studio.
@@ -53,6 +58,7 @@ type Bot struct {
 	sessions map[int64]*browseSession
 	flows    map[int64]*flow   // guided steps in progress
 	recent   map[int64]*recent // last spoken text / transcript, for Again and Read aloud
+	busy     map[int64]bool    // users with a Cartesia job running
 }
 
 // recent remembers what a user last heard or transcribed.
@@ -86,6 +92,7 @@ func New(tg *telegram.Client, ct *cartesia.Client, store *Store, cfg Config, log
 		sessions:      map[int64]*browseSession{},
 		flows:         map[int64]*flow{},
 		recent:        map[int64]*recent{},
+		busy:          map[int64]bool{},
 	}
 }
 

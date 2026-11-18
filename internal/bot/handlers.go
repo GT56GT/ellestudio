@@ -312,6 +312,18 @@ func (b *Bot) speak(ctx context.Context, m *telegram.Message, text string) {
 		}
 	}
 
+	if !b.begin(uid) {
+		b.busyNotice(ctx, m)
+		return
+	}
+	defer b.end(uid)
+	chars := utf8.RuneCountInString(text)
+	if ok, u := b.spendChars(uid, chars); !ok {
+		ls := b.limitScreen(true, u, chars)
+		b.replyHTML(ctx, m, ls.text, ls.kb)
+		return
+	}
+
 	action := "record_voice"
 	if s.AsFile {
 		action = "upload_document"
@@ -319,11 +331,13 @@ func (b *Bot) speak(ctx context.Context, m *telegram.Message, text string) {
 	_ = b.tg.SendChatAction(ctx, m.Chat.ID, action)
 
 	if !b.acquire(ctx) {
+		b.refund(uid, chars, 0)
 		return
 	}
 	audio, err := b.ttsWithRetry(ctx, req)
 	b.release()
 	if err != nil {
+		b.refund(uid, chars, 0)
 		b.fail(ctx, m, "tts", err)
 		return
 	}
@@ -392,16 +406,50 @@ func speechCaption(s Settings) string {
 
 // ---------------------------------------------------------------- speech-to-text
 
+// reserveAudio claims a recording's length from the daily allowance. When the
+// length is unknown (a file sent as a document) it claims one second now and
+// the rest once Cartesia reports the duration. It returns the seconds claimed.
+func (b *Bot) reserveAudio(ctx context.Context, m *telegram.Message, a audioRef) (int, bool) {
+	secs := max(a.Seconds, 1)
+	if ok, u := b.spendSecs(m.From.ID, secs); !ok {
+		ls := b.limitScreen(false, u, secs)
+		b.replyHTML(ctx, m, ls.text, ls.kb)
+		return 0, false
+	}
+	return secs, true
+}
+
+// settleAudio records the true length once known, without refusing (the
+// work is already done).
+func (b *Bot) settleAudio(uid int64, claimed int, actual float64) {
+	if extra := int(actual+0.999) - claimed; extra > 0 && !b.isAdmin(uid) {
+		if _, _, err := b.store.Spend(uid, today(), 0, extra, 0, 0); err != nil {
+			b.log.Warn("save usage", "err", err)
+		}
+	}
+}
+
 func (b *Bot) transcribe(ctx context.Context, m *telegram.Message, a audioRef) {
 	uid := m.From.ID
+	if !b.begin(uid) {
+		b.busyNotice(ctx, m)
+		return
+	}
+	defer b.end(uid)
+	claimed, ok := b.reserveAudio(ctx, m, a)
+	if !ok {
+		return
+	}
 	pr := b.startProgress(ctx, m, "Listening…")
 	data, name, err := b.fetchAudio(ctx, a, telegram.MaxDownloadBytes)
 	if err != nil {
+		b.refund(uid, 0, claimed)
 		pr.finish(ctx, m.Chat.ID, errorScreen(err))
 		return
 	}
 	s := b.store.Get(uid)
 	if !b.acquire(ctx) {
+		b.refund(uid, 0, claimed)
 		return
 	}
 	tctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
@@ -413,9 +461,11 @@ func (b *Bot) transcribe(ctx context.Context, m *telegram.Message, a audioRef) {
 	cancel()
 	b.release()
 	if err != nil {
+		b.refund(uid, 0, claimed)
 		pr.finish(ctx, m.Chat.ID, errorScreen(err))
 		return
 	}
+	b.settleAudio(uid, claimed, tr.Duration)
 	text := strings.TrimSpace(tr.Text)
 	if text == "" {
 		pr.finish(ctx, m.Chat.ID, screen{
@@ -498,13 +548,25 @@ func (b *Bot) detect(ctx context.Context, m *telegram.Message, a audioRef) {
 		b.replyHTML(ctx, m, s.text, s.kb)
 		return
 	}
+	uid := m.From.ID
+	if !b.begin(uid) {
+		b.busyNotice(ctx, m)
+		return
+	}
+	defer b.end(uid)
+	claimed, ok := b.reserveAudio(ctx, m, a)
+	if !ok {
+		return
+	}
 	pr := b.startProgress(ctx, m, "Checking for a watermark…")
 	data, name, err := b.fetchAudio(ctx, a, cartesia.MaxWatermarkBytes)
 	if err != nil {
+		b.refund(uid, 0, claimed)
 		pr.finish(ctx, m.Chat.ID, errorScreen(err))
 		return
 	}
 	if !b.acquire(ctx) {
+		b.refund(uid, 0, claimed)
 		return
 	}
 	tctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
@@ -512,6 +574,7 @@ func (b *Bot) detect(ctx context.Context, m *telegram.Message, a audioRef) {
 	cancel()
 	b.release()
 	if err != nil {
+		b.refund(uid, 0, claimed)
 		pr.finish(ctx, m.Chat.ID, errorScreen(err))
 		return
 	}

@@ -29,6 +29,14 @@ Don't know your Telegram ID? Start the bot with `ALLOWED_USER_IDS` set to anythi
 - **Errors point to the fix,** for example "voice not found" comes with a 🎧 Pick a voice button.
 - Slash commands still work for power users. Help → Commands lists them all.
 
+## Opening it to everyone
+
+Leave `ALLOWED_USER_IDS` empty and keep your own ID in `ADMIN_USER_IDS`. Then:
+
+- Each user gets a **daily allowance**: `DAILY_CHAR_LIMIT` characters of speech (default 2,000) and `DAILY_TRANSCRIBE_MINUTES` minutes of transcription and watermark checks (default 10). It resets at midnight UTC. Users see what's left in ⚙️ Studio, and a friendly screen tells them when it refreshes. Failed requests are refunded. Resetting settings doesn't refill it. Admins are unlimited.
+- Each user runs **one request at a time**, so nobody can tie up the shared Cartesia slots.
+- Cloning, localizing, renaming and deleting voices, creating dictionaries, and usage stay **admin-only**.
+
 ## What it does
 
 | You do | Ellie does | Cartesia endpoint |
