@@ -1,0 +1,332 @@
+// Package bot implements Ellie Studio, a Telegram front end for Cartesia's
+// speech APIs: text-to-speech, speech-to-text, voice library browsing,
+// cloning, localization, pronunciation dictionaries, and watermark checks.
+package bot
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"html"
+	"log/slog"
+	"net/http"
+	"runtime/debug"
+	"strings"
+	"sync"
+	"time"
+
+	"ellestudio/internal/cartesia"
+	"ellestudio/internal/telegram"
+)
+
+// Name is the bot's display name.
+const Name = "Ellie Studio"
+
+// Config controls access and limits.
+type Config struct {
+	// AllowedUsers may use the bot. Empty means anyone can.
+	AllowedUsers map[int64]bool
+	// AdminUsers may create or delete Cartesia resources (clone, localize,
+	// rename, delete, new dictionaries, usage). Empty means every allowed user.
+	AdminUsers map[int64]bool
+	// MaxTTSChars caps one synthesis request to protect credits.
+	MaxTTSChars int
+	// Concurrency caps simultaneous Cartesia calls (Free plan TTS limit is 2).
+	Concurrency int
+	// PollTimeout is the getUpdates long-poll duration.
+	PollTimeout time.Duration
+}
+
+// Bot is the running studio.
+type Bot struct {
+	tg    *telegram.Client
+	ct    *cartesia.Client
+	store *Store
+	cfg   Config
+	log   *slog.Logger
+
+	cartesiaSlots chan struct{} // bounds concurrent Cartesia work
+	inflight      chan struct{} // bounds concurrent update handlers
+	wg            sync.WaitGroup
+
+	sessMu   sync.Mutex
+	sessions map[int64]*browseSession
+}
+
+// New wires a bot together.
+func New(tg *telegram.Client, ct *cartesia.Client, store *Store, cfg Config, log *slog.Logger) *Bot {
+	if cfg.MaxTTSChars <= 0 {
+		cfg.MaxTTSChars = 1500
+	}
+	if cfg.Concurrency <= 0 {
+		cfg.Concurrency = 2
+	}
+	if cfg.PollTimeout <= 0 {
+		cfg.PollTimeout = 50 * time.Second
+	}
+	if log == nil {
+		log = slog.Default()
+	}
+	return &Bot{
+		tg:            tg,
+		ct:            ct,
+		store:         store,
+		cfg:           cfg,
+		log:           log,
+		cartesiaSlots: make(chan struct{}, cfg.Concurrency),
+		inflight:      make(chan struct{}, 32),
+		sessions:      map[int64]*browseSession{},
+	}
+}
+
+// Commands is the menu registered with Telegram.
+var Commands = []telegram.BotCommand{
+	{Command: "start", Description: "Welcome to Ellie Studio"},
+	{Command: "help", Description: "Everything the studio can do"},
+	{Command: "say", Description: "Speak some text"},
+	{Command: "voices", Description: "Browse the voice library"},
+	{Command: "myvoices", Description: "Voices your organization owns"},
+	{Command: "voice", Description: "Show or set the current voice"},
+	{Command: "preview", Description: "Play a voice's free preview"},
+	{Command: "emotion", Description: "Set the speaking emotion"},
+	{Command: "speed", Description: "Set speed (0.6–1.5)"},
+	{Command: "volume", Description: "Set volume (0.5–2.0)"},
+	{Command: "model", Description: "Pick the Sonic model"},
+	{Command: "lang", Description: "Set language, e.g. en, fr, en-GB"},
+	{Command: "format", Description: "Voice notes or audio files"},
+	{Command: "transcribe", Description: "Transcribe a replied-to audio"},
+	{Command: "clone", Description: "Clone a voice from a replied-to clip"},
+	{Command: "accents", Description: "List accents for a language"},
+	{Command: "localize", Description: "Make the current voice native in an accent"},
+	{Command: "rename", Description: "Rename the current (owned) voice"},
+	{Command: "deletevoice", Description: "Delete an owned voice"},
+	{Command: "dicts", Description: "Pick a pronunciation dictionary"},
+	{Command: "newdict", Description: "Create a pronunciation dictionary"},
+	{Command: "detect", Description: "Check audio for a Cartesia watermark"},
+	{Command: "settings", Description: "Show your studio settings"},
+	{Command: "reset", Description: "Reset your settings"},
+	{Command: "status", Description: "Cartesia API status and models"},
+	{Command: "usage", Description: "Credit usage (admin key)"},
+}
+
+// Run long-polls Telegram until ctx is cancelled, then waits for in-flight
+// handlers to finish.
+func (b *Bot) Run(ctx context.Context) error {
+	me, err := b.tg.GetMe(ctx)
+	if err != nil {
+		return fmt.Errorf("telegram getMe (check TELEGRAM_BOT_TOKEN): %w", err)
+	}
+	b.log.Info("connected to Telegram", "bot", "@"+me.Username)
+	if err := b.tg.SetMyCommands(ctx, Commands); err != nil {
+		b.log.Warn("setMyCommands failed", "err", err)
+	}
+
+	var offset int64
+	backoff := time.Second
+	for ctx.Err() == nil {
+		pollCtx, cancel := context.WithTimeout(ctx, b.cfg.PollTimeout+15*time.Second)
+		updates, err := b.tg.GetUpdates(pollCtx, offset, b.cfg.PollTimeout)
+		cancel()
+		if err != nil {
+			if ctx.Err() != nil {
+				break
+			}
+			wait := backoff
+			var te *telegram.Error
+			if errors.As(err, &te) {
+				if te.RetryAfter > 0 {
+					wait = time.Duration(te.RetryAfter) * time.Second
+				}
+				if te.Code == http.StatusConflict {
+					b.log.Error("another bot instance or a webhook is consuming updates", "err", err)
+				}
+				if te.Code == http.StatusUnauthorized {
+					return fmt.Errorf("telegram rejected the bot token: %w", err)
+				}
+			}
+			b.log.Warn("getUpdates failed", "err", err, "retry_in", wait)
+			sleep(ctx, wait)
+			backoff = min(backoff*2, 30*time.Second)
+			continue
+		}
+		backoff = time.Second
+		for _, u := range updates {
+			offset = u.UpdateID + 1
+			select {
+			case b.inflight <- struct{}{}:
+			case <-ctx.Done():
+				continue
+			}
+			b.wg.Add(1)
+			go func(u telegram.Update) {
+				defer func() { <-b.inflight; b.wg.Done() }()
+				b.handleUpdate(ctx, u)
+			}(u)
+		}
+	}
+	b.wg.Wait()
+	return nil
+}
+
+func sleep(ctx context.Context, d time.Duration) {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
+	}
+}
+
+func (b *Bot) handleUpdate(ctx context.Context, u telegram.Update) {
+	defer func() {
+		if r := recover(); r != nil {
+			b.log.Error("handler panic", "panic", r, "stack", string(debug.Stack()))
+		}
+	}()
+	switch {
+	case u.Message != nil:
+		b.handleMessage(ctx, u.Message)
+	case u.CallbackQuery != nil:
+		b.handleCallback(ctx, u.CallbackQuery)
+	}
+}
+
+// ---------------------------------------------------------------- access
+
+func (b *Bot) allowed(uid int64) bool {
+	return len(b.cfg.AllowedUsers) == 0 || b.cfg.AllowedUsers[uid]
+}
+
+func (b *Bot) isAdmin(uid int64) bool {
+	if len(b.cfg.AdminUsers) == 0 {
+		return b.allowed(uid)
+	}
+	return b.cfg.AdminUsers[uid]
+}
+
+// acquire takes a Cartesia slot, or returns false if ctx ends first.
+func (b *Bot) acquire(ctx context.Context) bool {
+	select {
+	case b.cartesiaSlots <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (b *Bot) release() { <-b.cartesiaSlots }
+
+// ---------------------------------------------------------------- replies
+
+// reply sends plain text, splitting anything longer than Telegram allows.
+func (b *Bot) reply(ctx context.Context, m *telegram.Message, text string) {
+	for i, chunk := range splitText(text, telegram.MaxMessageLen-96) {
+		p := telegram.SendMessageParams{ChatID: m.Chat.ID, Text: chunk, NoPreview: true}
+		if i == 0 {
+			p.ReplyTo = m.MessageID
+		}
+		if _, err := b.tg.SendMessage(ctx, p); err != nil {
+			b.log.Warn("sendMessage failed", "chat", m.Chat.ID, "err", err)
+			return
+		}
+	}
+}
+
+// replyHTML sends one HTML-formatted message, optionally with a keyboard.
+func (b *Bot) replyHTML(ctx context.Context, m *telegram.Message, text string, kb *telegram.InlineKeyboardMarkup) {
+	p := telegram.SendMessageParams{
+		ChatID: m.Chat.ID, Text: text, ParseMode: "HTML", ReplyTo: m.MessageID,
+		ReplyMarkup: kb, NoPreview: true,
+	}
+	if _, err := b.tg.SendMessage(ctx, p); err != nil {
+		b.log.Warn("sendMessage failed", "chat", m.Chat.ID, "err", err)
+	}
+}
+
+// editHTML replaces a bot message in place (used by keyboards).
+func (b *Bot) editHTML(ctx context.Context, m *telegram.Message, text string, kb *telegram.InlineKeyboardMarkup) {
+	p := telegram.SendMessageParams{
+		ChatID: m.Chat.ID, MessageID: m.MessageID, Text: text, ParseMode: "HTML",
+		ReplyMarkup: kb, NoPreview: true,
+	}
+	if err := b.tg.EditMessageText(ctx, p); err != nil && !strings.Contains(err.Error(), "message is not modified") {
+		b.log.Warn("editMessageText failed", "chat", m.Chat.ID, "err", err)
+	}
+}
+
+func (b *Bot) fail(ctx context.Context, m *telegram.Message, what string, err error) {
+	b.log.Warn(what, "chat", m.Chat.ID, "err", err)
+	b.replyHTML(ctx, m, "⚠️ "+explain(err), nil)
+}
+
+// explain turns an error into a short, user-facing HTML string.
+func explain(err error) string {
+	ae, ok := cartesia.AsAPIError(err)
+	if !ok {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return "That took too long. Please try again."
+		}
+		return html.EscapeString(err.Error())
+	}
+	var msg string
+	switch ae.ErrorCode {
+	case cartesia.ErrQuotaExceeded:
+		msg = "The studio is out of Cartesia credits for now."
+	case cartesia.ErrConcurrencyLimited:
+		msg = "The studio is busy (too many requests at once). Try again in a moment."
+	case cartesia.ErrVoiceModelMismatch:
+		msg = "That voice doesn't work with the selected model. Try /model or another voice."
+	case cartesia.ErrVoiceNotFound:
+		msg = "That voice no longer exists. Pick one with /voices."
+	case cartesia.ErrModelNotFound:
+		msg = "That model isn't available. Pick one with /model."
+	case cartesia.ErrLanguageNotSupported:
+		msg = "That language isn't supported here. Try /lang auto."
+	case cartesia.ErrFileTooLarge:
+		msg = "That file is too large for Cartesia."
+	case cartesia.ErrUnsupportedAudio:
+		msg = "Cartesia can't read that audio format. Try mp3, ogg, wav, flac, m4a, or webm."
+	case cartesia.ErrPlanUpgradeRequired:
+		msg = "This feature needs a higher Cartesia plan."
+	default:
+		switch ae.StatusCode {
+		case http.StatusUnauthorized:
+			msg = "Cartesia rejected the studio's API key."
+		case http.StatusForbidden:
+			msg = "The studio isn't allowed to do that (you may not own this resource)."
+		case http.StatusNotFound:
+			msg = "Not found."
+		default:
+			msg = strings.TrimSpace(ae.Title + ". " + ae.Message)
+		}
+	}
+	out := html.EscapeString(msg)
+	if ae.RequestID != "" {
+		out += "\n<i>request " + html.EscapeString(ae.RequestID) + "</i>"
+	}
+	return out
+}
+
+// splitText breaks s into pieces of at most n bytes, preferring newlines and
+// spaces, and never splitting a UTF-8 sequence.
+func splitText(s string, n int) []string {
+	var out []string
+	for len(s) > n {
+		cut := strings.LastIndex(s[:n], "\n")
+		if cut < n/2 {
+			cut = strings.LastIndex(s[:n], " ")
+		}
+		if cut < n/2 {
+			cut = n
+			for cut > 0 && s[cut]&0xC0 == 0x80 { // back off a continuation byte
+				cut--
+			}
+		}
+		out = append(out, s[:cut])
+		s = strings.TrimLeft(s[cut:], " \n")
+	}
+	if s != "" || len(out) == 0 {
+		out = append(out, s)
+	}
+	return out
+}
