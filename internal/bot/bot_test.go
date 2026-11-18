@@ -81,12 +81,13 @@ func (f *fakeTelegram) find(method string) []tgCall {
 }
 
 type fixture struct {
-	bot     *Bot
-	tg      *fakeTelegram
-	ttsIn   map[string]any
-	sttIn   map[string]string
-	cloned  bool
-	ttsFail bool
+	bot       *Bot
+	tg        *fakeTelegram
+	ttsIn     map[string]any
+	sttIn     map[string]string
+	cloned    bool
+	cloneDesc string
+	ttsFail   bool
 }
 
 func press(uid int64, data string) telegram.Update {
@@ -134,8 +135,21 @@ func newFixture(t *testing.T, cfg Config) *fixture {
 		case "/voices/v-new":
 			_, _ = io.WriteString(w, `{"id":"v-new","name":"Nova","language":"en"}`)
 		case "/voices":
-			_, _ = io.WriteString(w, `{"data":[{"id":"v-new","name":"Nova","language":"en","gender":"feminine"}],"has_more":false}`)
+			_, _ = io.WriteString(w, `{"data":[`+
+				`{"id":"v-new","name":"Nova","language":"en","gender":"feminine"},`+
+				`{"id":"v-secret","name":"Someone Else","is_owner":true,"description":"Cloned in Ellie Studio [ellie-owner:99]"},`+
+				`{"id":"v-mine","name":"My Clone","is_owner":true,"description":"Cloned in Ellie Studio [ellie-owner:7]"},`+
+				`{"id":"v-legacy","name":"Old Clone","is_owner":true,"description":"made elsewhere"}`+
+				`],"has_more":false}`)
+		case "/voices/v-secret":
+			_, _ = io.WriteString(w, `{"id":"v-secret","name":"Someone Else","is_owner":true,"description":"Cloned in Ellie Studio [ellie-owner:99]","preview_file_url":"`+"http://"+r.Host+`/p.mp3"}`)
+		case "/voices/v-mine":
+			_, _ = io.WriteString(w, `{"id":"v-mine","name":"My Clone","is_owner":true,"description":"Cloned in Ellie Studio [ellie-owner:7]"}`)
+		case "/pronunciation-dicts/d-secret":
+			_, _ = io.WriteString(w, `{"id":"d-secret","name":"Their words","is_owner":true,"description":"Created in Ellie Studio [ellie-owner:99]","items":[]}`)
 		case "/voices/clone":
+			_ = r.ParseMultipartForm(1 << 20)
+			fx.cloneDesc = r.FormValue("description")
 			fx.cloned = true
 			_, _ = io.WriteString(w, `{"id":"v-clone","name":"My Voice","language":"en"}`)
 		case "/models":
@@ -582,5 +596,79 @@ func TestOverEstimateIsRefunded(t *testing.T) {
 	fx.bot.handleUpdate(context.Background(), u)
 	if got := fx.bot.store.UsageOn(7, today()).Secs; got != 3 {
 		t.Fatalf("usage should settle to the real 2.5s (3s), got %ds", got)
+	}
+}
+
+func TestOwnerTag(t *testing.T) {
+	d := withOwner("Cloned in Ellie Studio", 42)
+	if id, ok := ownerOf(d); !ok || id != 42 {
+		t.Fatalf("ownerOf(%q) = %d, %v", d, id, ok)
+	}
+	if got := cleanDescription(d); got != "Cloned in Ellie Studio" {
+		t.Errorf("cleanDescription = %q", got)
+	}
+	if _, ok := ownerOf("no tag here"); ok {
+		t.Error("untagged description has no owner")
+	}
+}
+
+func TestVoicesArePrivateToTheirCreator(t *testing.T) {
+	fx := newFixture(t, Config{AdminUsers: map[int64]bool{1: true}})
+	ctx := context.Background()
+
+	list := fx.bot.voicesScreen(ctx, 7, fx.bot.resetSession(7, "", nil))
+	for _, want := range []string{"Nova", "My Clone"} {
+		if !strings.Contains(list.text, want) {
+			t.Errorf("user 7 should see %q", want)
+		}
+	}
+	for _, hidden := range []string{"Someone Else", "Old Clone"} {
+		if strings.Contains(list.text, hidden) {
+			t.Errorf("user 7 must not see %q (someone else's / untagged clone)", hidden)
+		}
+	}
+
+	fx.bot.handleUpdate(ctx, press(7, "v:v-secret"))
+	if fx.bot.store.Get(7).VoiceID == "v-secret" {
+		t.Fatal("user 7 must not be able to choose someone else's voice")
+	}
+	fx.bot.handleUpdate(ctx, msg(7, "/voice v-secret"))
+	if fx.bot.store.Get(7).VoiceID == "v-secret" || !strings.Contains(fx.tg.lastText(), "private") {
+		t.Fatalf("/voice with another user's ID must be refused: %q", fx.tg.lastText())
+	}
+	if card := fx.bot.voiceCard(ctx, 7, "v-secret"); !strings.Contains(card.text, "private") {
+		t.Errorf("voice card should be refused: %q", card.text)
+	}
+	fx.bot.handleUpdate(ctx, press(7, "p:v-secret"))
+	if len(fx.tg.find("sendAudio")) != 0 {
+		t.Fatal("previewing someone else's voice must be refused")
+	}
+
+	fx.bot.handleUpdate(ctx, press(7, "v:v-mine"))
+	if fx.bot.store.Get(7).VoiceID != "v-mine" {
+		t.Fatal("user 7 should be able to use their own clone")
+	}
+
+	admin := fx.bot.voicesScreen(ctx, 1, fx.bot.resetSession(1, "", nil))
+	if !strings.Contains(admin.text, "Someone Else") || !strings.Contains(admin.text, "Old Clone") {
+		t.Error("admins see every voice")
+	}
+}
+
+func TestDictionariesArePrivate(t *testing.T) {
+	fx := newFixture(t, Config{AdminUsers: map[int64]bool{1: true}})
+	fx.bot.handleUpdate(context.Background(), press(7, "d:d-secret"))
+	if fx.bot.store.Get(7).DictID == "d-secret" {
+		t.Fatal("user 7 must not be able to use someone else's dictionary")
+	}
+}
+
+func TestClonesAreTaggedWithTheirCreator(t *testing.T) {
+	fx := newFixture(t, Config{AdminUsers: map[int64]bool{1: true}})
+	u := msg(1, "/clone Studio Voice")
+	u.Message.Voice = &telegram.Voice{FileID: "f1", Duration: 8, FileSize: 16}
+	fx.bot.handleUpdate(context.Background(), u)
+	if owner, ok := ownerOf(fx.cloneDesc); !ok || owner != 1 {
+		t.Fatalf("clone description %q should carry the creator's tag", fx.cloneDesc)
 	}
 }

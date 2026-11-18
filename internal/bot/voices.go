@@ -109,11 +109,22 @@ func (b *Bot) voicesScreen(ctx context.Context, uid int64, s *browseSession) scr
 	}
 	sb.WriteString("\n")
 
+	var visible []cartesia.Voice
+	for _, v := range res.Data {
+		if b.canUseVoice(uid, v) {
+			visible = append(visible, v)
+		}
+	}
 	k := &keys{}
-	if len(res.Data) == 0 {
+	switch {
+	case len(visible) == 0 && owned && !b.isAdmin(uid):
+		sb.WriteString("You haven't created any voices yet. Voices other people create stay private to them.")
+	case len(visible) == 0 && hasNext:
+		sb.WriteString("Nothing to show on this page. Tap Next ▶ to keep looking.")
+	case len(visible) == 0:
 		sb.WriteString("No voices match. Try another search or clear the filters.")
 	}
-	for _, v := range res.Data {
+	for _, v := range visible {
 		sb.WriteString("<b>" + html.EscapeString(v.Name) + "</b>")
 		if v.Tagline != "" {
 			sb.WriteString(" — " + html.EscapeString(v.Tagline))
@@ -209,6 +220,9 @@ func (b *Bot) selectVoice(ctx context.Context, uid int64, id string) (*cartesia.
 	if err != nil {
 		return nil, err
 	}
+	if !b.canUseVoice(uid, *v) {
+		return nil, errPrivateVoice
+	}
 	if _, err := b.store.Update(uid, func(s *Settings) { s.VoiceID, s.VoiceName = v.ID, v.Name }); err != nil {
 		return nil, err
 	}
@@ -253,6 +267,9 @@ func (b *Bot) voiceCard(ctx context.Context, uid int64, id string) screen {
 	if err != nil {
 		return errorScreen(err)
 	}
+	if !b.canUseVoice(uid, *v) {
+		return errorScreen(errPrivateVoice)
+	}
 	current := b.store.Get(uid).VoiceID == v.ID
 	text := voiceDetails(v)
 	if current {
@@ -281,8 +298,8 @@ func (b *Bot) voiceCard(ctx context.Context, uid int64, id string) screen {
 func voiceDetails(v *cartesia.Voice) string {
 	var sb strings.Builder
 	sb.WriteString(header(icStudio, v.Name, v.Tagline))
-	if v.Description != "" {
-		sb.WriteString(html.EscapeString(truncate(v.Description, 400)) + "\n\n")
+	if d := cleanDescription(v.Description); d != "" {
+		sb.WriteString(html.EscapeString(truncate(d, 400)) + "\n\n")
 	}
 	if f := voiceFacts(*v); f != "" {
 		sb.WriteString(html.EscapeString(f) + "\n")
@@ -305,11 +322,15 @@ func voiceDetails(v *cartesia.Voice) string {
 // ---------------------------------------------------------------- preview
 
 // sendPreview plays a voice's free preview clip with a button to choose it.
-func (b *Bot) sendPreview(ctx context.Context, chatID, replyTo int64, id string) {
+func (b *Bot) sendPreview(ctx context.Context, uid, chatID, replyTo int64, id string) {
 	_ = b.tg.SendChatAction(ctx, chatID, "upload_voice")
 	v, err := b.ct.GetVoice(ctx, id, true)
 	if err != nil {
 		b.sendScreen(ctx, chatID, replyTo, errorScreen(err))
+		return
+	}
+	if !b.canUseVoice(uid, *v) {
+		b.sendScreen(ctx, chatID, replyTo, errorScreen(errPrivateVoice))
 		return
 	}
 	if v.PreviewFileURL == "" {
@@ -449,7 +470,7 @@ func (b *Bot) runLocalize(ctx context.Context, uid int64, target *telegram.Messa
 	tctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	v, err := b.ct.LocalizeVoice(tctx, cartesia.LocalizeVoiceRequest{
 		VoiceID: s.VoiceID, Name: fmt.Sprintf("%s (%s)", orDefault(s.VoiceName, "Voice"), accent), Accent: accent,
-		Description: "Localized in Ellie Studio from " + s.VoiceID,
+		Description: withOwner("Localized in Ellie Studio from "+s.VoiceID, uid),
 	})
 	cancel()
 	b.release()

@@ -88,7 +88,7 @@ func (b *Bot) command(ctx context.Context, m *telegram.Message, cmd, args string
 			send(noVoiceScreen())
 			return
 		}
-		b.sendPreview(ctx, chat, m.MessageID, id)
+		b.sendPreview(ctx, uid, chat, m.MessageID, id)
 	case "style":
 		send(b.styleScreen(uid))
 	case "settings", "studio":
@@ -354,7 +354,7 @@ func (b *Bot) dictsScreen(ctx context.Context, uid int64) screen {
 	}
 	k := &keys{}
 	for _, d := range page.Data {
-		if len("d:"+d.ID) <= 64 {
+		if b.canUseDict(uid, d) && len("d:"+d.ID) <= 64 {
 			k.row(btn(mark(fmt.Sprintf("%s · %d words", truncate(d.Name, 28), len(d.Items)), d.ID == cur), "d:"+d.ID))
 		}
 	}
@@ -368,7 +368,7 @@ func (b *Bot) dictsScreen(ctx context.Context, uid int64) screen {
 
 func (b *Bot) createDict(ctx context.Context, m *telegram.Message, name string, items []cartesia.PronunciationItem) {
 	d, err := b.ct.CreatePronunciationDict(ctx, cartesia.PronunciationDictRequest{
-		Name: name, Description: "Created in Ellie Studio", Items: items,
+		Name: name, Description: withOwner("Created in Ellie Studio", m.From.ID), Items: items,
 	})
 	if err != nil {
 		b.fail(ctx, m, "create dict", err)
@@ -499,7 +499,7 @@ func (b *Bot) handleCallback(ctx context.Context, q *telegram.CallbackQuery) {
 		b.chooseVoice(ctx, q, val)
 	case "p":
 		ack("Fetching the preview…")
-		b.sendPreview(ctx, q.Message.Chat.ID, 0, val)
+		b.sendPreview(ctx, uid, q.Message.Chat.ID, 0, val)
 	case "vc":
 		ack("")
 		b.show(ctx, q, b.voiceCard(ctx, uid, val))
@@ -558,6 +558,9 @@ func (b *Bot) handleCallback(ctx context.Context, q *telegram.CallbackQuery) {
 		id, name := "", ""
 		if val != "-" {
 			d, err := b.ct.GetPronunciationDict(ctx, val)
+			if err == nil && !b.canUseDict(uid, *d) {
+				err = errPrivateDict
+			}
 			if err != nil {
 				ack("")
 				b.show(ctx, q, errorScreen(err))

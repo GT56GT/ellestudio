@@ -545,7 +545,7 @@ func (b *Bot) runClone(ctx context.Context, m *telegram.Message, a audioRef, nam
 		Clip:        bytes.NewReader(data),
 		Filename:    filename,
 		Name:        name,
-		Description: "Cloned in Ellie Studio",
+		Description: withOwner("Cloned in Ellie Studio", uid),
 		Language:    lang,
 	})
 	cancel()
