@@ -406,11 +406,25 @@ func speechCaption(s Settings) string {
 
 // ---------------------------------------------------------------- speech-to-text
 
-// reserveAudio claims a recording's length from the daily allowance. When the
-// length is unknown (a file sent as a document) it claims one second now and
-// the rest once Cartesia reports the duration. It returns the seconds claimed.
-func (b *Bot) reserveAudio(ctx context.Context, m *telegram.Message, a audioRef) (int, bool) {
-	secs := max(a.Seconds, 1)
+// bytesPerAudioSec turns a file size into a generous length estimate: 16 kbps
+// is below what voice notes and music files use, so most recordings are
+// estimated longer than they really are.
+const bytesPerAudioSec = 16000 / 8
+
+// audioEstimate is the seconds to reserve for a recording. Durations come
+// from the sender's app (and files sent as documents have none), so they are
+// not trusted alone: the file size sets a floor on the estimate.
+func audioEstimate(a audioRef) int {
+	return max(a.Seconds, int(a.Size/bytesPerAudioSec), 1)
+}
+
+// reserveAudio claims the estimated length of a recording from the daily
+// allowance up front, refusing it if that would pass the limit.
+func (b *Bot) reserveAudio(ctx context.Context, m *telegram.Message, a audioRef, capSecs int) (int, bool) {
+	secs := audioEstimate(a)
+	if capSecs > 0 {
+		secs = min(secs, capSecs)
+	}
 	if ok, u := b.spendSecs(m.From.ID, secs); !ok {
 		ls := b.limitScreen(false, u, secs)
 		b.replyHTML(ctx, m, ls.text, ls.kb)
@@ -419,13 +433,20 @@ func (b *Bot) reserveAudio(ctx context.Context, m *telegram.Message, a audioRef)
 	return secs, true
 }
 
-// settleAudio records the true length once known, without refusing (the
-// work is already done).
+// settleAudio corrects a reservation to the real length Cartesia reported:
+// it refunds an over-estimate and records an under-estimate (without
+// refusing, since the work is already done).
 func (b *Bot) settleAudio(uid int64, claimed int, actual float64) {
-	if extra := int(actual+0.999) - claimed; extra > 0 && !b.isAdmin(uid) {
-		if _, _, err := b.store.Spend(uid, today(), 0, extra, 0, 0); err != nil {
+	if actual <= 0 || b.isAdmin(uid) {
+		return
+	}
+	switch diff := int(actual+0.999) - claimed; {
+	case diff > 0:
+		if _, _, err := b.store.Spend(uid, today(), 0, diff, 0, 0); err != nil {
 			b.log.Warn("save usage", "err", err)
 		}
+	case diff < 0:
+		b.store.Refund(uid, today(), 0, -diff)
 	}
 }
 
@@ -436,7 +457,7 @@ func (b *Bot) transcribe(ctx context.Context, m *telegram.Message, a audioRef) {
 		return
 	}
 	defer b.end(uid)
-	claimed, ok := b.reserveAudio(ctx, m, a)
+	claimed, ok := b.reserveAudio(ctx, m, a, 0)
 	if !ok {
 		return
 	}
@@ -554,7 +575,7 @@ func (b *Bot) detect(ctx context.Context, m *telegram.Message, a audioRef) {
 		return
 	}
 	defer b.end(uid)
-	claimed, ok := b.reserveAudio(ctx, m, a)
+	claimed, ok := b.reserveAudio(ctx, m, a, cartesia.MaxWatermarkSecs)
 	if !ok {
 		return
 	}

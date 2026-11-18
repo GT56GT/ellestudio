@@ -555,3 +555,32 @@ func TestOneRequestAtATime(t *testing.T) {
 		t.Fatal("after the first job ends, the next should run")
 	}
 }
+
+func TestAudioEstimateDoesNotTrustClaimedDuration(t *testing.T) {
+	// A 2 MB file claiming 1 second (or sent as a document with no duration)
+	// is reserved by size: 2 MB at 16 kbps is about 1,048 seconds.
+	if got := audioEstimate(audioRef{Seconds: 1, Size: 2 << 20}); got < 1000 {
+		t.Fatalf("estimate = %ds, want the size-based floor", got)
+	}
+	if got := audioEstimate(audioRef{Seconds: 30, Size: 1000}); got != 30 {
+		t.Fatalf("estimate = %ds, want the longer claimed duration", got)
+	}
+
+	fx := newFixture(t, Config{AdminUsers: map[int64]bool{1: true}, DailyAudioSecs: 600})
+	u := msg(7, "")
+	u.Message.Document = &telegram.Document{FileID: "f1", FileName: "talk.mp3", MimeType: "audio/mpeg", FileSize: 2 << 20}
+	fx.bot.handleUpdate(context.Background(), u)
+	if fx.sttIn != nil {
+		t.Fatal("a ~17 minute file must not slip past a 10 minute allowance")
+	}
+}
+
+func TestOverEstimateIsRefunded(t *testing.T) {
+	fx := newFixture(t, Config{AdminUsers: map[int64]bool{1: true}, DailyAudioSecs: 600})
+	u := msg(7, "")
+	u.Message.Voice = &telegram.Voice{FileID: "f1", Duration: 2, FileSize: 40000} // estimated 20s
+	fx.bot.handleUpdate(context.Background(), u)
+	if got := fx.bot.store.UsageOn(7, today()).Secs; got != 3 {
+		t.Fatalf("usage should settle to the real 2.5s (3s), got %ds", got)
+	}
+}
