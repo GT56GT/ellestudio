@@ -28,6 +28,7 @@ type Settings struct {
 	UsedChars int    `json:"used_chars,omitempty"`
 	UsedSecs  int    `json:"used_secs,omitempty"`
 	UsedMakes int    `json:"used_makes,omitempty"` // voices created today
+	UsedDicts int    `json:"used_dicts,omitempty"` // dictionaries created today
 }
 
 // Usage is what a user has spent today.
@@ -57,7 +58,10 @@ func (s *Store) Spend(uid int64, day string, chars, secs, charLimit, secLimit in
 	}
 	u.Chars += chars
 	u.Secs += secs
-	v.UsageDay, v.UsedChars, v.UsedSecs, v.UsedMakes = day, u.Chars, u.Secs, u.Makes
+	if v.UsageDay != day {
+		v.UsedMakes, v.UsedDicts = 0, 0
+	}
+	v.UsageDay, v.UsedChars, v.UsedSecs = day, u.Chars, u.Secs
 	s.data[uid] = v
 	return true, u, s.saveLocked()
 }
@@ -87,9 +91,40 @@ func (s *Store) SpendMake(uid int64, day string, limit int) (bool, Usage, error)
 		return false, u, nil
 	}
 	u.Makes++
+	if v.UsageDay != day {
+		v.UsedDicts = 0
+	}
 	v.UsageDay, v.UsedChars, v.UsedSecs, v.UsedMakes = day, u.Chars, u.Secs, u.Makes
 	s.data[uid] = v
 	return true, u, s.saveLocked()
+}
+
+// SpendDict records one new dictionary for day unless that would pass limit
+// (0 = unlimited). It returns whether it was recorded and today's count.
+func (s *Store) SpendDict(uid int64, day string, limit int) (bool, int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v := s.data[uid]
+	if v.UsageDay != day {
+		v.UsageDay, v.UsedChars, v.UsedSecs, v.UsedMakes, v.UsedDicts = day, 0, 0, 0, 0
+	}
+	if limit > 0 && v.UsedDicts+1 > limit {
+		return false, v.UsedDicts, nil
+	}
+	v.UsedDicts++
+	s.data[uid] = v
+	return true, v.UsedDicts, s.saveLocked()
+}
+
+// RefundDict gives back a SpendDict (the creation failed).
+func (s *Store) RefundDict(uid int64, day string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if v, ok := s.data[uid]; ok && v.UsageDay == day && v.UsedDicts > 0 {
+		v.UsedDicts--
+		s.data[uid] = v
+		_ = s.saveLocked()
+	}
 }
 
 // RefundMake gives back a SpendMake (the creation failed).
@@ -201,7 +236,8 @@ func (s *Store) Reset(uid int64) error {
 	if !ok {
 		return nil
 	}
-	s.data[uid] = Settings{UsageDay: old.UsageDay, UsedChars: old.UsedChars, UsedSecs: old.UsedSecs, UsedMakes: old.UsedMakes}
+	s.data[uid] = Settings{UsageDay: old.UsageDay, UsedChars: old.UsedChars, UsedSecs: old.UsedSecs,
+		UsedMakes: old.UsedMakes, UsedDicts: old.UsedDicts}
 	return s.saveLocked()
 }
 

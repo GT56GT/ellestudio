@@ -295,7 +295,7 @@ func (b *Bot) voiceCard(ctx context.Context, uid int64, id string) screen {
 func voiceDetails(v *cartesia.Voice, mine bool) string {
 	var sb strings.Builder
 	sb.WriteString(header(icStudio, v.Name, v.Tagline))
-	if d := cleanDescription(v.Description); d != "" {
+	if d := hideVoiceIDs(cleanDescription(v.Description)); d != "" {
 		sb.WriteString(html.EscapeString(truncate(d, 400)) + "\n\n")
 	}
 	if f := voiceFacts(*v, mine); f != "" {
@@ -476,7 +476,7 @@ func (b *Bot) runLocalize(ctx context.Context, uid int64, target *telegram.Messa
 	tctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	v, err := b.ct.LocalizeVoice(tctx, cartesia.LocalizeVoiceRequest{
 		VoiceID: s.VoiceID, Name: fmt.Sprintf("%s (%s)", orDefault(s.VoiceName, "Voice"), accent), Accent: accent,
-		Description: withOwner("Localized in Ellie Studio from "+s.VoiceID, uid),
+		Description: withOwner("Localized in Ellie Studio from "+src.Name, uid),
 	})
 	cancel()
 	b.release()

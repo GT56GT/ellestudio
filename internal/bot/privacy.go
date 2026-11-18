@@ -105,6 +105,13 @@ func parseVoiceRef(text string) (string, bool) {
 	return "", false
 }
 
+// hideVoiceIDs blanks voice IDs inside a description. An ID is a key to that
+// voice, so a description must never hand one to whoever can read it (older
+// localized voices named their source by ID).
+func hideVoiceIDs(s string) string {
+	return strings.TrimSpace(voiceIDRe.ReplaceAllString(s, "another voice"))
+}
+
 // shareLink opens the bot straight onto a voice.
 func (b *Bot) shareLink(id string) string {
 	return "https://t.me/" + orDefault(b.username, "EllieStudioBot") + "?start=v_" + id

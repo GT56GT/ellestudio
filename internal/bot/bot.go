@@ -43,6 +43,9 @@ type Config struct {
 	// DailyCreations caps new voices (clones + localizations) per user per
 	// UTC day (0 = unlimited). Admins are exempt.
 	DailyCreations int
+	// DailyDicts caps new pronunciation dictionaries per user per UTC day
+	// (0 = unlimited). Admins are exempt.
+	DailyDicts int
 }
 
 // Bot is the running studio.

@@ -375,10 +375,27 @@ func (b *Bot) dictsScreen(ctx context.Context, uid int64) screen {
 }
 
 func (b *Bot) createDict(ctx context.Context, m *telegram.Message, name string, items []cartesia.PronunciationItem) {
+	uid := m.From.ID
+	if !b.isAdmin(uid) {
+		ok, used, err := b.store.SpendDict(uid, today(), b.cfg.DailyDicts)
+		if err != nil {
+			b.log.Warn("save usage", "err", err)
+		}
+		if !ok {
+			s := noticeScreen("🎟", "Daily dictionary limit reached", fmt.Sprintf(
+				"You've created <b>%d</b> of your <b>%d</b> dictionaries for today. You can make more in <b>%s</b> (midnight UTC).",
+				used, b.cfg.DailyDicts, fmtWait(untilReset())))
+			b.replyHTML(ctx, m, s.text, s.kb)
+			return
+		}
+	}
 	d, err := b.ct.CreatePronunciationDict(ctx, cartesia.PronunciationDictRequest{
-		Name: name, Description: withOwner("Created in Ellie Studio", m.From.ID), Items: items,
+		Name: name, Description: withOwner("Created in Ellie Studio", uid), Items: items,
 	})
 	if err != nil {
+		if !b.isAdmin(uid) {
+			b.store.RefundDict(uid, today())
+		}
 		b.fail(ctx, m, "create dict", err)
 		return
 	}

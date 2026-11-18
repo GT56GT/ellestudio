@@ -744,3 +744,35 @@ func TestAnyoneCanCloneWithinTheDailyLimit(t *testing.T) {
 		t.Fatalf("the second clone should hit the daily limit: %q", fx.tg.lastText())
 	}
 }
+
+func TestDictionariesHaveADailyLimit(t *testing.T) {
+	fx := newFixture(t, Config{AdminUsers: map[int64]bool{1: true}, DailyDicts: 1})
+	created := 0
+	fx.bot.ct = cartesiaWithDicts(t, &created)
+	ctx := context.Background()
+	fx.bot.handleUpdate(ctx, msg(7, "/newdict First\nA = ay"))
+	fx.bot.handleUpdate(ctx, msg(7, "/newdict Second\nB = bee"))
+	if created != 1 || !strings.Contains(fx.tg.lastText(), "Daily dictionary limit reached") {
+		t.Fatalf("created %d dictionaries, last reply %q", created, fx.tg.lastText())
+	}
+}
+
+func TestDescriptionsNeverRevealVoiceIDs(t *testing.T) {
+	id := "a0e99841-438c-4a64-b679-ae501e7d6091"
+	v := &cartesia.Voice{ID: "x", Name: "Loc", IsOwner: true,
+		Description: "Localized in Ellie Studio from " + id + " [ellie-owner:9]"}
+	if out := voiceDetails(v, false); strings.Contains(out, id) || strings.Contains(out, "ellie-owner") {
+		t.Fatalf("description leaked a key or tag: %q", out)
+	}
+}
+
+// cartesiaWithDicts is a Cartesia stand-in that counts dictionary creations.
+func cartesiaWithDicts(t *testing.T, created *int) *cartesia.Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*created++
+		_, _ = io.WriteString(w, `{"id":"d1","name":"First","items":[{"text":"A","pronunciation":"ay"}]}`)
+	}))
+	t.Cleanup(srv.Close)
+	return cartesia.New("sk_car_test", cartesia.WithBaseURL(srv.URL))
+}
