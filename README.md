@@ -18,6 +18,17 @@ go run ./cmd/ellie
 
 Don't know your Telegram ID? Start the bot with `ALLOWED_USER_IDS` set to anything (for example `1`), message it, and it replies with your ID.
 
+## How it feels
+
+- **A menu that never goes away:** 🎙 Speak · 🎧 Voices · 🎛 Style · 📝 Transcribe · 🏠 Home · ❓ Help sit under the message box.
+- **A Home card** shows your current voice, style and output, with buttons to every area.
+- **No dead ends:** every screen ends with `◀ Back` / `🏠 Home`. Pickers mark your choice with ✅ and redraw in place.
+- **Guided steps** for search, cloning (clip → name) and pronunciation dictionaries. Each shows "Step 1 of 2" and a ✖ Cancel button.
+- **A next step after every result:** voice notes come with 🔁 Again · 🎭 Emotion · 🎧 Voice · 🎛 Style · 🏠 Home. Transcripts offer 🔊 Read aloud. Previews offer ✅ Use this voice.
+- **Progress you can see:** "⏳ Listening…" turns into the transcript, and "⏳ Cloning…" turns into the new voice card.
+- **Errors point to the fix,** for example "voice not found" comes with a 🎧 Pick a voice button.
+- Slash commands still work for power users. Help → Commands lists them all.
+
 ## What it does
 
 | You do | Ellie does | Cartesia endpoint |

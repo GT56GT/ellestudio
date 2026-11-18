@@ -14,12 +14,13 @@ import (
 
 const voicesPerPage = 6
 
-// browseSession remembers where a user is in the voice library so that
-// callback buttons stay within Telegram's 64-byte callback_data limit.
+// browseSession remembers where a user is in the voice library so buttons stay
+// inside Telegram's 64-byte callback_data limit.
 type browseSession struct {
 	query   string
+	gender  string // "", feminine, masculine
 	owned   bool
-	cursors []string // starting_after for each visited page; [0] == ""
+	cursors []string // starting_after per visited page; [0] == ""
 	next    string
 }
 
@@ -29,38 +30,47 @@ func (b *Bot) session(uid int64) *browseSession {
 	return b.sessions[uid]
 }
 
-func (b *Bot) setSession(uid int64, s *browseSession) {
+// resetSession starts a fresh browse, keeping the user's filters.
+func (b *Bot) resetSession(uid int64, query string, owned *bool) *browseSession {
 	b.sessMu.Lock()
 	defer b.sessMu.Unlock()
-	b.sessions[uid] = s
-}
-
-// ---------------------------------------------------------------- browse
-
-func (b *Bot) cmdVoices(ctx context.Context, m *telegram.Message, query string, owned bool) {
-	s := &browseSession{query: query, owned: owned, cursors: []string{""}}
-	b.setSession(m.From.ID, s)
-	text, kb, err := b.renderVoicePage(ctx, s)
-	if err != nil {
-		b.fail(ctx, m, "list voices", err)
-		return
+	s := &browseSession{query: query, cursors: []string{""}}
+	if old := b.sessions[uid]; old != nil {
+		s.gender, s.owned = old.gender, old.owned
 	}
-	b.replyHTML(ctx, m, text, kb)
+	if owned != nil {
+		s.owned = *owned
+	}
+	b.sessions[uid] = s
+	return s
 }
 
-// renderVoicePage fetches the session's current page. The session lock is not
-// held during the network call, so the cursor is read up front.
-func (b *Bot) renderVoicePage(ctx context.Context, s *browseSession) (string, *telegram.InlineKeyboardMarkup, error) {
+func noVoiceScreen() screen {
+	return screen{
+		header(icVoices, "Pick a voice first", "") + "Choose who should speak, then send your text again.",
+		(&keys{}).row(btn(icVoices+" Browse voices", "nav:voices")).nav("", "").build(),
+	}
+}
+
+// ---------------------------------------------------------------- library
+
+// openVoices posts a fresh voice library screen.
+func (b *Bot) openVoices(ctx context.Context, chatID, uid int64, query string, owned *bool) {
+	s := b.resetSession(uid, query, owned)
+	b.sendScreen(ctx, chatID, 0, b.voicesScreen(ctx, uid, s))
+}
+
+func (b *Bot) voicesScreen(ctx context.Context, uid int64, s *browseSession) screen {
 	b.sessMu.Lock()
 	cursor, page := s.cursors[len(s.cursors)-1], len(s.cursors)
-	query, owned := s.query, s.owned
+	query, gender, owned := s.query, s.gender, s.owned
 	b.sessMu.Unlock()
 
 	res, err := b.ct.ListVoices(ctx, cartesia.ListVoicesParams{
-		Limit: voicesPerPage, Q: query, OwnedOnly: owned, StartingAfter: cursor,
+		Limit: voicesPerPage, Q: query, Gender: gender, OwnedOnly: owned, StartingAfter: cursor,
 	})
 	if err != nil {
-		return "", nil, err
+		return errorScreen(err)
 	}
 	b.sessMu.Lock()
 	s.next = ""
@@ -73,47 +83,71 @@ func (b *Bot) renderVoicePage(ctx context.Context, s *browseSession) (string, *t
 	hasNext := s.next != ""
 	b.sessMu.Unlock()
 
+	cur := b.store.Get(uid)
 	var sb strings.Builder
-	title := "🎧 Voice library"
+	sb.WriteString(header(icVoices, "Voices", "Tap a name to use it · 🔊 to hear it first"))
+	sb.WriteString(field(icStudio, "Now using", orDefault(cur.VoiceName, "none yet")))
+	var showing []string
+	switch gender {
+	case "feminine":
+		showing = append(showing, "♀ feminine")
+	case "masculine":
+		showing = append(showing, "♂ masculine")
+	}
 	if owned {
-		title = "🗂 Your voices"
+		showing = append(showing, "mine")
 	}
-	fmt.Fprintf(&sb, "<b>%s</b>", title)
 	if query != "" {
-		fmt.Fprintf(&sb, " · “%s”", html.EscapeString(query))
+		showing = append(showing, "“"+query+"”")
 	}
-	fmt.Fprintf(&sb, " · page %d\n\n", page)
-	if len(res.Data) == 0 {
-		sb.WriteString("No voices found. Try another search: /voices <words>")
-		return sb.String(), nil, nil
+	if len(showing) == 0 {
+		showing = append(showing, "all voices")
 	}
+	sb.WriteString(field("🔎", "Showing", strings.Join(showing, " · ")))
+	if page > 1 {
+		sb.WriteString(fmt.Sprintf("<i>Page %d</i>\n", page))
+	}
+	sb.WriteString("\n")
 
-	kb := &telegram.InlineKeyboardMarkup{}
-	for i, v := range res.Data {
-		fmt.Fprintf(&sb, "%d. <b>%s</b>", i+1, html.EscapeString(v.Name))
+	k := &keys{}
+	if len(res.Data) == 0 {
+		sb.WriteString("No voices match. Try another search or clear the filters.")
+	}
+	for _, v := range res.Data {
+		sb.WriteString("<b>" + html.EscapeString(v.Name) + "</b>")
 		if v.Tagline != "" {
-			fmt.Fprintf(&sb, " — %s", html.EscapeString(v.Tagline))
+			sb.WriteString(" — " + html.EscapeString(v.Tagline))
 		}
-		sb.WriteString("\n   <i>" + html.EscapeString(voiceFacts(v)) + "</i>\n")
-		if len("v:"+v.ID) > 64 {
+		sb.WriteString("\n<i>" + html.EscapeString(voiceFacts(v)) + "</i>\n\n")
+		if len("vc:"+v.ID) > 64 {
 			continue
 		}
-		kb.InlineKeyboard = append(kb.InlineKeyboard, []telegram.InlineKeyboardButton{
-			{Text: fmt.Sprintf("%d. Use %s", i+1, truncate(v.Name, 24)), CallbackData: "v:" + v.ID},
-			{Text: "🔊 Preview", CallbackData: "p:" + v.ID},
-		})
+		k.row(btn(mark(truncate(v.Name, 28), v.ID == cur.VoiceID), "v:"+v.ID), btn("🔊", "p:"+v.ID))
 	}
-	var nav []telegram.InlineKeyboardButton
+	var paging []telegram.InlineKeyboardButton
 	if page > 1 {
-		nav = append(nav, telegram.InlineKeyboardButton{Text: "◀ Back", CallbackData: "vb"})
+		paging = append(paging, btn(icBack+" Previous", "vb"))
 	}
 	if hasNext {
-		nav = append(nav, telegram.InlineKeyboardButton{Text: "Next ▶", CallbackData: "vn"})
+		paging = append(paging, btn("Next ▶", "vn"))
 	}
-	if len(nav) > 0 {
-		kb.InlineKeyboard = append(kb.InlineKeyboard, nav)
+	k.row(paging...)
+	k.row(
+		btn(mark("All", gender == ""), "vf:all"),
+		btn(mark("♀", gender == "feminine"), "vf:feminine"),
+		btn(mark("♂", gender == "masculine"), "vf:masculine"),
+		btn(mark("Mine", owned), "vm"),
+	)
+	search := btn("🔍 Search", "do:search")
+	if query != "" {
+		k.row(search, btn(icCancel+" Clear search", "vq"))
+	} else if cur.VoiceID != "" {
+		k.row(search, btn("ℹ️ About "+truncate(orDefault(cur.VoiceName, "my voice"), 14), "vc:"+cur.VoiceID))
+	} else {
+		k.row(search)
 	}
-	return sb.String(), kb, nil
+	k.nav("", "")
+	return screen{strings.TrimRight(sb.String(), "\n"), k.build()}
 }
 
 func voiceFacts(v cartesia.Voice) string {
@@ -136,31 +170,39 @@ func voiceFacts(v cartesia.Voice) string {
 	return strings.Join(f, " · ")
 }
 
-// pageVoices moves the browse session forward (+1) or back (-1).
-func (b *Bot) pageVoices(ctx context.Context, q *telegram.CallbackQuery, dir int) {
-	s := b.session(q.From.ID)
+// browse applies a library button (paging, filters) and redraws in place.
+func (b *Bot) browse(ctx context.Context, q *telegram.CallbackQuery, kind, val string) {
+	uid := q.From.ID
+	s := b.session(uid)
 	if s == nil {
-		_ = b.tg.AnswerCallbackQuery(ctx, q.ID, "This list expired. Run /voices again.")
-		return
+		s = b.resetSession(uid, "", nil)
 	}
 	b.sessMu.Lock()
-	switch {
-	case dir > 0 && s.next != "":
-		s.cursors = append(s.cursors, s.next)
-	case dir < 0 && len(s.cursors) > 1:
-		s.cursors = s.cursors[:len(s.cursors)-1]
+	switch kind {
+	case "vn":
+		if s.next != "" {
+			s.cursors = append(s.cursors, s.next)
+		}
+	case "vb":
+		if len(s.cursors) > 1 {
+			s.cursors = s.cursors[:len(s.cursors)-1]
+		}
+	case "vf":
+		s.gender = map[string]string{"feminine": "feminine", "masculine": "masculine"}[val]
+		s.cursors = []string{""}
+	case "vm":
+		s.owned = !s.owned
+		s.cursors = []string{""}
+	case "vq":
+		s.query = ""
+		s.cursors = []string{""}
 	}
 	b.sessMu.Unlock()
 	_ = b.tg.AnswerCallbackQuery(ctx, q.ID, "")
-	text, kb, err := b.renderVoicePage(ctx, s)
-	if err != nil {
-		b.editHTML(ctx, q.Message, "⚠️ "+explain(err), nil)
-		return
-	}
-	b.editHTML(ctx, q.Message, text, kb)
+	b.show(ctx, q, b.voicesScreen(ctx, uid, s))
 }
 
-// ---------------------------------------------------------------- select / show
+// ---------------------------------------------------------------- choosing
 
 func (b *Bot) selectVoice(ctx context.Context, uid int64, id string) (*cartesia.Voice, error) {
 	v, err := b.ct.GetVoice(ctx, id, false)
@@ -173,88 +215,113 @@ func (b *Bot) selectVoice(ctx context.Context, uid int64, id string) (*cartesia.
 	return v, nil
 }
 
-func (b *Bot) cmdVoice(ctx context.Context, m *telegram.Message, args string) {
-	if args != "" {
-		v, err := b.selectVoice(ctx, m.From.ID, args)
-		if err != nil {
-			b.fail(ctx, m, "select voice", err)
-			return
-		}
-		b.replyHTML(ctx, m, "✅ Now speaking as <b>"+html.EscapeString(v.Name)+"</b>. Send any text to hear it.", nil)
-		return
-	}
-	s := b.store.Get(m.From.ID)
-	if s.VoiceID == "" {
-		b.reply(ctx, m, "No voice selected yet. Browse with /voices.")
-		return
-	}
-	v, err := b.ct.GetVoice(ctx, s.VoiceID, false)
+func voiceChosenScreen(v *cartesia.Voice) screen {
+	text := header(icOK, "Now speaking as "+v.Name, voiceFacts(*v)) + "Send any text to hear it, or try a sample."
+	k := (&keys{}).
+		row(btn(icPlay+" Hear a sample", "do:sample"), btn(icStyle+" Style", "nav:style")).
+		nav("Voices", "nav:voices")
+	return screen{text, k.build()}
+}
+
+// chooseVoice handles a "use this voice" button.
+func (b *Bot) chooseVoice(ctx context.Context, q *telegram.CallbackQuery, id string) {
+	v, err := b.selectVoice(ctx, q.From.ID, id)
 	if err != nil {
-		b.fail(ctx, m, "get voice", err)
+		_ = b.tg.AnswerCallbackQuery(ctx, q.ID, "Couldn't switch to that voice")
+		b.show(ctx, q, errorScreen(err))
 		return
 	}
-	kb := &telegram.InlineKeyboardMarkup{InlineKeyboard: [][]telegram.InlineKeyboardButton{
-		{{Text: "🔊 Preview", CallbackData: "p:" + v.ID}},
-	}}
-	b.replyHTML(ctx, m, voiceDetails(v), kb)
+	_ = b.tg.AnswerCallbackQuery(ctx, q.ID, icOK+" Now speaking as "+v.Name)
+	// From the library list, redraw the list so the ✅ moves; elsewhere confirm.
+	if s := b.session(q.From.ID); s != nil && q.Message.Text != "" && strings.Contains(q.Message.Text, "Tap a name to use it") {
+		b.show(ctx, q, b.voicesScreen(ctx, q.From.ID, s))
+		return
+	}
+	b.show(ctx, q, voiceChosenScreen(v))
+}
+
+// ---------------------------------------------------------------- voice card
+
+func (b *Bot) voiceCard(ctx context.Context, uid int64, id string) screen {
+	if id == "" {
+		id = b.store.Get(uid).VoiceID
+	}
+	if id == "" {
+		return noVoiceScreen()
+	}
+	v, err := b.ct.GetVoice(ctx, id, false)
+	if err != nil {
+		return errorScreen(err)
+	}
+	current := b.store.Get(uid).VoiceID == v.ID
+	text := voiceDetails(v)
+	if current {
+		text += "\n" + icOK + " <i>This is your current voice.</i>"
+	}
+	k := &keys{}
+	if current {
+		k.row(btn("🔊 Preview", "p:"+v.ID), btn(icPlay+" Hear a sample", "do:sample"))
+	} else {
+		k.row(btn(icOK+" Use this voice", "v:"+v.ID), btn("🔊 Preview", "p:"+v.ID))
+	}
+	if b.isAdmin(uid) {
+		if v.IsOwner && current {
+			k.row(btn("✏️ Rename", "do:rename"), btn("🗑 Delete", "dv:"+v.ID))
+		} else if v.IsOwner {
+			k.row(btn("🗑 Delete", "dv:"+v.ID))
+		}
+		if current {
+			k.row(btn(icLocalize+" Localize into another accent", "nav:localize"))
+		}
+	}
+	k.nav("Voices", "nav:voices")
+	return screen{text, k.build()}
 }
 
 func voiceDetails(v *cartesia.Voice) string {
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "🎙 <b>%s</b>", html.EscapeString(v.Name))
-	if v.Tagline != "" {
-		fmt.Fprintf(&sb, " — %s", html.EscapeString(v.Tagline))
-	}
-	sb.WriteString("\n")
+	sb.WriteString(header(icStudio, v.Name, v.Tagline))
 	if v.Description != "" {
-		sb.WriteString(html.EscapeString(truncate(v.Description, 400)) + "\n")
+		sb.WriteString(html.EscapeString(truncate(v.Description, 400)) + "\n\n")
 	}
-	fmt.Fprintf(&sb, "\nID: <code>%s</code>\n", html.EscapeString(v.ID))
 	if f := voiceFacts(*v); f != "" {
 		sb.WriteString(html.EscapeString(f) + "\n")
 	}
 	if len(v.Accents) > 0 {
 		var acc []string
 		for _, a := range v.Accents {
-			label := a.Accent + " (" + a.Locale
+			label := a.Accent
 			if a.IsNative {
-				label += ", native"
+				label += " (native)"
 			}
-			acc = append(acc, label+")")
+			acc = append(acc, label)
 		}
 		sb.WriteString("Accents: " + html.EscapeString(strings.Join(acc, ", ")) + "\n")
 	}
+	sb.WriteString("ID: <code>" + html.EscapeString(v.ID) + "</code>\n")
 	return sb.String()
 }
 
 // ---------------------------------------------------------------- preview
 
-func (b *Bot) cmdPreview(ctx context.Context, m *telegram.Message, id string) {
-	if id == "" {
-		id = b.store.Get(m.From.ID).VoiceID
-	}
-	if id == "" {
-		b.reply(ctx, m, "Usage: /preview <voice id>, or pick a voice first with /voices.")
-		return
-	}
-	b.sendPreview(ctx, m, id)
-}
-
-// sendPreview plays a voice's free preview clip (no credits used).
-func (b *Bot) sendPreview(ctx context.Context, m *telegram.Message, id string) {
-	_ = b.tg.SendChatAction(ctx, m.Chat.ID, "upload_voice")
+// sendPreview plays a voice's free preview clip with a button to choose it.
+func (b *Bot) sendPreview(ctx context.Context, chatID, replyTo int64, id string) {
+	_ = b.tg.SendChatAction(ctx, chatID, "upload_voice")
 	v, err := b.ct.GetVoice(ctx, id, true)
 	if err != nil {
-		b.fail(ctx, m, "get voice", err)
+		b.sendScreen(ctx, chatID, replyTo, errorScreen(err))
 		return
 	}
 	if v.PreviewFileURL == "" {
-		b.reply(ctx, m, "That voice has no preview clip. Send text after selecting it to hear it.")
+		b.sendScreen(ctx, chatID, replyTo, screen{
+			header("🔊", v.Name, "") + "This voice has no preview clip. Choose it and send some text to hear it.",
+			(&keys{}).row(btn(icOK+" Use this voice", "v:"+v.ID)).nav("Voices", "nav:voices").build(),
+		})
 		return
 	}
 	data, ct, err := b.ct.DownloadPreview(ctx, v.PreviewFileURL)
 	if err != nil {
-		b.fail(ctx, m, "download preview", err)
+		b.sendScreen(ctx, chatID, replyTo, errorScreen(err))
 		return
 	}
 	ext := ".mp3"
@@ -264,16 +331,17 @@ func (b *Bot) sendPreview(ctx context.Context, m *telegram.Message, id string) {
 		}
 	}
 	_, err = b.tg.SendAudio(ctx, telegram.MediaParams{
-		ChatID: m.Chat.ID, ReplyTo: m.MessageID, Data: data,
+		ChatID: chatID, ReplyTo: replyTo, Data: data,
 		Filename: "preview" + ext, Title: v.Name + " — preview",
-		Caption: "🔊 " + v.Name + " (preview)",
+		Caption:     "🔊 " + v.Name + " · free preview",
+		ReplyMarkup: (&keys{}).row(btn(icOK+" Use "+truncate(v.Name, 24), "v:"+v.ID)).nav("Voices", "nav:voices").build(),
 	})
 	if err != nil {
-		b.fail(ctx, m, "send preview", err)
+		b.log.Warn("send preview", "err", err)
 	}
 }
 
-// ---------------------------------------------------------------- accents
+// ---------------------------------------------------------------- accents (command)
 
 func (b *Bot) cmdAccents(ctx context.Context, m *telegram.Message, args string) {
 	f := cartesia.AccentFilter{}
@@ -293,17 +361,18 @@ func (b *Bot) cmdAccents(ctx context.Context, m *telegram.Message, args string) 
 		return
 	}
 	if len(list) == 0 {
-		b.reply(ctx, m, "No accents found for that. Try /accents all.")
+		ns := noticeScreen(icLocalize, "Accents", "No accents found for that. Try <code>/accents all</code>.")
+		b.replyHTML(ctx, m, ns.text, ns.kb)
 		return
 	}
-	lines := []string{"<b>🌍 Accents</b> (🔁 = you can /localize into it)", ""}
+	lines := []string{header(icLocalize, "Accents", "🔁 = you can localize a voice into it")}
 	for _, a := range list {
-		mark := ""
+		mk := ""
 		if a.IsLocalizable {
-			mark = " 🔁"
+			mk = " 🔁"
 		}
 		lines = append(lines, fmt.Sprintf("• <code>%s</code> — %s (%s)%s",
-			html.EscapeString(a.ID), html.EscapeString(a.Name), html.EscapeString(a.Locale), mark))
+			html.EscapeString(a.ID), html.EscapeString(a.Name), html.EscapeString(a.Locale), mk))
 	}
 	b.replyHTMLLines(ctx, m, lines)
 }
@@ -319,117 +388,155 @@ func (b *Bot) replyHTMLLines(ctx context.Context, m *telegram.Message, lines []s
 		cur.WriteString(l + "\n")
 	}
 	if cur.Len() > 0 {
-		b.replyHTML(ctx, m, cur.String(), nil)
+		b.replyHTML(ctx, m, cur.String(), (&keys{}).nav("", "").build())
 	}
 }
 
-// ---------------------------------------------------------------- localize / rename / delete
+// ---------------------------------------------------------------- localize
 
-func (b *Bot) cmdLocalize(ctx context.Context, m *telegram.Message, args string) {
-	if !b.isAdmin(m.From.ID) {
-		b.reply(ctx, m, "Only studio admins can localize voices.")
-		return
+func (b *Bot) localizeScreen(ctx context.Context, uid int64) screen {
+	if !b.isAdmin(uid) {
+		return b.createScreen(uid)
 	}
-	accent, name, _ := strings.Cut(strings.TrimSpace(args), " ")
-	if accent == "" {
-		b.reply(ctx, m, "Usage: /localize <accent id> [new voice name]\nFind accent ids with /accents (🔁 marks localizable ones).")
-		return
-	}
-	s := b.store.Get(m.From.ID)
+	s := b.store.Get(uid)
 	if s.VoiceID == "" {
-		b.reply(ctx, m, "Pick the voice to localize first with /voices.")
+		return noVoiceScreen()
+	}
+	v, err := b.ct.GetVoice(ctx, s.VoiceID, false)
+	if err != nil {
+		return errorScreen(err)
+	}
+	accents, err := b.ct.ListAccents(ctx, cartesia.AccentFilter{LocalizableOnly: true, Language: v.Language})
+	if err != nil {
+		return errorScreen(err)
+	}
+	has := map[string]bool{}
+	for _, a := range v.Accents {
+		has[a.Accent] = true
+	}
+	var bs []telegram.InlineKeyboardButton
+	for _, a := range accents {
+		if !has[a.ID] && len("loc:"+a.ID) <= 64 {
+			bs = append(bs, btn(icLocalize+" "+a.Name, "loc:"+a.ID))
+		}
+	}
+	text := header(icLocalize, "Localize "+v.Name, "Make this voice sound native in another accent")
+	if len(bs) == 0 {
+		text += "There are no other accents to localize this voice into yet."
+	} else {
+		text += "Pick an accent. I'll create a <b>new voice</b> and switch you to it; the original stays as it is."
+	}
+	return screen{text, (&keys{}).grid(2, bs).nav("Create", "nav:create").build()}
+}
+
+// runLocalize creates a localized copy of the user's voice. target is a bot
+// message that is redrawn with the progress and then the result.
+func (b *Bot) runLocalize(ctx context.Context, uid int64, target *telegram.Message, accent string) {
+	draw := func(s screen) { b.editHTML(ctx, target, s.text, s.kb) }
+	if !b.isAdmin(uid) {
+		draw(b.createScreen(uid))
 		return
 	}
-	name = strings.TrimSpace(name)
-	if name == "" {
-		name = fmt.Sprintf("%s (%s)", orDefault(s.VoiceName, "Voice"), accent)
+	s := b.store.Get(uid)
+	if s.VoiceID == "" {
+		draw(noVoiceScreen())
+		return
 	}
-	_ = b.tg.SendChatAction(ctx, m.Chat.ID, "typing")
+	draw(screen{header(icWait, "Localizing "+orDefault(s.VoiceName, "your voice"), "") + "This usually takes 10–30 seconds.", nil})
 	if !b.acquire(ctx) {
 		return
 	}
 	tctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	v, err := b.ct.LocalizeVoice(tctx, cartesia.LocalizeVoiceRequest{
-		VoiceID: s.VoiceID, Name: name, Accent: accent,
+		VoiceID: s.VoiceID, Name: fmt.Sprintf("%s (%s)", orDefault(s.VoiceName, "Voice"), accent), Accent: accent,
 		Description: "Localized in Ellie Studio from " + s.VoiceID,
 	})
 	cancel()
 	b.release()
 	if err != nil {
-		b.fail(ctx, m, "localize", err)
+		draw(errorScreen(err))
 		return
 	}
-	if _, err := b.store.Update(m.From.ID, func(st *Settings) { st.VoiceID, st.VoiceName = v.ID, v.Name }); err != nil {
+	if _, err := b.store.Update(uid, func(st *Settings) { st.VoiceID, st.VoiceName = v.ID, v.Name }); err != nil {
 		b.log.Warn("save settings", "err", err)
 	}
-	b.replyHTML(ctx, m, fmt.Sprintf("🌍 Created <b>%s</b> and made it your current voice.\nID: <code>%s</code>",
-		html.EscapeString(v.Name), html.EscapeString(v.ID)), nil)
+	draw(createdScreen(icLocalize, v.Name, v.ID))
 }
 
-func (b *Bot) cmdRename(ctx context.Context, m *telegram.Message, name string) {
+// createdScreen confirms a new voice (clone or localize).
+func createdScreen(icon, name, id string) screen {
+	text := header(icon, name+" is ready", "It's now your current voice") +
+		"ID: <code>" + html.EscapeString(id) + "</code>\n\nSend any text to hear it."
+	k := (&keys{}).row(btn(icPlay+" Hear a sample", "do:sample"), btn(icStyle+" Style", "nav:style")).nav("", "")
+	return screen{text, k.build()}
+}
+
+// ---------------------------------------------------------------- rename / delete
+
+func (b *Bot) renameVoice(ctx context.Context, m *telegram.Message, id, name string) {
 	if !b.isAdmin(m.From.ID) {
-		b.reply(ctx, m, "Only studio admins can rename voices.")
+		s := noticeScreen(icLock, "Rename voice", "Only studio admins can rename voices.")
+		b.replyHTML(ctx, m, s.text, s.kb)
 		return
 	}
-	name = strings.TrimSpace(name)
-	s := b.store.Get(m.From.ID)
-	if name == "" || s.VoiceID == "" {
-		b.reply(ctx, m, "Usage: /rename <new name>  (renames your current voice; you must own it)")
-		return
-	}
-	v, err := b.ct.UpdateVoice(ctx, s.VoiceID, cartesia.UpdateVoiceRequest{Name: name})
+	v, err := b.ct.UpdateVoice(ctx, id, cartesia.UpdateVoiceRequest{Name: strings.TrimSpace(name)})
 	if err != nil {
 		b.fail(ctx, m, "rename", err)
 		return
 	}
-	if _, err := b.store.Update(m.From.ID, func(st *Settings) { st.VoiceName = v.Name }); err != nil {
+	if _, err := b.store.Update(m.From.ID, func(st *Settings) {
+		if st.VoiceID == v.ID {
+			st.VoiceName = v.Name
+		}
+	}); err != nil {
 		b.log.Warn("save settings", "err", err)
 	}
-	b.replyHTML(ctx, m, "✏️ Renamed to <b>"+html.EscapeString(v.Name)+"</b>.", nil)
+	s := b.voiceCard(ctx, m.From.ID, v.ID)
+	s.text += "\n" + icOK + " <i>Renamed.</i>"
+	b.replyHTML(ctx, m, s.text, s.kb)
 }
 
-func (b *Bot) cmdDeleteVoice(ctx context.Context, m *telegram.Message, id string) {
-	if !b.isAdmin(m.From.ID) {
-		b.reply(ctx, m, "Only studio admins can delete voices.")
-		return
-	}
-	if id == "" {
-		id = b.store.Get(m.From.ID).VoiceID
-	}
-	if id == "" {
-		b.reply(ctx, m, "Usage: /deletevoice <voice id>")
-		return
+func (b *Bot) deleteConfirmScreen(ctx context.Context, uid int64, id string) screen {
+	if !b.isAdmin(uid) {
+		return noticeScreen(icLock, "Delete voice", "Only studio admins can delete voices.")
 	}
 	v, err := b.ct.GetVoice(ctx, id, false)
 	if err != nil {
-		b.fail(ctx, m, "get voice", err)
-		return
+		return errorScreen(err)
 	}
 	if !v.IsOwner {
-		b.reply(ctx, m, "You can only delete voices your organization owns.")
-		return
+		return screen{header("🗑", "Can't delete "+v.Name, "") + "You can only delete voices your studio created.",
+			(&keys{}).nav("Voice", "vc:"+v.ID).build()}
 	}
-	kb := &telegram.InlineKeyboardMarkup{InlineKeyboard: [][]telegram.InlineKeyboardButton{{
-		{Text: "🗑 Delete permanently", CallbackData: "dv:" + v.ID},
-		{Text: "Cancel", CallbackData: "x"},
-	}}}
-	b.replyHTML(ctx, m, fmt.Sprintf("Delete <b>%s</b> (<code>%s</code>)? This can't be undone.",
-		html.EscapeString(v.Name), html.EscapeString(v.ID)), kb)
+	text := header("🗑", "Delete "+v.Name+"?", "") + "This removes the voice for good. It can't be undone."
+	k := (&keys{}).row(btn("🗑 Yes, delete", "dvy:"+v.ID), btn(icCancel+" Keep it", "vc:"+v.ID)).nav("", "")
+	return screen{text, k.build()}
 }
 
-func (b *Bot) confirmDeleteVoice(ctx context.Context, q *telegram.CallbackQuery, id string) {
+func (b *Bot) deleteVoice(ctx context.Context, q *telegram.CallbackQuery, id string) {
 	if !b.isAdmin(q.From.ID) {
 		_ = b.tg.AnswerCallbackQuery(ctx, q.ID, "Only studio admins can delete voices.")
 		return
 	}
 	if err := b.ct.DeleteVoice(ctx, id); err != nil {
 		_ = b.tg.AnswerCallbackQuery(ctx, q.ID, "Delete failed")
-		b.editHTML(ctx, q.Message, "⚠️ "+explain(err), nil)
+		b.show(ctx, q, errorScreen(err))
 		return
 	}
 	if err := b.store.ForgetVoice(id); err != nil {
 		b.log.Warn("forget voice", "err", err)
 	}
 	_ = b.tg.AnswerCallbackQuery(ctx, q.ID, "Deleted")
-	b.editHTML(ctx, q.Message, "🗑 Voice <code>"+html.EscapeString(id)+"</code> deleted.", nil)
+	b.show(ctx, q, screen{header("🗑", "Voice deleted", "") + "Pick another voice to keep going.",
+		(&keys{}).row(btn(icVoices+" Browse voices", "nav:voices")).nav("", "").build()})
+}
+
+// errorScreen is the in-place version of fail().
+func errorScreen(err error) screen {
+	return screen{header(icWarn, "Something went wrong", "") + explain(err), recovery(err, "")}
+}
+
+// noticeScreen is a short titled message with a way home.
+func noticeScreen(icon, title, body string) screen {
+	return screen{header(icon, title, "") + body, (&keys{}).nav("", "").build()}
 }

@@ -51,6 +51,14 @@ type Bot struct {
 
 	sessMu   sync.Mutex
 	sessions map[int64]*browseSession
+	flows    map[int64]*flow   // guided steps in progress
+	recent   map[int64]*recent // last spoken text / transcript, for Again and Read aloud
+}
+
+// recent remembers what a user last heard or transcribed.
+type recent struct {
+	spoken     string
+	transcript string
 }
 
 // New wires a bot together.
@@ -76,38 +84,29 @@ func New(tg *telegram.Client, ct *cartesia.Client, store *Store, cfg Config, log
 		cartesiaSlots: make(chan struct{}, cfg.Concurrency),
 		inflight:      make(chan struct{}, 32),
 		sessions:      map[int64]*browseSession{},
+		flows:         map[int64]*flow{},
+		recent:        map[int64]*recent{},
 	}
 }
 
-// Commands is the menu registered with Telegram.
+// Commands is the short menu Telegram shows; every other command still works
+// and is listed in Help → Commands.
 var Commands = []telegram.BotCommand{
-	{Command: "start", Description: "Welcome to Ellie Studio"},
-	{Command: "help", Description: "Everything the studio can do"},
-	{Command: "say", Description: "Speak some text"},
-	{Command: "voices", Description: "Browse the voice library"},
-	{Command: "myvoices", Description: "Voices your organization owns"},
-	{Command: "voice", Description: "Show or set the current voice"},
-	{Command: "preview", Description: "Play a voice's free preview"},
-	{Command: "emotion", Description: "Set the speaking emotion"},
-	{Command: "speed", Description: "Set speed (0.6–1.5)"},
-	{Command: "volume", Description: "Set volume (0.5–2.0)"},
-	{Command: "model", Description: "Pick the Sonic model"},
-	{Command: "lang", Description: "Set language, e.g. en, fr, en-GB"},
-	{Command: "format", Description: "Voice notes or audio files"},
-	{Command: "transcribe", Description: "Transcribe a replied-to audio"},
-	{Command: "clone", Description: "Clone a voice from a replied-to clip"},
-	{Command: "accents", Description: "List accents for a language"},
-	{Command: "localize", Description: "Make the current voice native in an accent"},
-	{Command: "rename", Description: "Rename the current (owned) voice"},
-	{Command: "deletevoice", Description: "Delete an owned voice"},
-	{Command: "dicts", Description: "Pick a pronunciation dictionary"},
-	{Command: "newdict", Description: "Create a pronunciation dictionary"},
-	{Command: "detect", Description: "Check audio for a Cartesia watermark"},
-	{Command: "settings", Description: "Show your studio settings"},
-	{Command: "reset", Description: "Reset your settings"},
-	{Command: "status", Description: "Cartesia API status and models"},
-	{Command: "usage", Description: "Credit usage (admin key)"},
+	{Command: "start", Description: "Open Ellie Studio"},
+	{Command: "menu", Description: "Home screen"},
+	{Command: "voices", Description: "Browse and pick a voice"},
+	{Command: "style", Description: "Emotion, speed, volume, language"},
+	{Command: "help", Description: "How everything works"},
+	{Command: "cancel", Description: "Stop what you're doing"},
 }
+
+// Profile texts shown in Telegram before the first /start.
+const (
+	botDescription = "🎙 Ellie Studio turns your text into lifelike speech and your voice notes into text.\n\n" +
+		"• Hundreds of natural voices\n• Emotion, speed and language controls\n• Clone or localize your own voice\n\n" +
+		"Tap Start, then just send a message."
+	botShortDescription = "Lifelike text-to-speech and transcription, powered by Cartesia."
+)
 
 // Run long-polls Telegram until ctx is cancelled, then waits for in-flight
 // handlers to finish.
@@ -119,6 +118,12 @@ func (b *Bot) Run(ctx context.Context) error {
 	b.log.Info("connected to Telegram", "bot", "@"+me.Username)
 	if err := b.tg.SetMyCommands(ctx, Commands); err != nil {
 		b.log.Warn("setMyCommands failed", "err", err)
+	}
+	if err := b.tg.SetMyDescription(ctx, botDescription); err != nil {
+		b.log.Warn("setMyDescription failed", "err", err)
+	}
+	if err := b.tg.SetMyShortDescription(ctx, botShortDescription); err != nil {
+		b.log.Warn("setMyShortDescription failed", "err", err)
 	}
 
 	var offset int64
@@ -254,9 +259,41 @@ func (b *Bot) editHTML(ctx context.Context, m *telegram.Message, text string, kb
 	}
 }
 
+// sendScreen posts a screen as a new message.
+func (b *Bot) sendScreen(ctx context.Context, chatID, replyTo int64, s screen) *telegram.Message {
+	msg, err := b.tg.SendMessage(ctx, telegram.SendMessageParams{
+		ChatID: chatID, Text: s.text, ParseMode: "HTML", ReplyTo: replyTo,
+		ReplyMarkup: s.kb, NoPreview: true,
+	})
+	if err != nil {
+		b.log.Warn("sendMessage failed", "chat", chatID, "err", err)
+		return nil
+	}
+	return msg
+}
+
+// show answers a button press with a screen: it redraws the pressed message
+// in place, or posts a new one when that message is audio (which has no text
+// to replace).
+func (b *Bot) show(ctx context.Context, q *telegram.CallbackQuery, s screen) {
+	m := q.Message
+	if m.Voice != nil || m.Audio != nil || m.Document != nil || m.VideoNote != nil {
+		b.sendScreen(ctx, m.Chat.ID, 0, s)
+		return
+	}
+	b.editHTML(ctx, m, s.text, s.kb)
+}
+
+// fail reports an error with buttons that lead to the fix.
 func (b *Bot) fail(ctx context.Context, m *telegram.Message, what string, err error) {
 	b.log.Warn(what, "chat", m.Chat.ID, "err", err)
-	b.replyHTML(ctx, m, "⚠️ "+explain(err), nil)
+	retry := ""
+	if what == "tts" {
+		retry = "do:again"
+	}
+	s := errorScreen(err)
+	s.kb = recovery(err, retry)
+	b.replyHTML(ctx, m, s.text, s.kb)
 }
 
 // explain turns an error into a short, user-facing HTML string.

@@ -65,6 +65,14 @@ func (s *Store) SetDefaultVoice(id, name string) {
 	s.defaults.VoiceID, s.defaults.VoiceName = id, name
 }
 
+// Known reports whether the user has used the studio before.
+func (s *Store) Known(uid int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.data[uid]
+	return ok
+}
+
 // Get returns a user's settings with defaults filled in.
 func (s *Store) Get(uid int64) Settings {
 	s.mu.Lock()

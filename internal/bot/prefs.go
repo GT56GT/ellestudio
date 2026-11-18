@@ -13,229 +13,266 @@ import (
 	"ellestudio/internal/telegram"
 )
 
-// featuredEmotions are offered as buttons; /emotion list shows all 58.
-var featuredEmotions = []string{
-	"neutral", "calm", "content", "happy",
-	"excited", "curious", "sympathetic", "peaceful",
-	"sad", "angry", "scared", "anxious",
-	"sarcastic", "confident", "mysterious", "determined",
+var localeRe = regexp.MustCompile(`^[a-zA-Z]{2,3}(-[a-zA-Z]{2,4})?$`)
+
+// ---------------------------------------------------------------- welcome
+
+func (b *Bot) welcome(ctx context.Context, m *telegram.Message) {
+	uid := m.From.ID
+	name := html.EscapeString(orDefault(m.From.FirstName, "there"))
+	var text string
+	if !b.store.Known(uid) {
+		text = "👋 <b>Hi " + name + ", I'm Ellie!</b>\nYour pocket voice studio.\n\n" +
+			"1️⃣ <b>Send me text</b> and I'll say it out loud\n" +
+			"2️⃣ <b>Send a voice note</b> and I'll write it down\n" +
+			"3️⃣ <b>Use the menu below</b> to change voice and style anytime\n\n" +
+			"Start with ▶️ <b>Hear a sample</b> on the card below."
+		if _, err := b.store.Update(uid, func(*Settings) {}); err != nil {
+			b.log.Warn("save settings", "err", err)
+		}
+	} else {
+		text = "👋 <b>Welcome back, " + name + "!</b> Your menu is below."
+	}
+	if _, err := b.tg.SendMessage(ctx, telegram.SendMessageParams{
+		ChatID: m.Chat.ID, Text: text, ParseMode: "HTML", ReplyMarkup: menuKeyboard(),
+	}); err != nil {
+		b.log.Warn("sendMessage failed", "err", err)
+	}
+	b.sendScreen(ctx, m.Chat.ID, 0, b.homeScreen(uid))
 }
 
-var (
-	speedPresets  = []float64{0.6, 0.8, 1.0, 1.2, 1.5}
-	volumePresets = []float64{0.5, 0.75, 1.0, 1.5, 2.0}
-	localeRe      = regexp.MustCompile(`^[a-zA-Z]{2,3}(-[a-zA-Z]{2,4})?$`)
-)
-
-// ---------------------------------------------------------------- welcome / help
-
-func (b *Bot) cmdStart(ctx context.Context, m *telegram.Message) {
-	s := b.store.Get(m.From.ID)
-	b.replyHTML(ctx, m, fmt.Sprintf(`👋 <b>Welcome to Ellie Studio</b>
-
-Your pocket voice studio, powered by Cartesia.
-
-• <b>Send any text</b> and I'll speak it.
-• <b>Send a voice note or audio file</b> and I'll transcribe it.
-• Browse voices with /voices, then tune /emotion, /speed and /volume.
-
-Current voice: <b>%s</b>. See /help for everything else.`, html.EscapeString(orDefault(s.VoiceName, "none yet"))), nil)
+func privateScreen(uid int64) screen {
+	return screen{header(icLock, "Ellie Studio is private", "") +
+		"Ask the studio owner to add your Telegram ID:\n<code>" + strconv.FormatInt(uid, 10) + "</code>", nil}
 }
 
-func (b *Bot) cmdHelp(ctx context.Context, m *telegram.Message) {
-	b.replyHTML(ctx, m, `<b>🎛 Ellie Studio</b>
+// ---------------------------------------------------------------- commands
 
-<b>Speak</b>
-• Send text, or /say &lt;text&gt;: text-to-speech
-• /voices [search], /myvoices: browse and pick a voice
-• /voice [id]: show or set the current voice
-• /preview [id]: play a voice's free preview clip
-• /emotion, /speed, /volume: shape the delivery
-• /model: choose the Sonic model · /lang: set language (en, fr, en-GB, auto)
-• /format: voice notes or audio files
-• /dicts, /newdict: custom pronunciations
+// command runs a slash command. Every command lands on a screen.
+func (b *Bot) command(ctx context.Context, m *telegram.Message, cmd, args string) {
+	uid, chat := m.From.ID, m.Chat.ID
+	send := func(s screen) { b.replyHTML(ctx, m, s.text, s.kb) }
 
-<b>Listen</b>
-• Send a voice note or audio file: transcription
-• /transcribe (as a reply): transcribe that audio
-• /detect (as a reply): check for a Cartesia watermark
-
-<b>Create</b> (admins)
-• /clone &lt;name&gt; as a reply to a 5–15s clip: clone a voice
-• /accents [lang]: list accents · /localize &lt;accent&gt; [name]: localize the current voice
-• /rename &lt;name&gt; · /deletevoice [id]
-
-<b>Studio</b>
-• /settings · /reset · /status · /usage`, nil)
-}
-
-// ---------------------------------------------------------------- tuning
-
-func (b *Bot) cmdEmotion(ctx context.Context, m *telegram.Message, args string) {
-	arg := strings.ToLower(strings.TrimSpace(args))
-	switch {
-	case arg == "":
-		b.replyHTML(ctx, m, "🎭 <b>Pick an emotion</b>\n<i>Auto lets the model read the mood from your text. /emotion list shows all 58.</i>", emotionKeyboard())
-	case arg == "list" || arg == "all":
-		b.reply(ctx, m, "All emotions:\n"+strings.Join(cartesia.Emotions, ", ")+"\n\nSet one with /emotion <name>.")
+	switch cmd {
+	case "start":
+		b.welcome(ctx, m)
+	case "menu", "home":
+		send(b.homeScreen(uid))
+	case "help":
+		send(helpScreen(args))
+	case "say":
+		if args == "" {
+			send(b.speakPrompt(uid))
+			return
+		}
+		b.speak(ctx, m, args)
+	case "voices":
+		b.openVoices(ctx, chat, uid, args, nil)
+	case "myvoices":
+		owned := true
+		b.openVoices(ctx, chat, uid, args, &owned)
+	case "voice":
+		if args != "" {
+			v, err := b.selectVoice(ctx, uid, args)
+			if err != nil {
+				b.fail(ctx, m, "select voice", err)
+				return
+			}
+			send(voiceChosenScreen(v))
+			return
+		}
+		send(b.voiceCard(ctx, uid, ""))
+	case "preview":
+		id := orDefault(args, b.store.Get(uid).VoiceID)
+		if id == "" {
+			send(noVoiceScreen())
+			return
+		}
+		b.sendPreview(ctx, chat, m.MessageID, id)
+	case "style":
+		send(b.styleScreen(uid))
+	case "settings", "studio":
+		send(b.studioScreen(uid))
+	case "emotion":
+		switch a := strings.ToLower(args); {
+		case a == "":
+			send(b.emotionScreen(uid, false))
+		case a == "list" || a == "all":
+			send(b.emotionScreen(uid, true))
+		default:
+			if err := b.setEmotion(uid, a); err != nil {
+				send(withWarning(b.emotionScreen(uid, false), err))
+				return
+			}
+			send(b.emotionScreen(uid, !contains(featuredEmotions, a) && a != "auto"))
+		}
+	case "speed", "volume":
+		vol := cmd == "volume"
+		if args != "" {
+			if err := b.setFactor(uid, vol, args); err != nil {
+				send(withWarning(b.rangeScreen(uid, vol), err))
+				return
+			}
+		}
+		send(b.rangeScreen(uid, vol))
+	case "model":
+		if args != "" {
+			if err := b.setModel(ctx, uid, args); err != nil {
+				send(withWarning(b.modelScreen(ctx, uid), err))
+				return
+			}
+		}
+		send(b.modelScreen(ctx, uid))
+	case "lang", "language":
+		if args != "" {
+			if err := b.setLang(uid, args); err != nil {
+				send(withWarning(b.langScreen(ctx, uid), err))
+				return
+			}
+		}
+		send(b.langScreen(ctx, uid))
+	case "format", "output":
+		switch strings.ToLower(args) {
+		case "voice", "note":
+			b.setOutput(uid, false)
+		case "file", "audio", "mp3":
+			b.setOutput(uid, true)
+		}
+		send(b.outputScreen(uid))
+	case "accents":
+		b.cmdAccents(ctx, m, args)
+	case "localize":
+		if args == "" {
+			send(b.localizeScreen(ctx, uid))
+			return
+		}
+		accent, _, _ := strings.Cut(args, " ")
+		if target := b.sendScreen(ctx, chat, m.MessageID, screen{icWait + " Starting…", nil}); target != nil {
+			b.runLocalize(ctx, uid, target, accent)
+		}
+	case "rename":
+		if args == "" {
+			b.startFlow(ctx, chat, uid, flowRename)
+			return
+		}
+		b.renameVoice(ctx, m, b.store.Get(uid).VoiceID, args)
+	case "deletevoice":
+		send(b.deleteConfirmScreen(ctx, uid, orDefault(args, b.store.Get(uid).VoiceID)))
+	case "dicts":
+		send(b.dictsScreen(ctx, uid))
+	case "newdict":
+		if !b.isAdmin(uid) {
+			send(b.createScreen(uid))
+			return
+		}
+		if args == "" {
+			b.startFlow(ctx, chat, uid, flowDictName)
+			return
+		}
+		name, items, err := parseDict(args)
+		if err != nil {
+			send(screen{header(icDict, "New dictionary", "") + icWarn + " " + html.EscapeString(err.Error()) + "\n\nOr tap below and I'll guide you.",
+				(&keys{}).row(btn(icDict+" New dictionary", "do:newdict")).nav("", "").build()})
+			return
+		}
+		b.createDict(ctx, m, name, items)
+	case "clone", "transcribe", "detect":
+		if a, ok := audioOf(m.ReplyToMessage); ok {
+			b.audioCommand(ctx, m, cmd, a, args)
+			return
+		}
+		switch cmd {
+		case "clone":
+			b.startFlow(ctx, chat, uid, flowCloneClip)
+		case "transcribe":
+			send(transcribePrompt())
+		case "detect":
+			send(screen{header("🔏", "Watermark check", "") +
+				"Reply to an audio message with /detect, or send audio with /detect as its caption.\n" +
+				"<i>Audio must be 5 seconds to 5 minutes long. Needs a paid Cartesia plan.</i>", (&keys{}).nav("", "").build()})
+		}
+	case "reset":
+		send(resetScreen())
+	case "status":
+		send(b.statusScreen(ctx))
+	case "usage":
+		send(b.usageScreen(ctx, uid))
 	default:
-		b.setEmotion(ctx, m.From.ID, arg, func(msg string) { b.replyHTML(ctx, m, msg, nil) })
+		send(screen{header("🤔", "Unknown command", "") + "Tap Help to see what I can do, or just send me some text.",
+			(&keys{}).row(btn(icHelp+" Help", "nav:help")).nav("", "").build()})
 	}
 }
 
-func emotionKeyboard() *telegram.InlineKeyboardMarkup {
-	kb := &telegram.InlineKeyboardMarkup{}
-	var row []telegram.InlineKeyboardButton
-	for _, e := range featuredEmotions {
-		row = append(row, telegram.InlineKeyboardButton{Text: e, CallbackData: "e:" + e})
-		if len(row) == 4 {
-			kb.InlineKeyboard = append(kb.InlineKeyboard, row)
-			row = nil
-		}
-	}
-	kb.InlineKeyboard = append(kb.InlineKeyboard, []telegram.InlineKeyboardButton{{Text: "🤖 Auto", CallbackData: "e:auto"}})
-	return kb
-}
+// ---------------------------------------------------------------- setters
 
-func (b *Bot) setEmotion(_ context.Context, uid int64, e string, done func(string)) {
-	if e == "auto" || e == "none" || e == "off" {
+func (b *Bot) setEmotion(uid int64, e string) error {
+	switch e {
+	case "auto", "none", "off", "natural":
 		e = ""
-	} else if !cartesia.IsEmotion(e) {
-		done("Unknown emotion. Try /emotion list.")
-		return
-	}
-	if _, err := b.store.Update(uid, func(s *Settings) { s.Emotion = e }); err != nil {
-		done("⚠️ " + explain(err))
-		return
-	}
-	done("🎭 Emotion: <b>" + html.EscapeString(orDefault(e, "auto")) + "</b>")
-}
-
-func (b *Bot) cmdSpeed(ctx context.Context, m *telegram.Message, args string) {
-	b.cmdRange(ctx, m, args, "Speed", "s:", speedPresets, cartesia.MinSpeed, cartesia.MaxSpeed,
-		func(s *Settings, v float64) { s.Speed = v })
-}
-
-func (b *Bot) cmdVolume(ctx context.Context, m *telegram.Message, args string) {
-	b.cmdRange(ctx, m, args, "Volume", "vo:", volumePresets, cartesia.MinVolume, cartesia.MaxVolume,
-		func(s *Settings, v float64) { s.Volume = v })
-}
-
-func (b *Bot) cmdRange(ctx context.Context, m *telegram.Message, args, label, prefix string, presets []float64, lo, hi float64, set func(*Settings, float64)) {
-	if args == "" {
-		kb := &telegram.InlineKeyboardMarkup{}
-		var row []telegram.InlineKeyboardButton
-		for _, p := range presets {
-			row = append(row, telegram.InlineKeyboardButton{Text: fmtFactor(p), CallbackData: prefix + strconv.FormatFloat(p, 'f', -1, 64)})
+	default:
+		if !cartesia.IsEmotion(e) {
+			return fmt.Errorf("I don't know the emotion %q. Pick one below.", e)
 		}
-		kb.InlineKeyboard = append(kb.InlineKeyboard, row)
-		b.replyHTML(ctx, m, fmt.Sprintf("<b>%s</b> (%.1f–%.1f). Tap a preset or send /%s 1.1", label, lo, hi, strings.ToLower(label)), kb)
-		return
 	}
-	v, err := parseFactor(args, lo, hi)
+	_, err := b.store.Update(uid, func(s *Settings) { s.Emotion = e })
+	return err
+}
+
+func (b *Bot) setFactor(uid int64, volume bool, raw string) error {
+	lo, hi := cartesia.MinSpeed, cartesia.MaxSpeed
+	if volume {
+		lo, hi = cartesia.MinVolume, cartesia.MaxVolume
+	}
+	v, err := parseFactor(raw, lo, hi)
 	if err != nil {
-		b.reply(ctx, m, err.Error())
-		return
+		return err
 	}
-	if _, err := b.store.Update(m.From.ID, func(s *Settings) { set(s, v) }); err != nil {
-		b.fail(ctx, m, "save", err)
-		return
-	}
-	b.replyHTML(ctx, m, fmt.Sprintf("%s: <b>%s</b>", label, fmtFactor(v)), nil)
+	_, err = b.store.Update(uid, func(s *Settings) {
+		if volume {
+			s.Volume = v
+		} else {
+			s.Speed = v
+		}
+	})
+	return err
 }
 
 func parseFactor(s string, lo, hi float64) (float64, error) {
-	s = strings.TrimSuffix(strings.TrimSpace(strings.ToLower(s)), "x")
+	s = strings.TrimSuffix(strings.TrimSuffix(strings.TrimSpace(strings.ToLower(s)), "x"), "×")
 	v, err := strconv.ParseFloat(s, 64)
 	if err != nil {
-		return 0, fmt.Errorf("send a number between %.1f and %.1f", lo, hi)
+		return 0, fmt.Errorf("Send a number between %s and %s, like 1.1.", fmtFactor(lo), fmtFactor(hi))
 	}
 	if v < lo || v > hi {
-		return 0, fmt.Errorf("must be between %.1f and %.1f", lo, hi)
+		return 0, fmt.Errorf("That's out of range. Pick something from %s to %s.", fmtFactor(lo), fmtFactor(hi))
 	}
 	return v, nil
 }
 
-func fmtFactor(v float64) string { return strconv.FormatFloat(v, 'f', -1, 64) + "×" }
-
-func (b *Bot) cmdModel(ctx context.Context, m *telegram.Message, args string) {
-	models := b.ttsModels(ctx)
-	if args != "" {
-		if !contains(models, args) {
-			b.reply(ctx, m, "Unknown model. Options: "+strings.Join(models, ", "))
-			return
-		}
-		if _, err := b.store.Update(m.From.ID, func(s *Settings) { s.Model = args }); err != nil {
-			b.fail(ctx, m, "save", err)
-			return
-		}
-		b.replyHTML(ctx, m, "🧠 Model: <b>"+html.EscapeString(args)+"</b>", nil)
-		return
+func (b *Bot) setModel(ctx context.Context, uid int64, id string) error {
+	if !contains(b.ttsModels(ctx), id) {
+		return fmt.Errorf("I don't know the model %q. Pick one below.", id)
 	}
-	cur := b.store.Get(m.From.ID).Model
-	kb := &telegram.InlineKeyboardMarkup{}
-	for _, id := range models {
-		label := id
-		if id == cur {
-			label = "✅ " + id
-		}
-		kb.InlineKeyboard = append(kb.InlineKeyboard, []telegram.InlineKeyboardButton{{Text: label, CallbackData: "m:" + id}})
-	}
-	b.replyHTML(ctx, m, "🧠 <b>Choose a Sonic model</b>", kb)
+	_, err := b.store.Update(uid, func(s *Settings) { s.Model = id })
+	return err
 }
 
-// ttsModels asks GET /models, falling back to the spec's enum.
-func (b *Bot) ttsModels(ctx context.Context) []string {
-	list, err := b.ct.ListModels(ctx, "tts")
-	if err != nil || len(list) == 0 {
-		return cartesia.TTSModels
-	}
-	ids := make([]string, 0, len(list))
-	for _, m := range list {
-		if len(m.ID)+2 <= 64 {
-			ids = append(ids, m.ID)
-		}
-	}
-	return ids
-}
-
-func (b *Bot) cmdLang(ctx context.Context, m *telegram.Message, args string) {
-	arg := strings.TrimSpace(args)
-	if arg == "" {
-		s := b.store.Get(m.From.ID)
-		msg := fmt.Sprintf("🌐 Language: <b>%s</b>\nSet with /lang fr, /lang en-GB, or /lang auto.", html.EscapeString(orDefault(s.Language, "auto")))
-		if langs := b.modelLanguages(ctx, s.Model); len(langs) > 0 {
-			msg += "\n\n<i>" + html.EscapeString(s.Model) + " supports:</i> " + html.EscapeString(strings.Join(langs, ", "))
-		}
-		b.replyHTML(ctx, m, msg, nil)
-		return
-	}
+func (b *Bot) setLang(uid int64, raw string) error {
 	lang := ""
-	if l := strings.ToLower(arg); l != "auto" && l != "off" && l != "none" {
-		if !localeRe.MatchString(arg) {
-			b.reply(ctx, m, "That doesn't look like a language code. Examples: en, fr, ja, en-GB, es-MX.")
-			return
+	if l := strings.ToLower(strings.TrimSpace(raw)); l != "auto" && l != "off" && l != "none" {
+		if !localeRe.MatchString(raw) {
+			return fmt.Errorf("That doesn't look like a language code. Try en, fr, ja or en-GB.")
 		}
-		lang = normalizeLocale(arg)
+		lang = normalizeLocale(raw)
 	}
-	if _, err := b.store.Update(m.From.ID, func(s *Settings) { s.Language = lang }); err != nil {
-		b.fail(ctx, m, "save", err)
-		return
-	}
-	b.replyHTML(ctx, m, "🌐 Language: <b>"+html.EscapeString(orDefault(lang, "auto"))+"</b>\n<i>Also used to transcribe and clone.</i>", nil)
+	_, err := b.store.Update(uid, func(s *Settings) { s.Language = lang })
+	return err
 }
 
-func (b *Bot) modelLanguages(ctx context.Context, model string) []string {
-	list, err := b.ct.ListModels(ctx, "tts")
-	if err != nil {
-		return nil
+func (b *Bot) setOutput(uid int64, asFile bool) {
+	if _, err := b.store.Update(uid, func(s *Settings) { s.AsFile = asFile }); err != nil {
+		b.log.Warn("save settings", "err", err)
 	}
-	for _, m := range list {
-		if m.ID == model {
-			return m.SupportedLanguages
-		}
-	}
-	return nil
 }
 
 // normalizeLocale turns "en-gb" into "en-GB" and "FR" into "fr".
@@ -251,67 +288,85 @@ func normalizeLocale(s string) string {
 	return lang + "-" + region
 }
 
-func (b *Bot) cmdFormat(ctx context.Context, m *telegram.Message, args string) {
-	switch strings.ToLower(strings.TrimSpace(args)) {
-	case "voice", "note":
-		b.setFormat(m.From.ID, false)
-		b.reply(ctx, m, "🎙 You'll get voice notes.")
-	case "file", "audio", "mp3":
-		b.setFormat(m.From.ID, true)
-		b.reply(ctx, m, "🎵 You'll get MP3 audio files.")
-	default:
-		kb := &telegram.InlineKeyboardMarkup{InlineKeyboard: [][]telegram.InlineKeyboardButton{{
-			{Text: "🎙 Voice notes", CallbackData: "f:voice"},
-			{Text: "🎵 MP3 files", CallbackData: "f:file"},
-		}}}
-		b.replyHTML(ctx, m, "How should I send speech?", kb)
+// ---------------------------------------------------------------- API-backed screens
+
+// ttsModels asks GET /models, falling back to the spec's enum.
+func (b *Bot) ttsModels(ctx context.Context) []string {
+	list, err := b.ct.ListModels(ctx, "tts")
+	if err != nil || len(list) == 0 {
+		return cartesia.TTSModels
 	}
+	ids := make([]string, 0, len(list))
+	for _, m := range list {
+		if len("m:"+m.ID) <= 64 {
+			ids = append(ids, m.ID)
+		}
+	}
+	return ids
 }
 
-func (b *Bot) setFormat(uid int64, asFile bool) {
-	if _, err := b.store.Update(uid, func(s *Settings) { s.AsFile = asFile }); err != nil {
-		b.log.Warn("save settings", "err", err)
+func (b *Bot) modelScreen(ctx context.Context, uid int64) screen {
+	cur := b.store.Get(uid).Model
+	var bs []telegram.InlineKeyboardButton
+	for _, id := range b.ttsModels(ctx) {
+		bs = append(bs, btn(mark(id, id == cur), "m:"+id))
 	}
+	text := header(icModel, "Model", "The Sonic engine that speaks") +
+		"Now: <b>" + html.EscapeString(cur) + "</b>\n<i>The newest model usually sounds best.</i>"
+	return screen{text, (&keys{}).grid(2, bs).nav("Style", "nav:style").build()}
 }
 
-// ---------------------------------------------------------------- pronunciation dictionaries
+func (b *Bot) langScreen(ctx context.Context, uid int64) screen {
+	s := b.store.Get(uid)
+	supported := map[string]bool{}
+	if list, err := b.ct.ListModels(ctx, "tts"); err == nil {
+		for _, md := range list {
+			if md.ID == s.Model {
+				for _, l := range md.SupportedLanguages {
+					supported[baseLang(l)] = true
+				}
+			}
+		}
+	}
+	var bs []telegram.InlineKeyboardButton
+	for _, l := range languages {
+		if len(supported) == 0 || supported[l[0]] {
+			bs = append(bs, btn(mark(l[1], s.Language == l[0]), "l:"+l[0]))
+		}
+	}
+	text := header(icLang, "Language", "Used for speaking, transcribing and cloning") +
+		"Now: <b>" + html.EscapeString(langLabel(s.Language)) + "</b>\n" +
+		"<i>Auto works for most text. For other languages send /lang code, like /lang en-GB.</i>"
+	k := (&keys{}).row(btn(mark("🤖 Auto", s.Language == ""), "l:auto")).grid(3, bs).nav("Style", "nav:style")
+	return screen{text, k.build()}
+}
 
-func (b *Bot) cmdDicts(ctx context.Context, m *telegram.Message) {
+func (b *Bot) dictsScreen(ctx context.Context, uid int64) screen {
 	page, err := b.ct.ListPronunciationDicts(ctx, 20, "")
 	if err != nil {
-		b.fail(ctx, m, "list dicts", err)
-		return
+		return errorScreen(err)
 	}
-	cur := b.store.Get(m.From.ID).DictID
-	kb := &telegram.InlineKeyboardMarkup{}
-	for _, d := range page.Data {
-		if len("d:"+d.ID) > 64 {
-			continue
-		}
-		label := fmt.Sprintf("%s (%d)", truncate(d.Name, 30), len(d.Items))
-		if d.ID == cur {
-			label = "✅ " + label
-		}
-		kb.InlineKeyboard = append(kb.InlineKeyboard, []telegram.InlineKeyboardButton{{Text: label, CallbackData: "d:" + d.ID}})
-	}
-	kb.InlineKeyboard = append(kb.InlineKeyboard, []telegram.InlineKeyboardButton{{Text: "No dictionary", CallbackData: "d:-"}})
-	msg := "📖 <b>Pronunciation dictionaries</b>"
+	cur := b.store.Get(uid).DictID
+	text := header(icDict, "Pronunciation", "Teach me how to say names and brands") +
+		"Now: <b>" + html.EscapeString(orDefault(b.store.Get(uid).DictName, "none")) + "</b>"
 	if len(page.Data) == 0 {
-		msg += "\nNone yet. Create one with /newdict."
+		text += "\n\nYou don't have any dictionaries yet."
 	}
-	b.replyHTML(ctx, m, msg, kb)
+	k := &keys{}
+	for _, d := range page.Data {
+		if len("d:"+d.ID) <= 64 {
+			k.row(btn(mark(fmt.Sprintf("%s · %d words", truncate(d.Name, 28), len(d.Items)), d.ID == cur), "d:"+d.ID))
+		}
+	}
+	k.row(btn(mark("🚫 No dictionary", cur == ""), "d:-"))
+	if b.isAdmin(uid) {
+		k.row(btn(icDict+" New dictionary", "do:newdict"))
+	}
+	k.nav("", "")
+	return screen{text, k.build()}
 }
 
-func (b *Bot) cmdNewDict(ctx context.Context, m *telegram.Message, args string) {
-	if !b.isAdmin(m.From.ID) {
-		b.reply(ctx, m, "Only studio admins can create dictionaries.")
-		return
-	}
-	name, items, err := parseDict(args)
-	if err != nil {
-		b.reply(ctx, m, err.Error()+"\n\nFormat:\n/newdict Brand words\nCartesia = car-TEE-zhuh\nEllie = EH-lee")
-		return
-	}
+func (b *Bot) createDict(ctx context.Context, m *telegram.Message, name string, items []cartesia.PronunciationItem) {
 	d, err := b.ct.CreatePronunciationDict(ctx, cartesia.PronunciationDictRequest{
 		Name: name, Description: "Created in Ellie Studio", Items: items,
 	})
@@ -322,16 +377,17 @@ func (b *Bot) cmdNewDict(ctx context.Context, m *telegram.Message, args string) 
 	if _, err := b.store.Update(m.From.ID, func(s *Settings) { s.DictID, s.DictName = d.ID, d.Name }); err != nil {
 		b.log.Warn("save settings", "err", err)
 	}
-	b.replyHTML(ctx, m, fmt.Sprintf("📖 Created <b>%s</b> with %d entries and turned it on.",
-		html.EscapeString(d.Name), len(d.Items)), nil)
+	text := header(icDict, d.Name+" is on", fmt.Sprintf("%d words", len(d.Items))) + "Send some text with those words to hear the difference."
+	k := (&keys{}).row(btn(icDict+" Pronunciation", "nav:dicts")).nav("", "")
+	b.replyHTML(ctx, m, text, k.build())
 }
 
 // parseDict reads "name\ntext = pronunciation\n..." (also accepts "=>" or ":").
 func parseDict(args string) (string, []cartesia.PronunciationItem, error) {
 	lines := strings.Split(strings.TrimSpace(args), "\n")
 	name := strings.TrimSpace(lines[0])
-	if name == "" || strings.ContainsAny(name, "=") {
-		return "", nil, fmt.Errorf("start with a dictionary name on the first line")
+	if name == "" || strings.Contains(name, "=") {
+		return "", nil, fmt.Errorf("Start with a dictionary name on the first line.")
 	}
 	var items []cartesia.PronunciationItem
 	for i, l := range lines[1:] {
@@ -348,51 +404,27 @@ func parseDict(args string) (string, []cartesia.PronunciationItem, error) {
 		}
 		text, pron = strings.TrimSpace(text), strings.TrimSpace(pron)
 		if !ok || text == "" || pron == "" {
-			return "", nil, fmt.Errorf("line %d isn't “word = pronunciation”", i+2)
+			return "", nil, fmt.Errorf("Line %d should look like “word = pronunciation”.", i+1)
 		}
 		items = append(items, cartesia.PronunciationItem{Text: text, Pronunciation: pron})
 	}
 	if len(items) == 0 {
-		return "", nil, fmt.Errorf("add at least one “word = pronunciation” line")
+		return "", nil, fmt.Errorf("Add at least one “word = pronunciation” line.")
 	}
 	return name, items, nil
 }
 
-// ---------------------------------------------------------------- settings / status / usage
-
-func (b *Bot) cmdSettings(ctx context.Context, m *telegram.Message) {
-	s := b.store.Get(m.From.ID)
-	out := "voice note"
-	if s.AsFile {
-		out = "MP3 file"
-	}
-	b.replyHTML(ctx, m, fmt.Sprintf(`⚙️ <b>Your studio</b>
-
-Voice: <b>%s</b> <code>%s</code>
-Model: %s
-Language: %s
-Emotion: %s
-Speed: %s · Volume: %s
-Dictionary: %s
-Output: %s`,
-		html.EscapeString(orDefault(s.VoiceName, "none")), html.EscapeString(s.VoiceID),
-		html.EscapeString(s.Model), html.EscapeString(orDefault(s.Language, "auto")),
-		html.EscapeString(orDefault(s.Emotion, "auto")), fmtFactor(s.Speed), fmtFactor(s.Volume),
-		html.EscapeString(orDefault(s.DictName, "none")), out), nil)
-}
-
-func (b *Bot) cmdStatus(ctx context.Context, m *telegram.Message) {
+func (b *Bot) statusScreen(ctx context.Context) screen {
 	info, err := b.ct.Status(ctx)
 	if err != nil {
-		b.fail(ctx, m, "status", err)
-		return
+		return errorScreen(err)
 	}
-	state := "🟢 OK"
+	state := "🟢 All systems normal"
 	if !info.OK {
-		state = "🔴 degraded"
+		state = "🔴 Degraded"
 	}
-	msg := fmt.Sprintf("<b>Cartesia API</b> %s\nLatest API version: <code>%s</code>\nStudio uses: <code>%s</code>",
-		state, html.EscapeString(info.Version), cartesia.APIVersion)
+	text := header("📊", "Service status", "") + state + "\n" +
+		field("🗓", "API version", info.Version) + field("🔗", "Studio uses", cartesia.APIVersion)
 	if models, err := b.ct.ListModels(ctx, ""); err == nil {
 		var tts, stt []string
 		for _, md := range models {
@@ -402,40 +434,37 @@ func (b *Bot) cmdStatus(ctx context.Context, m *telegram.Message) {
 				tts = append(tts, md.ID)
 			}
 		}
-		msg += "\n\nTTS: " + html.EscapeString(strings.Join(tts, ", ")) +
-			"\nSTT: " + html.EscapeString(strings.Join(stt, ", "))
+		text += field(icStudio, "Speech models", strings.Join(tts, ", ")) +
+			field(icListen, "Transcription models", strings.Join(stt, ", "))
 	}
-	b.replyHTML(ctx, m, msg, nil)
+	return screen{text, (&keys{}).nav("Studio", "nav:studio").build()}
 }
 
-func (b *Bot) cmdUsage(ctx context.Context, m *telegram.Message) {
-	if !b.isAdmin(m.From.ID) {
-		b.reply(ctx, m, "Only studio admins can see usage.")
-		return
+func (b *Bot) usageScreen(ctx context.Context, uid int64) screen {
+	nav := (&keys{}).nav("Studio", "nav:studio").build()
+	if !b.isAdmin(uid) {
+		return screen{header("📈", "Usage", "") + icLock + " Usage is visible to studio admins.", nav}
 	}
 	if !b.ct.HasAdminKey() {
-		b.reply(ctx, m, "Usage needs an admin key. Set CARTESIA_ADMIN_KEY (sk_car_admin_...) and restart.")
-		return
+		return screen{header("📈", "Usage", "") + "Usage needs a Cartesia admin key. Set <code>CARTESIA_ADMIN_KEY</code> on the server.", nav}
 	}
 	end := time.Now().UTC()
-	start := end.AddDate(0, 0, -28)
-	buckets, err := b.ct.CreditUsage(ctx, start, end, "week")
+	buckets, err := b.ct.CreditUsage(ctx, end.AddDate(0, 0, -28), end, "week")
 	if err != nil {
-		b.fail(ctx, m, "usage", err)
-		return
+		return errorScreen(err)
 	}
 	var total int64
-	lines := []string{"📊 <b>Credit usage, last 4 weeks</b>", ""}
+	var sb strings.Builder
+	sb.WriteString(header("📈", "Usage", "Credits, last 4 weeks"))
 	for _, bk := range buckets {
 		total += bk.Credits
-		lines = append(lines, fmt.Sprintf("%s → %s: <b>%d</b>",
-			bk.StartTS.Format("Jan 2"), bk.EndTS.Format("Jan 2"), bk.Credits))
+		fmt.Fprintf(&sb, "%s – %s: <b>%d</b>\n", bk.StartTS.Format("Jan 2"), bk.EndTS.Format("Jan 2"), bk.Credits)
 	}
-	lines = append(lines, "", fmt.Sprintf("Total: <b>%d</b> credits", total))
-	b.replyHTMLLines(ctx, m, lines)
+	fmt.Fprintf(&sb, "\nTotal: <b>%d</b> credits", total)
+	return screen{sb.String(), nav}
 }
 
-// ---------------------------------------------------------------- callbacks
+// ---------------------------------------------------------------- buttons
 
 func (b *Bot) handleCallback(ctx context.Context, q *telegram.CallbackQuery) {
 	if !b.allowed(q.From.ID) {
@@ -446,93 +475,217 @@ func (b *Bot) handleCallback(ctx context.Context, q *telegram.CallbackQuery) {
 		_ = b.tg.AnswerCallbackQuery(ctx, q.ID, "")
 		return
 	}
+	uid := q.From.ID
 	kind, val, _ := strings.Cut(q.Data, ":")
 	ack := func(text string) { _ = b.tg.AnswerCallbackQuery(ctx, q.ID, text) }
+	// Any button other than Cancel or one that starts a guided step leaves
+	// the step, so a later text message is never mistaken for its answer.
+	if kind != "cancel" && !(kind == "do" && contains([]string{"search", "clone", "newdict", "rename"}, val)) {
+		b.clearFlow(uid)
+	}
+	// as is a message stand-in so speech handlers can answer in this chat.
+	as := &telegram.Message{From: &q.From, Chat: q.Message.Chat}
 
 	switch kind {
-	case "v": // select voice
-		v, err := b.selectVoice(ctx, q.From.ID, val)
-		if err != nil {
-			ack("Couldn't select that voice")
+	case "nav":
+		ack("")
+		b.show(ctx, q, b.navScreen(ctx, uid, val))
+	case "help":
+		ack("")
+		b.show(ctx, q, helpScreen(val))
+
+	// voices
+	case "v":
+		b.chooseVoice(ctx, q, val)
+	case "p":
+		ack("Fetching the preview…")
+		b.sendPreview(ctx, q.Message.Chat.ID, 0, val)
+	case "vc":
+		ack("")
+		b.show(ctx, q, b.voiceCard(ctx, uid, val))
+	case "vn", "vb", "vf", "vm", "vq":
+		b.browse(ctx, q, kind, val)
+	case "dv":
+		ack("")
+		b.show(ctx, q, b.deleteConfirmScreen(ctx, uid, val))
+	case "dvy":
+		b.deleteVoice(ctx, q, val)
+	case "loc":
+		ack("Creating your localized voice…")
+		if q.Message.Text == "" { // pressed under audio: draw into a fresh message
+			if t := b.sendScreen(ctx, q.Message.Chat.ID, 0, screen{icWait + " Starting…", nil}); t != nil {
+				b.runLocalize(ctx, uid, t, val)
+			}
 			return
 		}
-		ack("Voice: " + v.Name)
-		b.replyHTML(ctx, q.Message, "✅ Now speaking as <b>"+html.EscapeString(v.Name)+"</b>. Send any text to hear it.", nil)
-	case "p": // preview
-		ack("Fetching preview…")
-		b.sendPreview(ctx, q.Message, val)
-	case "vn":
-		b.pageVoices(ctx, q, +1)
-	case "vb":
-		b.pageVoices(ctx, q, -1)
+		b.runLocalize(ctx, uid, q.Message, val)
+
+	// style
 	case "e":
-		b.setEmotion(ctx, q.From.ID, val, func(msg string) {
-			ack("")
-			b.editHTML(ctx, q.Message, msg, nil)
-		})
-	case "s", "vo":
-		lo, hi, label := cartesia.MinSpeed, cartesia.MaxSpeed, "Speed"
-		if kind == "vo" {
-			lo, hi, label = cartesia.MinVolume, cartesia.MaxVolume, "Volume"
-		}
-		v, err := parseFactor(val, lo, hi)
-		if err != nil {
+		if err := b.setEmotion(uid, val); err != nil {
 			ack(err.Error())
 			return
 		}
-		_, err = b.store.Update(q.From.ID, func(s *Settings) {
-			if kind == "s" {
-				s.Speed = v
-			} else {
-				s.Volume = v
-			}
-		})
-		if err != nil {
-			ack("Couldn't save")
+		ack(icOK + " Emotion: " + orDefault(map[string]string{"auto": "natural"}[val], val))
+		b.show(ctx, q, b.emotionScreen(uid, !contains(featuredEmotions, val) && val != "auto"))
+	case "s", "vo":
+		vol := kind == "vo"
+		if err := b.setFactor(uid, vol, val); err != nil {
+			ack(err.Error())
 			return
 		}
-		ack(label + ": " + fmtFactor(v))
-		b.editHTML(ctx, q.Message, fmt.Sprintf("%s: <b>%s</b>", label, fmtFactor(v)), nil)
+		ack(icOK + " " + map[bool]string{false: "Speed ", true: "Volume "}[vol] + fmtFactor(mustFloat(val)))
+		b.show(ctx, q, b.rangeScreen(uid, vol))
 	case "m":
-		if !contains(b.ttsModels(ctx), val) {
-			ack("Unknown model")
+		if err := b.setModel(ctx, uid, val); err != nil {
+			ack(err.Error())
 			return
 		}
-		if _, err := b.store.Update(q.From.ID, func(s *Settings) { s.Model = val }); err != nil {
-			ack("Couldn't save")
+		ack(icOK + " Model: " + val)
+		b.show(ctx, q, b.modelScreen(ctx, uid))
+	case "l":
+		if err := b.setLang(uid, val); err != nil {
+			ack(err.Error())
 			return
 		}
-		ack("Model: " + val)
-		b.editHTML(ctx, q.Message, "🧠 Model: <b>"+html.EscapeString(val)+"</b>", nil)
+		ack(icOK + " Language: " + langLabel(b.store.Get(uid).Language))
+		b.show(ctx, q, b.langScreen(ctx, uid))
 	case "f":
-		b.setFormat(q.From.ID, val == "file")
-		ack("")
-		if val == "file" {
-			b.editHTML(ctx, q.Message, "🎵 You'll get MP3 audio files.", nil)
-		} else {
-			b.editHTML(ctx, q.Message, "🎙 You'll get voice notes.", nil)
-		}
+		b.setOutput(uid, val == "file")
+		ack(icOK + " Output: " + outputLabel(val == "file"))
+		b.show(ctx, q, b.outputScreen(uid))
 	case "d":
 		id, name := "", ""
 		if val != "-" {
 			d, err := b.ct.GetPronunciationDict(ctx, val)
 			if err != nil {
-				ack("Couldn't load that dictionary")
+				ack("")
+				b.show(ctx, q, errorScreen(err))
 				return
 			}
 			id, name = d.ID, d.Name
 		}
-		if _, err := b.store.Update(q.From.ID, func(s *Settings) { s.DictID, s.DictName = id, name }); err != nil {
-			ack("Couldn't save")
+		if _, err := b.store.Update(uid, func(s *Settings) { s.DictID, s.DictName = id, name }); err != nil {
+			ack("")
+			b.show(ctx, q, errorScreen(err))
+			return
+		}
+		ack(icOK + " Pronunciation: " + orDefault(name, "none"))
+		b.show(ctx, q, b.dictsScreen(ctx, uid))
+
+	// actions
+	case "do":
+		b.action(ctx, q, as, val)
+	case "reset":
+		if err := b.store.Reset(uid); err != nil {
+			ack("")
+			b.show(ctx, q, errorScreen(err))
+			return
+		}
+		ack(icOK + " Settings reset")
+		b.show(ctx, q, b.homeScreen(uid))
+	case "cancel":
+		b.clearFlow(uid)
+		ack("Cancelled")
+		b.show(ctx, q, cancelledScreen())
+	default:
+		ack("")
+	}
+}
+
+// withWarning keeps the user on the picker and explains what went wrong.
+func withWarning(s screen, err error) screen {
+	s.text += "\n\n" + icWarn + " " + explain(err)
+	return s
+}
+
+func mustFloat(s string) float64 {
+	v, _ := strconv.ParseFloat(s, 64)
+	return v
+}
+
+// navScreen maps "nav:<name>" to its screen.
+func (b *Bot) navScreen(ctx context.Context, uid int64, name string) screen {
+	switch name {
+	case "style":
+		return b.styleScreen(uid)
+	case "emotion":
+		return b.emotionScreen(uid, false)
+	case "emotions":
+		return b.emotionScreen(uid, true)
+	case "speed":
+		return b.rangeScreen(uid, false)
+	case "volume":
+		return b.rangeScreen(uid, true)
+	case "lang":
+		return b.langScreen(ctx, uid)
+	case "model":
+		return b.modelScreen(ctx, uid)
+	case "output":
+		return b.outputScreen(uid)
+	case "voices":
+		return b.voicesScreen(ctx, uid, b.resetSession(uid, "", nil))
+	case "studio":
+		return b.studioScreen(uid)
+	case "dicts":
+		return b.dictsScreen(ctx, uid)
+	case "create":
+		return b.createScreen(uid)
+	case "localize":
+		return b.localizeScreen(ctx, uid)
+	case "help":
+		return helpScreen("")
+	case "status":
+		return b.statusScreen(ctx)
+	case "usage":
+		return b.usageScreen(ctx, uid)
+	case "reset":
+		return resetScreen()
+	}
+	return b.homeScreen(uid)
+}
+
+// action handles "do:<what>" buttons.
+func (b *Bot) action(ctx context.Context, q *telegram.CallbackQuery, as *telegram.Message, what string) {
+	uid, chat := q.From.ID, q.Message.Chat.ID
+	ack := func(text string) { _ = b.tg.AnswerCallbackQuery(ctx, q.ID, text) }
+	switch what {
+	case "sample":
+		ack("")
+		s := b.store.Get(uid)
+		b.speak(ctx, as, fmt.Sprintf("Hi, I'm %s. This is how I sound in Ellie Studio. Send me anything and I'll read it out loud.",
+			orDefault(s.VoiceName, "your new voice")))
+	case "again":
+		text := b.lastSpoken(uid)
+		if text == "" {
+			ack("Send me some text first")
+			return
+		}
+		ack(icAgain + " One more time")
+		b.speak(ctx, as, text)
+	case "readback":
+		text := b.lastTranscript(uid)
+		if text == "" {
+			ack("Nothing to read yet")
 			return
 		}
 		ack("")
-		b.editHTML(ctx, q.Message, "📖 Dictionary: <b>"+html.EscapeString(orDefault(name, "none"))+"</b>", nil)
-	case "dv":
-		b.confirmDeleteVoice(ctx, q, val)
-	case "x":
-		ack("Cancelled")
-		b.editHTML(ctx, q.Message, "Cancelled.", nil)
+		b.speak(ctx, as, text)
+	case "transcribe":
+		ack("")
+		b.show(ctx, q, transcribePrompt())
+	case "search":
+		ack("")
+		b.startFlow(ctx, chat, uid, flowSearch)
+	case "clone":
+		ack("")
+		b.startFlow(ctx, chat, uid, flowCloneClip)
+	case "newdict":
+		ack("")
+		b.startFlow(ctx, chat, uid, flowDictName)
+	case "rename":
+		ack("")
+		b.startFlow(ctx, chat, uid, flowRename)
 	default:
 		ack("")
 	}

@@ -81,10 +81,32 @@ func (f *fakeTelegram) find(method string) []tgCall {
 }
 
 type fixture struct {
-	bot   *Bot
-	tg    *fakeTelegram
-	ttsIn map[string]any
-	sttIn map[string]string
+	bot    *Bot
+	tg     *fakeTelegram
+	ttsIn  map[string]any
+	sttIn  map[string]string
+	cloned bool
+}
+
+func press(uid int64, data string) telegram.Update {
+	return telegram.Update{CallbackQuery: &telegram.CallbackQuery{
+		ID: "cb", From: telegram.User{ID: uid}, Data: data,
+		Message: &telegram.Message{MessageID: 5, Chat: telegram.Chat{ID: uid}, Text: "screen"},
+	}}
+}
+
+// lastText returns the text of the most recent sendMessage or editMessageText.
+func (f *fakeTelegram) lastText() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := len(f.calls) - 1; i >= 0; i-- {
+		c := f.calls[i]
+		if c.Method == "sendMessage" || c.Method == "editMessageText" {
+			s, _ := c.JSON["text"].(string)
+			return s
+		}
+	}
+	return ""
 }
 
 func newFixture(t *testing.T, cfg Config) *fixture {
@@ -105,6 +127,17 @@ func newFixture(t *testing.T, cfg Config) *fixture {
 			_, _ = io.WriteString(w, `{"type":"transcript","text":"hello from a voice note","duration":2.5,"language":"en"}`)
 		case "/voices/v-new":
 			_, _ = io.WriteString(w, `{"id":"v-new","name":"Nova","language":"en"}`)
+		case "/voices":
+			_, _ = io.WriteString(w, `{"data":[{"id":"v-new","name":"Nova","language":"en","gender":"feminine"}],"has_more":false}`)
+		case "/voices/clone":
+			fx.cloned = true
+			_, _ = io.WriteString(w, `{"id":"v-clone","name":"My Voice","language":"en"}`)
+		case "/models":
+			_, _ = io.WriteString(w, `{"data":[{"id":"sonic-3.6","capability":"tts","supported_languages":["en","fr"]},{"id":"ink-whisper","capability":"stt"}]}`)
+		case "/pronunciation-dicts/":
+			_, _ = io.WriteString(w, `{"data":[],"has_more":false}`)
+		case "/":
+			_, _ = io.WriteString(w, `{"ok":true,"version":"2026-08-14"}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -158,6 +191,143 @@ func TestTextBecomesVoiceNote(t *testing.T) {
 	if gc["speed"].(float64) != 1.2 || gc["emotion"] != "calm" {
 		t.Errorf("generation_config = %v", gc)
 	}
+	if !strings.Contains(sent[0].Form["reply_markup"], `"do:again"`) {
+		t.Errorf("voice note should carry the Again/Emotion/Voice/Style buttons: %q", sent[0].Form["reply_markup"])
+	}
+}
+
+func TestAgainRepeatsLastText(t *testing.T) {
+	fx := newFixture(t, Config{})
+	ctx := context.Background()
+	fx.bot.handleUpdate(ctx, msg(7, "First line"))
+	fx.ttsIn = nil
+	fx.bot.handleUpdate(ctx, press(7, "do:again"))
+	if fx.ttsIn["transcript"] != "First line" {
+		t.Fatalf("Again should resend the last text, got %v", fx.ttsIn)
+	}
+}
+
+func TestEveryScreenHasAWayHome(t *testing.T) {
+	fx := newFixture(t, Config{})
+	ctx := context.Background()
+	names := []string{"style", "emotion", "emotions", "speed", "volume", "lang", "model", "output",
+		"voices", "studio", "dicts", "create", "localize", "help", "status", "usage"}
+	for _, n := range names {
+		s := fx.bot.navScreen(ctx, 7, n)
+		if s.kb == nil || len(s.kb.InlineKeyboard) == 0 {
+			t.Errorf("%s: no buttons", n)
+			continue
+		}
+		last := s.kb.InlineKeyboard[len(s.kb.InlineKeyboard)-1]
+		if last[len(last)-1].CallbackData != "nav:home" {
+			t.Errorf("%s: last row should end with Home, got %+v", n, last)
+		}
+		for _, row := range s.kb.InlineKeyboard {
+			for _, bt := range row {
+				if len(bt.CallbackData) > 64 || bt.CallbackData == "" {
+					t.Errorf("%s: bad callback_data %q", n, bt.CallbackData)
+				}
+			}
+		}
+	}
+	for _, topic := range []string{"", "speak", "voices", "listen", "create", "commands"} {
+		kb := helpScreen(topic).kb.InlineKeyboard
+		if last := kb[len(kb)-1]; last[len(last)-1].CallbackData != "nav:home" {
+			t.Errorf("help %q: no Home", topic)
+		}
+	}
+}
+
+func TestPickerRedrawsWithCheckmark(t *testing.T) {
+	fx := newFixture(t, Config{})
+	fx.bot.handleUpdate(context.Background(), press(7, "s:1.2"))
+	edits := fx.tg.find("editMessageText")
+	if len(edits) != 1 {
+		t.Fatalf("expected the speed picker to redraw in place, got %d edits", len(edits))
+	}
+	if !strings.Contains(edits[0].JSON["text"].(string), "1.2×") {
+		t.Errorf("picker text = %q", edits[0].JSON["text"])
+	}
+	kb, _ := json.Marshal(edits[0].JSON["reply_markup"])
+	if !strings.Contains(string(kb), "✅ 1.2×") || !strings.Contains(string(kb), "nav:home") {
+		t.Errorf("picker keyboard should mark 1.2× and keep Home: %s", kb)
+	}
+	if fx.bot.store.Get(7).Speed != 1.2 {
+		t.Error("speed not saved")
+	}
+}
+
+func TestStartShowsMenuKeyboardAndHome(t *testing.T) {
+	fx := newFixture(t, Config{})
+	fx.bot.handleUpdate(context.Background(), msg(7, "/start"))
+	sent := fx.tg.find("sendMessage")
+	if len(sent) != 2 {
+		t.Fatalf("expected welcome + home card, got %d messages", len(sent))
+	}
+	kb, _ := json.Marshal(sent[0].JSON["reply_markup"])
+	if !strings.Contains(string(kb), `"keyboard"`) || !strings.Contains(string(kb), menuVoices) {
+		t.Errorf("welcome should pin the menu keyboard: %s", kb)
+	}
+	if !strings.Contains(sent[1].JSON["text"].(string), "Ellie Studio") {
+		t.Errorf("second message should be the home card: %q", sent[1].JSON["text"])
+	}
+	if !fx.bot.store.Known(7) {
+		t.Error("user should be remembered after onboarding")
+	}
+}
+
+func TestMenuButtonIsNotSpoken(t *testing.T) {
+	fx := newFixture(t, Config{})
+	fx.bot.handleUpdate(context.Background(), msg(7, menuVoices))
+	if fx.ttsIn != nil {
+		t.Fatal("menu label must not be sent to TTS")
+	}
+	if !strings.Contains(fx.tg.lastText(), "Nova") {
+		t.Errorf("voices screen should list the library, got %q", fx.tg.lastText())
+	}
+}
+
+func TestGuidedCloneFlow(t *testing.T) {
+	fx := newFixture(t, Config{})
+	ctx := context.Background()
+	fx.bot.handleUpdate(ctx, press(7, "do:clone"))
+	if !strings.Contains(fx.tg.lastText(), "Step 1 of 2") {
+		t.Fatalf("clone should start at step 1, got %q", fx.tg.lastText())
+	}
+	fx.bot.handleUpdate(ctx, msg(7, "not audio"))
+	if fx.ttsIn != nil || !strings.Contains(fx.tg.lastText(), "recording") {
+		t.Fatalf("text during step 1 should be redirected, not spoken: %q", fx.tg.lastText())
+	}
+	u := msg(7, "")
+	u.Message.Voice = &telegram.Voice{FileID: "f1", Duration: 8, FileSize: 16}
+	fx.bot.handleUpdate(ctx, u)
+	if !strings.Contains(fx.tg.lastText(), "Step 2 of 2") {
+		t.Fatalf("clip should advance to step 2, got %q", fx.tg.lastText())
+	}
+	fx.bot.handleUpdate(ctx, msg(7, "My Voice"))
+	if !fx.cloned {
+		t.Fatal("clone endpoint was not called")
+	}
+	if s := fx.bot.store.Get(7); s.VoiceID != "v-clone" {
+		t.Errorf("cloned voice should become current, got %+v", s)
+	}
+	if !strings.Contains(fx.tg.lastText(), "is ready") {
+		t.Errorf("expected a ready card, got %q", fx.tg.lastText())
+	}
+}
+
+func TestCancelEndsFlow(t *testing.T) {
+	fx := newFixture(t, Config{})
+	ctx := context.Background()
+	fx.bot.handleUpdate(ctx, press(7, "do:search"))
+	fx.bot.handleUpdate(ctx, msg(7, "/cancel"))
+	if fx.bot.getFlow(7) != nil {
+		t.Fatal("flow should be cleared")
+	}
+	fx.bot.handleUpdate(ctx, msg(7, "hello"))
+	if fx.ttsIn == nil {
+		t.Fatal("after cancel, text should be spoken again")
+	}
 }
 
 func TestVoiceNoteIsTranscribed(t *testing.T) {
@@ -171,13 +341,17 @@ func TestVoiceNoteIsTranscribed(t *testing.T) {
 	if fx.sttIn["language"] != "en" || fx.sttIn["filename"] != "voice.ogg" {
 		t.Errorf("stt input = %v", fx.sttIn)
 	}
-	var replies []string
-	for _, c := range fx.tg.find("sendMessage") {
-		replies = append(replies, c.JSON["text"].(string))
+	edits := fx.tg.find("editMessageText")
+	if len(edits) == 0 {
+		t.Fatal("the ⏳ progress message should turn into the transcript")
 	}
-	last := replies[len(replies)-1]
+	last := edits[len(edits)-1].JSON["text"].(string)
 	if !strings.Contains(last, "hello from a voice note") || !strings.Contains(last, "2.5s") {
-		t.Errorf("transcript reply = %q", last)
+		t.Errorf("transcript = %q", last)
+	}
+	fx.bot.handleUpdate(ctx, press(7, "do:readback"))
+	if fx.ttsIn["transcript"] != "hello from a voice note" {
+		t.Errorf("Read aloud should speak the transcript, got %v", fx.ttsIn)
 	}
 }
 

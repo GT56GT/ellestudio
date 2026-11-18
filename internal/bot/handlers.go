@@ -16,12 +16,17 @@ import (
 
 // ---------------------------------------------------------------- routing
 
+// handleMessage routes a message in a fixed order so the user always gets the
+// most specific answer: commands, then menu buttons, then a guided step in
+// progress, then the defaults (audio → transcript, text → speech).
 func (b *Bot) handleMessage(ctx context.Context, m *telegram.Message) {
 	if m.From == nil || m.From.IsBot {
 		return
 	}
-	if !b.allowed(m.From.ID) {
-		b.reply(ctx, m, "Sorry, Ellie Studio is private. Ask the owner to add your Telegram ID: "+fmt.Sprint(m.From.ID))
+	uid := m.From.ID
+	if !b.allowed(uid) {
+		s := privateScreen(uid)
+		b.replyHTML(ctx, m, s.text, nil)
 		return
 	}
 
@@ -30,97 +35,89 @@ func (b *Bot) handleMessage(ctx context.Context, m *telegram.Message) {
 		text = strings.TrimSpace(m.Caption)
 	}
 	cmd, args := parseCommand(text)
+	a, hasAudio := audioOf(m)
 
-	// Audio sent directly: the caption may carry a command.
-	if a, ok := audioOf(m); ok {
-		switch cmd {
-		case "clone":
-			b.cmdClone(ctx, m, a, args)
-		case "detect":
-			b.cmdDetect(ctx, m, a)
-		default:
-			b.cmdTranscribe(ctx, m, a)
+	if cmd != "" {
+		if cmd == "cancel" {
+			if b.clearFlow(uid) {
+				s := cancelledScreen()
+				b.replyHTML(ctx, m, s.text, s.kb)
+			} else {
+				ns := noticeScreen(icOK, "Nothing to cancel", "You're all set 👍")
+				b.replyHTML(ctx, m, ns.text, ns.kb)
+			}
+			return
 		}
+		b.clearFlow(uid)
+		if hasAudio && (cmd == "clone" || cmd == "detect" || cmd == "transcribe") {
+			b.audioCommand(ctx, m, cmd, a, args)
+			return
+		}
+		b.command(ctx, m, cmd, args)
 		return
 	}
-	if cmd == "" {
-		if text != "" {
-			b.speak(ctx, m, text)
-		}
+	if !hasAudio && b.menuButton(ctx, m, text) {
 		return
 	}
+	if f := b.getFlow(uid); f != nil {
+		b.continueFlow(ctx, m, f, text, a, hasAudio)
+		return
+	}
+	switch {
+	case hasAudio:
+		b.transcribe(ctx, m, a)
+	case text != "":
+		b.speak(ctx, m, text)
+	}
+}
 
-	switch cmd {
-	case "start":
-		b.cmdStart(ctx, m)
-	case "help":
-		b.cmdHelp(ctx, m)
-	case "say":
-		if args == "" {
-			b.reply(ctx, m, "Usage: /say <text>  (or just send me any text)")
-			return
-		}
-		b.speak(ctx, m, args)
-	case "transcribe", "clone", "detect":
-		a, ok := audioOf(m.ReplyToMessage)
-		if !ok {
-			b.reply(ctx, m, fmt.Sprintf("Reply to a voice note or audio file with /%s, or send the audio with /%s as its caption.", cmd, cmd))
-			return
-		}
-		switch cmd {
-		case "transcribe":
-			b.cmdTranscribe(ctx, m, a)
-		case "clone":
-			b.cmdClone(ctx, m, a, args)
-		case "detect":
-			b.cmdDetect(ctx, m, a)
-		}
-	case "voices":
-		b.cmdVoices(ctx, m, args, false)
-	case "myvoices":
-		b.cmdVoices(ctx, m, args, true)
-	case "voice":
-		b.cmdVoice(ctx, m, args)
-	case "preview":
-		b.cmdPreview(ctx, m, args)
-	case "accents":
-		b.cmdAccents(ctx, m, args)
-	case "localize":
-		b.cmdLocalize(ctx, m, args)
-	case "rename":
-		b.cmdRename(ctx, m, args)
-	case "deletevoice":
-		b.cmdDeleteVoice(ctx, m, args)
-	case "emotion":
-		b.cmdEmotion(ctx, m, args)
-	case "speed":
-		b.cmdSpeed(ctx, m, args)
-	case "volume":
-		b.cmdVolume(ctx, m, args)
-	case "model":
-		b.cmdModel(ctx, m, args)
-	case "lang", "language":
-		b.cmdLang(ctx, m, args)
-	case "format":
-		b.cmdFormat(ctx, m, args)
-	case "dicts":
-		b.cmdDicts(ctx, m)
-	case "newdict":
-		b.cmdNewDict(ctx, m, args)
-	case "settings":
-		b.cmdSettings(ctx, m)
-	case "reset":
-		if err := b.store.Reset(m.From.ID); err != nil {
-			b.fail(ctx, m, "reset", err)
-			return
-		}
-		b.reply(ctx, m, "Settings reset to the studio defaults.")
-	case "status":
-		b.cmdStatus(ctx, m)
-	case "usage":
-		b.cmdUsage(ctx, m)
+// menuButton handles a tap on the persistent menu under the input box.
+func (b *Bot) menuButton(ctx context.Context, m *telegram.Message, text string) bool {
+	uid := m.From.ID
+	var s screen
+	switch text {
+	case menuSpeak:
+		s = b.speakPrompt(uid)
+	case menuVoices:
+		b.clearFlow(uid)
+		b.openVoices(ctx, m.Chat.ID, uid, "", nil)
+		return true
+	case menuStyle:
+		s = b.styleScreen(uid)
+	case menuTranscribe:
+		s = transcribePrompt()
+	case menuHome:
+		s = b.homeScreen(uid)
+	case menuHelp:
+		s = helpScreen("")
 	default:
-		b.reply(ctx, m, "Unknown command. Try /help.")
+		return false
+	}
+	b.clearFlow(uid)
+	b.sendScreen(ctx, m.Chat.ID, 0, s)
+	return true
+}
+
+// audioCommand runs a command aimed at an audio attachment.
+func (b *Bot) audioCommand(ctx context.Context, m *telegram.Message, cmd string, a audioRef, args string) {
+	switch cmd {
+	case "transcribe":
+		b.transcribe(ctx, m, a)
+	case "detect":
+		b.detect(ctx, m, a)
+	case "clone":
+		if !b.isAdmin(m.From.ID) {
+			s := b.createScreen(m.From.ID)
+			b.replyHTML(ctx, m, s.text, s.kb)
+			return
+		}
+		if strings.TrimSpace(args) == "" {
+			b.setFlow(m.From.ID, &flow{kind: flowCloneName, clip: a})
+			s := clonePromptName()
+			b.replyHTML(ctx, m, s.text, s.kb)
+			return
+		}
+		b.runClone(ctx, m, a, args)
 	}
 }
 
@@ -138,6 +135,8 @@ func parseCommand(text string) (string, string) {
 	return strings.ToLower(head), strings.TrimSpace(rest)
 }
 
+// ---------------------------------------------------------------- audio attachments
+
 // audioRef is a downloadable audio attachment.
 type audioRef struct {
 	FileID   string
@@ -146,8 +145,8 @@ type audioRef struct {
 	Seconds  int
 }
 
-// audioOf finds audio in a message: voice notes, audio files, video notes,
-// or documents that look like audio.
+// audioOf finds audio in a message: voice notes, audio files, video notes, or
+// documents that look like audio.
 func audioOf(m *telegram.Message) (audioRef, bool) {
 	if m == nil {
 		return audioRef{}, false
@@ -208,7 +207,7 @@ func contains(list []string, s string) bool {
 func (b *Bot) fetchAudio(ctx context.Context, a audioRef, limit int64) ([]byte, string, error) {
 	limit = min(limit, telegram.MaxDownloadBytes)
 	if a.Size > limit {
-		return nil, "", fmt.Errorf("that file is %.1f MB; the limit here is %.0f MB", float64(a.Size)/(1<<20), float64(limit)/(1<<20))
+		return nil, "", fmt.Errorf("That file is %.1f MB; the limit here is %.0f MB.", float64(a.Size)/(1<<20), float64(limit)/(1<<20))
 	}
 	data, filePath, err := b.tg.Download(ctx, a.FileID, limit)
 	if err != nil {
@@ -221,16 +220,77 @@ func (b *Bot) fetchAudio(ctx context.Context, a audioRef, limit int64) ([]byte, 
 	return data, name, nil
 }
 
+// ---------------------------------------------------------------- progress
+
+// progress is a "⏳ working…" message that later turns into the result.
+type progress struct {
+	b   *Bot
+	msg *telegram.Message
+}
+
+func (b *Bot) startProgress(ctx context.Context, m *telegram.Message, text string) *progress {
+	msg := b.sendScreen(ctx, m.Chat.ID, m.MessageID, screen{icWait + " " + text, nil})
+	return &progress{b, msg}
+}
+
+// finish replaces the progress message with s (or posts s if that fails).
+func (p *progress) finish(ctx context.Context, chatID int64, s screen) {
+	if p.msg != nil {
+		err := p.b.tg.EditMessageText(ctx, telegram.SendMessageParams{
+			ChatID: chatID, MessageID: p.msg.MessageID, Text: s.text, ParseMode: "HTML", ReplyMarkup: s.kb, NoPreview: true,
+		})
+		if err == nil {
+			return
+		}
+	}
+	p.b.sendScreen(ctx, chatID, 0, s)
+}
+
+// ---------------------------------------------------------------- remembered text
+
+func (b *Bot) remember(uid int64, fn func(*recent)) {
+	b.sessMu.Lock()
+	defer b.sessMu.Unlock()
+	r := b.recent[uid]
+	if r == nil {
+		r = &recent{}
+		b.recent[uid] = r
+	}
+	fn(r)
+}
+
+func (b *Bot) lastSpoken(uid int64) string {
+	b.sessMu.Lock()
+	defer b.sessMu.Unlock()
+	if r := b.recent[uid]; r != nil {
+		return r.spoken
+	}
+	return ""
+}
+
+func (b *Bot) lastTranscript(uid int64) string {
+	b.sessMu.Lock()
+	defer b.sessMu.Unlock()
+	if r := b.recent[uid]; r != nil {
+		return r.transcript
+	}
+	return ""
+}
+
 // ---------------------------------------------------------------- text-to-speech
 
 func (b *Bot) speak(ctx context.Context, m *telegram.Message, text string) {
+	uid := m.From.ID
 	if n := utf8.RuneCountInString(text); n > b.cfg.MaxTTSChars {
-		b.reply(ctx, m, fmt.Sprintf("That's %d characters; the studio limit is %d per message. Split it up and send again.", n, b.cfg.MaxTTSChars))
+		s := noticeScreen(icWarn, "That's a lot of text", fmt.Sprintf(
+			"It's <b>%d</b> characters. I can read up to <b>%d</b> at a time, so split it into smaller messages.", n, b.cfg.MaxTTSChars))
+		b.replyHTML(ctx, m, s.text, s.kb)
 		return
 	}
-	s := b.store.Get(m.From.ID)
+	s := b.store.Get(uid)
 	if s.VoiceID == "" {
-		b.reply(ctx, m, "Pick a voice first with /voices.")
+		ns := noVoiceScreen()
+		b.replyHTML(ctx, m, ns.text, ns.kb)
 		return
 	}
 
@@ -267,6 +327,7 @@ func (b *Bot) speak(ctx context.Context, m *telegram.Message, text string) {
 		b.fail(ctx, m, "tts", err)
 		return
 	}
+	b.remember(uid, func(r *recent) { r.spoken = text })
 	b.sendSpeech(ctx, m, s, text, audio)
 }
 
@@ -291,10 +352,9 @@ func (b *Bot) ttsWithRetry(ctx context.Context, req cartesia.TTSRequest) ([]byte
 }
 
 func (b *Bot) sendSpeech(ctx context.Context, m *telegram.Message, s Settings, text string, audio []byte) {
-	caption := speechCaption(s)
 	p := telegram.MediaParams{
-		ChatID: m.Chat.ID, ReplyTo: m.MessageID, Caption: caption,
-		Filename: "ellie-studio.mp3", Data: audio,
+		ChatID: m.Chat.ID, ReplyTo: m.MessageID, Caption: speechCaption(s),
+		Filename: "ellie-studio.mp3", Data: audio, ReplyMarkup: afterSpeech(),
 	}
 	if !s.AsFile {
 		_, err := b.tg.SendVoice(ctx, p)
@@ -314,32 +374,33 @@ func (b *Bot) sendSpeech(ctx context.Context, m *telegram.Message, s Settings, t
 }
 
 func speechCaption(s Settings) string {
-	parts := []string{"🎙 " + orDefault(s.VoiceName, "voice")}
+	parts := []string{icStudio + " " + orDefault(s.VoiceName, "voice")}
 	if s.Emotion != "" {
 		parts = append(parts, s.Emotion)
 	}
 	if s.Speed != 1 {
-		parts = append(parts, fmt.Sprintf("%.2gx speed", s.Speed))
+		parts = append(parts, fmtFactor(s.Speed)+" speed")
 	}
 	if s.Volume != 1 {
-		parts = append(parts, fmt.Sprintf("%.2gx volume", s.Volume))
+		parts = append(parts, fmtFactor(s.Volume)+" volume")
 	}
 	if s.Language != "" {
-		parts = append(parts, s.Language)
+		parts = append(parts, langLabel(s.Language))
 	}
 	return strings.Join(parts, " · ")
 }
 
 // ---------------------------------------------------------------- speech-to-text
 
-func (b *Bot) cmdTranscribe(ctx context.Context, m *telegram.Message, a audioRef) {
-	_ = b.tg.SendChatAction(ctx, m.Chat.ID, "typing")
+func (b *Bot) transcribe(ctx context.Context, m *telegram.Message, a audioRef) {
+	uid := m.From.ID
+	pr := b.startProgress(ctx, m, "Listening…")
 	data, name, err := b.fetchAudio(ctx, a, telegram.MaxDownloadBytes)
 	if err != nil {
-		b.fail(ctx, m, "download", err)
+		pr.finish(ctx, m.Chat.ID, errorScreen(err))
 		return
 	}
-	s := b.store.Get(m.From.ID)
+	s := b.store.Get(uid)
 	if !b.acquire(ctx) {
 		return
 	}
@@ -352,15 +413,19 @@ func (b *Bot) cmdTranscribe(ctx context.Context, m *telegram.Message, a audioRef
 	cancel()
 	b.release()
 	if err != nil {
-		b.fail(ctx, m, "stt", err)
+		pr.finish(ctx, m.Chat.ID, errorScreen(err))
 		return
 	}
 	text := strings.TrimSpace(tr.Text)
 	if text == "" {
-		b.reply(ctx, m, "I couldn't hear any speech in that.")
+		pr.finish(ctx, m.Chat.ID, screen{
+			header(icListen, "No speech found", "") + "I couldn't hear any words in that. Try a clearer recording.",
+			(&keys{}).nav("", "").build(),
+		})
 		return
 	}
-	header := "📝 Transcript"
+	b.remember(uid, func(r *recent) { r.transcript = truncate(text, b.cfg.MaxTTSChars) })
+
 	var meta []string
 	if tr.Duration > 0 {
 		meta = append(meta, fmt.Sprintf("%.1fs", tr.Duration))
@@ -368,36 +433,39 @@ func (b *Bot) cmdTranscribe(ctx context.Context, m *telegram.Message, a audioRef
 	if tr.Language != "" {
 		meta = append(meta, tr.Language)
 	}
-	if len(meta) > 0 {
-		header += " (" + strings.Join(meta, ", ") + ")"
+	chunks := splitText(text, telegram.MaxMessageLen-400)
+	head := header(icListen, "Transcript", strings.Join(meta, " · "))
+	if len(chunks) == 1 {
+		pr.finish(ctx, m.Chat.ID, screen{head + html.EscapeString(chunks[0]), afterTranscript()})
+		return
 	}
-	b.reply(ctx, m, header+"\n\n"+text)
+	pr.finish(ctx, m.Chat.ID, screen{head + html.EscapeString(chunks[0]), nil})
+	for i, c := range chunks[1:] {
+		var kb *telegram.InlineKeyboardMarkup
+		if i == len(chunks)-2 {
+			kb = afterTranscript()
+		}
+		b.sendScreen(ctx, m.Chat.ID, 0, screen{html.EscapeString(c), kb})
+	}
 }
 
 // ---------------------------------------------------------------- voice cloning
 
-func (b *Bot) cmdClone(ctx context.Context, m *telegram.Message, a audioRef, name string) {
-	if !b.isAdmin(m.From.ID) {
-		b.reply(ctx, m, "Only studio admins can clone voices.")
+func (b *Bot) runClone(ctx context.Context, m *telegram.Message, a audioRef, name string) {
+	uid := m.From.ID
+	if !b.isAdmin(uid) {
+		s := b.createScreen(uid)
+		b.replyHTML(ctx, m, s.text, s.kb)
 		return
 	}
 	name = strings.TrimSpace(name)
-	if name == "" {
-		b.reply(ctx, m, "Give the voice a name: /clone <name>  (reply to a 5–15 second clean clip of one speaker)")
-		return
-	}
-	if utf8.RuneCountInString(name) > 100 {
-		b.reply(ctx, m, "That name is too long.")
-		return
-	}
-	_ = b.tg.SendChatAction(ctx, m.Chat.ID, "typing")
+	pr := b.startProgress(ctx, m, "Cloning <b>"+html.EscapeString(name)+"</b>… this takes a few seconds.")
 	data, filename, err := b.fetchAudio(ctx, a, cartesia.MaxCloneClipBytes)
 	if err != nil {
-		b.fail(ctx, m, "download", err)
+		pr.finish(ctx, m.Chat.ID, errorScreen(err))
 		return
 	}
-	s := b.store.Get(m.From.ID)
-	lang := orDefault(baseLang(s.Language), "en")
+	lang := orDefault(baseLang(b.store.Get(uid).Language), "en")
 	if !b.acquire(ctx) {
 		return
 	}
@@ -412,28 +480,28 @@ func (b *Bot) cmdClone(ctx context.Context, m *telegram.Message, a audioRef, nam
 	cancel()
 	b.release()
 	if err != nil {
-		b.fail(ctx, m, "clone", err)
+		pr.finish(ctx, m.Chat.ID, errorScreen(err))
 		return
 	}
-	if _, err := b.store.Update(m.From.ID, func(st *Settings) { st.VoiceID, st.VoiceName = v.ID, v.Name }); err != nil {
+	if _, err := b.store.Update(uid, func(st *Settings) { st.VoiceID, st.VoiceName = v.ID, v.Name }); err != nil {
 		b.log.Warn("save settings", "err", err)
 	}
-	b.replyHTML(ctx, m, fmt.Sprintf(
-		"✨ Cloned <b>%s</b> (%s) and made it your current voice.\nID: <code>%s</code>\n\nSend any text to hear it.",
-		html.EscapeString(v.Name), html.EscapeString(v.Language), html.EscapeString(v.ID)), nil)
+	pr.finish(ctx, m.Chat.ID, createdScreen(icCreate, v.Name, v.ID))
 }
 
 // ---------------------------------------------------------------- watermark
 
-func (b *Bot) cmdDetect(ctx context.Context, m *telegram.Message, a audioRef) {
+func (b *Bot) detect(ctx context.Context, m *telegram.Message, a audioRef) {
+	nav := (&keys{}).nav("", "").build()
 	if a.Seconds > 0 && (a.Seconds < cartesia.MinWatermarkSecs || a.Seconds > cartesia.MaxWatermarkSecs) {
-		b.reply(ctx, m, "Watermark checks need audio between 5 seconds and 5 minutes long.")
+		s := noticeScreen("🔏", "Watermark check", "This check needs audio between <b>5 seconds and 5 minutes</b> long.")
+		b.replyHTML(ctx, m, s.text, s.kb)
 		return
 	}
-	_ = b.tg.SendChatAction(ctx, m.Chat.ID, "typing")
+	pr := b.startProgress(ctx, m, "Checking for a watermark…")
 	data, name, err := b.fetchAudio(ctx, a, cartesia.MaxWatermarkBytes)
 	if err != nil {
-		b.fail(ctx, m, "download", err)
+		pr.finish(ctx, m.Chat.ID, errorScreen(err))
 		return
 	}
 	if !b.acquire(ctx) {
@@ -444,14 +512,14 @@ func (b *Bot) cmdDetect(ctx context.Context, m *telegram.Message, a audioRef) {
 	cancel()
 	b.release()
 	if err != nil {
-		b.fail(ctx, m, "watermark", err)
+		pr.finish(ctx, m.Chat.ID, errorScreen(err))
 		return
 	}
+	verdict := "No Cartesia watermark found in this audio."
 	if found {
-		b.reply(ctx, m, "🔏 Cartesia watermark detected: this audio was generated with Cartesia.")
-	} else {
-		b.reply(ctx, m, "No Cartesia watermark detected.")
+		verdict = "✅ <b>Watermark found.</b> This audio was generated with Cartesia."
 	}
+	pr.finish(ctx, m.Chat.ID, screen{header("🔏", "Watermark check", "") + verdict, nav})
 }
 
 // ---------------------------------------------------------------- small helpers

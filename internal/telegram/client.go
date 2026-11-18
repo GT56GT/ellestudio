@@ -119,6 +119,32 @@ type InlineKeyboardMarkup struct {
 	InlineKeyboard [][]InlineKeyboardButton `json:"inline_keyboard"`
 }
 
+// KeyboardButton is one button of a reply keyboard; tapping it sends Text.
+type KeyboardButton struct {
+	Text string `json:"text"`
+}
+
+// ReplyKeyboardMarkup is the menu pinned under the message input.
+type ReplyKeyboardMarkup struct {
+	Keyboard              [][]KeyboardButton `json:"keyboard"`
+	ResizeKeyboard        bool               `json:"resize_keyboard,omitempty"`
+	IsPersistent          bool               `json:"is_persistent,omitempty"`
+	InputFieldPlaceholder string             `json:"input_field_placeholder,omitempty"`
+}
+
+// hasMarkup reports whether v is a real keyboard (not nil or a typed nil).
+func hasMarkup(v any) bool {
+	switch k := v.(type) {
+	case nil:
+		return false
+	case *InlineKeyboardMarkup:
+		return k != nil
+	case *ReplyKeyboardMarkup:
+		return k != nil
+	}
+	return true
+}
+
 type File struct {
 	FileID   string `json:"file_id"`
 	FileSize int64  `json:"file_size"`
@@ -231,7 +257,7 @@ type SendMessageParams struct {
 	Text        string
 	ParseMode   string
 	ReplyTo     int64
-	ReplyMarkup *InlineKeyboardMarkup
+	ReplyMarkup any // *InlineKeyboardMarkup or *ReplyKeyboardMarkup (edits: inline only)
 	NoPreview   bool
 }
 
@@ -246,7 +272,7 @@ func (p SendMessageParams) payload() map[string]any {
 	if p.ReplyTo != 0 {
 		m["reply_parameters"] = map[string]any{"message_id": p.ReplyTo, "allow_sending_without_reply": true}
 	}
-	if p.ReplyMarkup != nil {
+	if hasMarkup(p.ReplyMarkup) {
 		m["reply_markup"] = p.ReplyMarkup
 	}
 	if p.NoPreview {
@@ -281,6 +307,21 @@ func (c *Client) SetMyCommands(ctx context.Context, cmds []BotCommand) error {
 	return c.call(ctx, "setMyCommands", map[string]any{"commands": cmds}, nil)
 }
 
+// SetMyDescription sets the text shown in an empty chat before /start.
+func (c *Client) SetMyDescription(ctx context.Context, text string) error {
+	return c.call(ctx, "setMyDescription", map[string]any{"description": text}, nil)
+}
+
+// SetMyShortDescription sets the bot's profile blurb.
+func (c *Client) SetMyShortDescription(ctx context.Context, text string) error {
+	return c.call(ctx, "setMyShortDescription", map[string]any{"short_description": text}, nil)
+}
+
+// DeleteMessage removes a message the bot sent.
+func (c *Client) DeleteMessage(ctx context.Context, chatID, messageID int64) error {
+	return c.call(ctx, "deleteMessage", map[string]any{"chat_id": chatID, "message_id": messageID}, nil)
+}
+
 // MediaParams is shared by sendVoice / sendAudio / sendDocument.
 type MediaParams struct {
 	ChatID   int64
@@ -289,6 +330,8 @@ type MediaParams struct {
 	Filename string
 	Data     []byte
 	Title    string // sendAudio only
+	// ReplyMarkup is an optional keyboard attached under the media.
+	ReplyMarkup any
 }
 
 // SendVoice uploads a voice note (OGG/Opus, MP3, or M4A).
@@ -319,6 +362,13 @@ func (c *Client) sendMedia(ctx context.Context, method, field string, p MediaPar
 	if p.ReplyTo != 0 {
 		rp, _ := json.Marshal(map[string]any{"message_id": p.ReplyTo, "allow_sending_without_reply": true})
 		_ = w.WriteField("reply_parameters", string(rp))
+	}
+	if hasMarkup(p.ReplyMarkup) {
+		rm, err := json.Marshal(p.ReplyMarkup)
+		if err != nil {
+			return nil, err
+		}
+		_ = w.WriteField("reply_markup", string(rm))
 	}
 	part, err := w.CreateFormFile(field, p.Filename)
 	if err != nil {
