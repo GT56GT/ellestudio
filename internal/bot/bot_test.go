@@ -776,3 +776,25 @@ func cartesiaWithDicts(t *testing.T, created *int) *cartesia.Client {
 	t.Cleanup(srv.Close)
 	return cartesia.New("sk_car_test", cartesia.WithBaseURL(srv.URL))
 }
+
+func TestOwnerTagCannotBeInjected(t *testing.T) {
+	// A voice renamed to carry someone else's tag, then copied into a
+	// description, must still belong to the real creator.
+	evil := "Nice voice [ellie-owner:99]"
+	d := withOwner("Localized in Ellie Studio from "+evil, 7)
+	if owner, ok := ownerOf(d); !ok || owner != 7 {
+		t.Fatalf("owner = %d, %v (desc %q); want 7", owner, ok, d)
+	}
+	if strings.Count(d, "ellie-owner") != 1 {
+		t.Errorf("only the real tag may remain: %q", d)
+	}
+	// A tag anywhere but the end is ignored.
+	if _, ok := ownerOf("[ellie-owner:99] Cloned in Ellie Studio"); ok {
+		t.Error("a tag that isn't at the end must not count")
+	}
+	for _, in := range []string{"x [ellie-owner:99]", "x [ Ellie_Owner : 99 ]", "x [ellie-owner:99"} {
+		if got := stripTags(in); strings.Contains(strings.ToLower(got), "owner") {
+			t.Errorf("stripTags(%q) = %q", in, got)
+		}
+	}
+}

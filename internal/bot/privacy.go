@@ -25,19 +25,34 @@ import (
 	"ellestudio/internal/cartesia"
 )
 
-var ownerTagRe = regexp.MustCompile(`\s*\[ellie-owner:(\d+)\]`)
+var (
+	// ownerTagRe matches any owner tag, for cleaning text.
+	ownerTagRe = regexp.MustCompile(`\s*\[ellie-owner:(\d+)\]`)
+	// trailingOwnerRe matches only the tag the bot appends at the very end.
+	// Ownership is read from here alone, so a tag smuggled in earlier (for
+	// example inside a voice name copied into a description) never counts.
+	trailingOwnerRe = regexp.MustCompile(`\[ellie-owner:(\d+)\]\s*$`)
+	// tagLikeRe catches look-alike tags in user text, however they are spaced.
+	tagLikeRe = regexp.MustCompile(`(?i)\[\s*ellie[\s_-]*owner\s*:[^\]]*\]?`)
+)
 
 // ownerTag is appended to the description of anything a user creates.
 func ownerTag(uid int64) string { return "[ellie-owner:" + strconv.FormatInt(uid, 10) + "]" }
 
-// withOwner appends the owner tag to a description.
+// stripTags removes anything that looks like an owner tag from user text.
+func stripTags(s string) string {
+	return strings.TrimSpace(tagLikeRe.ReplaceAllString(s, ""))
+}
+
+// withOwner strips any tags already in desc, then appends the real one, so the
+// only tag in the result is the creator's and it sits at the end.
 func withOwner(desc string, uid int64) string {
-	return strings.TrimSpace(desc + " " + ownerTag(uid))
+	return strings.TrimSpace(stripTags(desc) + " " + ownerTag(uid))
 }
 
 // ownerOf reads the creator from a description.
 func ownerOf(desc string) (int64, bool) {
-	m := ownerTagRe.FindStringSubmatch(desc)
+	m := trailingOwnerRe.FindStringSubmatch(desc)
 	if m == nil {
 		return 0, false
 	}

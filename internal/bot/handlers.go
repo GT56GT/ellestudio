@@ -533,7 +533,7 @@ func (b *Bot) runClone(ctx context.Context, m *telegram.Message, a audioRef, nam
 		b.replyHTML(ctx, m, ls.text, ls.kb)
 		return
 	}
-	name = strings.TrimSpace(name)
+	name = orDefault(stripTags(name), "My voice")
 	pr := b.startProgress(ctx, m, "Cloning <b>"+html.EscapeString(name)+"</b>… this takes a few seconds.")
 	data, filename, err := b.fetchAudio(ctx, a, cartesia.MaxCloneClipBytes)
 	if err != nil {

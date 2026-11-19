@@ -390,7 +390,7 @@ func (b *Bot) createDict(ctx context.Context, m *telegram.Message, name string, 
 		}
 	}
 	d, err := b.ct.CreatePronunciationDict(ctx, cartesia.PronunciationDictRequest{
-		Name: name, Description: withOwner("Created in Ellie Studio", uid), Items: items,
+		Name: orDefault(stripTags(name), "My words"), Description: withOwner("Created in Ellie Studio", uid), Items: items,
 	})
 	if err != nil {
 		if !b.isAdmin(uid) {

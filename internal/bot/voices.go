@@ -475,7 +475,7 @@ func (b *Bot) runLocalize(ctx context.Context, uid int64, target *telegram.Messa
 	}
 	tctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	v, err := b.ct.LocalizeVoice(tctx, cartesia.LocalizeVoiceRequest{
-		VoiceID: s.VoiceID, Name: fmt.Sprintf("%s (%s)", orDefault(s.VoiceName, "Voice"), accent), Accent: accent,
+		VoiceID: s.VoiceID, Name: fmt.Sprintf("%s (%s)", orDefault(stripTags(src.Name), "Voice"), accent), Accent: accent,
 		Description: withOwner("Localized in Ellie Studio from "+src.Name, uid),
 	})
 	cancel()
@@ -545,7 +545,7 @@ func (b *Bot) renameVoice(ctx context.Context, m *telegram.Message, id, name str
 		b.fail(ctx, m, "rename", err)
 		return
 	}
-	v, err := b.ct.UpdateVoice(ctx, id, cartesia.UpdateVoiceRequest{Name: strings.TrimSpace(name)})
+	v, err := b.ct.UpdateVoice(ctx, id, cartesia.UpdateVoiceRequest{Name: orDefault(stripTags(name), cur.Name)})
 	if err != nil {
 		b.fail(ctx, m, "rename", err)
 		return
