@@ -1,7 +1,7 @@
 # Build a static binary, then run it on a minimal non-root image.
 FROM golang:1.26-alpine AS build
 WORKDIR /src
-COPY go.mod ./
+COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/ellie ./cmd/ellie && mkdir -p /out/data

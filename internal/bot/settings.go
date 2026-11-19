@@ -10,6 +10,14 @@ import (
 	"sync"
 )
 
+// persister is where a Store keeps its data between restarts: a JSON file
+// (the default) or Postgres (when DATABASE_URL is set). The Store keeps every
+// user in memory and calls save with the users that just changed.
+type persister interface {
+	save(all map[int64]Settings, changed []int64) error
+	close() error
+}
+
 // Settings are one user's studio preferences.
 type Settings struct {
 	VoiceID   string  `json:"voice_id"`
@@ -63,7 +71,7 @@ func (s *Store) Spend(uid int64, day string, chars, secs, charLimit, secLimit in
 	}
 	v.UsageDay, v.UsedChars, v.UsedSecs = day, u.Chars, u.Secs
 	s.data[uid] = v
-	return true, u, s.saveLocked()
+	return true, u, s.saveLocked(uid)
 }
 
 // Refund gives back an earlier Spend (for example when generation failed).
@@ -77,7 +85,7 @@ func (s *Store) Refund(uid int64, day string, chars, secs int) {
 	v.UsedChars = max(0, v.UsedChars-chars)
 	v.UsedSecs = max(0, v.UsedSecs-secs)
 	s.data[uid] = v
-	_ = s.saveLocked()
+	_ = s.saveLocked(uid)
 }
 
 // SpendMake records one new voice for day unless that would pass limit
@@ -96,7 +104,7 @@ func (s *Store) SpendMake(uid int64, day string, limit int) (bool, Usage, error)
 	}
 	v.UsageDay, v.UsedChars, v.UsedSecs, v.UsedMakes = day, u.Chars, u.Secs, u.Makes
 	s.data[uid] = v
-	return true, u, s.saveLocked()
+	return true, u, s.saveLocked(uid)
 }
 
 // SpendDict records one new dictionary for day unless that would pass limit
@@ -113,7 +121,7 @@ func (s *Store) SpendDict(uid int64, day string, limit int) (bool, int, error) {
 	}
 	v.UsedDicts++
 	s.data[uid] = v
-	return true, v.UsedDicts, s.saveLocked()
+	return true, v.UsedDicts, s.saveLocked(uid)
 }
 
 // RefundDict gives back a SpendDict (the creation failed).
@@ -123,7 +131,7 @@ func (s *Store) RefundDict(uid int64, day string) {
 	if v, ok := s.data[uid]; ok && v.UsageDay == day && v.UsedDicts > 0 {
 		v.UsedDicts--
 		s.data[uid] = v
-		_ = s.saveLocked()
+		_ = s.saveLocked(uid)
 	}
 }
 
@@ -134,7 +142,7 @@ func (s *Store) RefundMake(uid int64, day string) {
 	if v, ok := s.data[uid]; ok && v.UsageDay == day && v.UsedMakes > 0 {
 		v.UsedMakes--
 		s.data[uid] = v
-		_ = s.saveLocked()
+		_ = s.saveLocked(uid)
 	}
 }
 
@@ -148,17 +156,18 @@ func (s *Store) UsageOn(uid int64, day string) Usage {
 // Store keeps per-user Settings in memory and persists them as JSON.
 type Store struct {
 	mu       sync.Mutex
-	path     string
+	backend  persister // nil = memory only
 	defaults Settings
 	data     map[int64]Settings
 }
 
 // OpenStore loads path if it exists. An empty path keeps settings in memory.
 func OpenStore(path string, defaults Settings) (*Store, error) {
-	s := &Store{path: path, defaults: defaults, data: map[int64]Settings{}}
+	s := &Store{defaults: defaults, data: map[int64]Settings{}}
 	if path == "" {
 		return s, nil
 	}
+	s.backend = fileStore{path: path}
 	raw, err := os.ReadFile(path)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
@@ -170,6 +179,14 @@ func OpenStore(path string, defaults Settings) (*Store, error) {
 		return nil, fmt.Errorf("settings: parse %s: %w", path, err)
 	}
 	return s, nil
+}
+
+// Close releases the backend (the database pool, if any).
+func (s *Store) Close() error {
+	if s.backend == nil {
+		return nil
+	}
+	return s.backend.close()
 }
 
 // Defaults returns the studio-wide defaults.
@@ -224,7 +241,7 @@ func (s *Store) Update(uid int64, fn func(*Settings)) (Settings, error) {
 	v := s.data[uid]
 	fn(&v)
 	s.data[uid] = v
-	return s.withDefaults(v), s.saveLocked()
+	return s.withDefaults(v), s.saveLocked(uid)
 }
 
 // Reset forgets a user's settings but keeps today's usage, so resetting can't
@@ -238,35 +255,52 @@ func (s *Store) Reset(uid int64) error {
 	}
 	s.data[uid] = Settings{UsageDay: old.UsageDay, UsedChars: old.UsedChars, UsedSecs: old.UsedSecs,
 		UsedMakes: old.UsedMakes, UsedDicts: old.UsedDicts}
-	return s.saveLocked()
+	return s.saveLocked(uid)
 }
 
 // ForgetVoice clears a voice from every user who selected it (after delete).
 func (s *Store) ForgetVoice(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var changed []int64
 	for uid, v := range s.data {
 		if v.VoiceID == id {
 			v.VoiceID, v.VoiceName = "", ""
 			s.data[uid] = v
+			changed = append(changed, uid)
 		}
 	}
-	return s.saveLocked()
-}
-
-// saveLocked writes atomically (temp file + rename) with owner-only perms.
-func (s *Store) saveLocked() error {
-	if s.path == "" {
+	if len(changed) == 0 {
 		return nil
 	}
-	raw, err := json.MarshalIndent(s.data, "", "  ")
+	return s.saveLocked(changed...)
+}
+
+// saveLocked persists the users in changed. Callers hold s.mu.
+func (s *Store) saveLocked(changed ...int64) error {
+	if s.backend == nil {
+		return nil
+	}
+	return s.backend.save(s.data, changed)
+}
+
+// fileStore keeps every user in one JSON file.
+type fileStore struct{ path string }
+
+func (fileStore) close() error { return nil }
+
+// save rewrites the whole file atomically (temp file + rename) with
+// owner-only permissions.
+func (f fileStore) save(all map[int64]Settings, _ []int64) error {
+	raw, err := json.MarshalIndent(all, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
+	dir := filepath.Dir(f.path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("settings: %w", err)
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(s.path), ".settings-*.json")
+	tmp, err := os.CreateTemp(dir, ".settings-*.json")
 	if err != nil {
 		return fmt.Errorf("settings: %w", err)
 	}
@@ -282,5 +316,5 @@ func (s *Store) saveLocked() error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("settings: %w", err)
 	}
-	return os.Rename(tmp.Name(), s.path)
+	return os.Rename(tmp.Name(), f.path)
 }

@@ -67,17 +67,26 @@ func run(log *slog.Logger) error {
 	ct := cartesia.New(ctKey, opts...)
 	tg := telegram.New(tgToken, os.Getenv("TELEGRAM_API_URL"))
 
-	dataDir := envOr("DATA_DIR", "data")
-	store, err := bot.OpenStore(filepath.Join(dataDir, "settings.json"), bot.Settings{
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	defaults := bot.Settings{
 		VoiceID: os.Getenv("DEFAULT_VOICE_ID"),
 		Model:   envOr("DEFAULT_MODEL", cartesia.DefaultTTSModel),
-	})
+	}
+	var store *bot.Store
+	if dbURL := os.Getenv("DATABASE_URL"); dbURL != "" {
+		store, err = bot.OpenPostgresStore(ctx, dbURL, defaults)
+		log.Info("settings stored in Postgres")
+	} else {
+		path := filepath.Join(envOr("DATA_DIR", "data"), "settings.json")
+		store, err = bot.OpenStore(path, defaults)
+		log.Info("settings stored in a file", "path", path)
+	}
 	if err != nil {
 		return err
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	defer store.Close()
 
 	if port := os.Getenv("PORT"); port != "" {
 		startHealthServer(ctx, log, port)

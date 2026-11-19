@@ -2,7 +2,7 @@
 
 A Telegram voice studio powered by [Cartesia](https://cartesia.ai). Send text and get it back as speech. Send a voice note and get a transcript. Browse, clone, and localize voices, all from chat.
 
-Written in Go with **no third-party dependencies**: both the Cartesia client and the Telegram client are standard library only.
+Written in Go. The Cartesia and Telegram clients use only the standard library; the one dependency is [pgx](https://github.com/jackc/pgx), for the optional Postgres store.
 
 ## Quick start
 
@@ -28,6 +28,15 @@ Don't know your Telegram ID? Start the bot with `ALLOWED_USER_IDS` set to anythi
 - **Progress you can see:** "⏳ Listening…" turns into the transcript, and "⏳ Cloning…" turns into the new voice card.
 - **Errors point to the fix,** for example "voice not found" comes with a 🎧 Pick a voice button.
 - Slash commands still work for power users. Help → Commands lists them all.
+
+## Where settings are kept
+
+Each user's choices (voice, style, output) and today's usage counts are kept in one of two places:
+
+- **A file** (default): `DATA_DIR/settings.json`. Good for running locally. On hosts without a persistent disk, such as Render, it's wiped on every deploy.
+- **Postgres**: set `DATABASE_URL` and the bot creates an `ellie_user_settings` table (one JSONB row per user) on startup. Use this in production. On Render, use the database's **Internal** connection string.
+
+Voices, dictionaries and who owns them live in Cartesia, so they're safe either way.
 
 ## Opening it to everyone
 
@@ -93,7 +102,7 @@ These endpoint groups are documented but intentionally not wired into the bot, b
 - **Audio formats.** Telegram voice notes are OGG/Opus, which `/stt` and `/voices/clone` accept directly. TTS returns MP3, which Telegram accepts for voice notes, so no ffmpeg is needed. If a user blocks voice notes in their privacy settings, the bot falls back to an audio file.
 - **Limits.** `CARTESIA_CONCURRENCY` caps parallel Cartesia calls; set it to your plan's TTS limit. Requests that hit `concurrency_limited` retry with backoff. Uploads are checked against Telegram's 20 MB download cap and Cartesia's 16 MB (clone) and 32 MB (watermark) limits before any download.
 - **Errors.** Cartesia's structured errors (`error_code`, `request_id`) become friendly messages that include the request ID for support.
-- **Safety.** Preview downloads only send the API key to the Cartesia host. Bot-token URLs are scrubbed from error logs. Settings are written atomically to `data/settings.json` with mode `0600`.
+- **Safety.** Preview downloads only send the API key to the Cartesia host. Bot-token URLs are scrubbed from error logs. File settings are written atomically with mode `0600`. Database errors never include the connection password.
 
 ## Layout
 
@@ -101,7 +110,7 @@ These endpoint groups are documented but intentionally not wired into the bot, b
 cmd/ellie/            entry point, env/.env config
 internal/cartesia/    Cartesia REST client (TTS, STT, voices, accents, models, infill, watermark, dictionaries, usage)
 internal/telegram/    minimal Bot API client (long polling, messages, keyboards, uploads, downloads)
-internal/bot/         Ellie Studio commands, buttons, per-user settings
+internal/bot/         Ellie Studio commands, buttons, per-user settings (file or Postgres)
 docs/                 scraped Cartesia API reference
 ```
 
@@ -112,3 +121,9 @@ go test -race ./...
 ```
 
 The bot tests run the full flow against fake Telegram and Cartesia servers: text → TTS → voice note, voice note → STT → transcript, access control, admin gating, and button handling.
+
+To also test the Postgres store, point it at a scratch database (it only touches two test rows with negative user IDs and deletes them):
+
+```bash
+TEST_DATABASE_URL=postgres://user:pass@host:5432/db go test ./internal/bot -run Postgres
+```
