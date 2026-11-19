@@ -74,17 +74,30 @@ func run(log *slog.Logger) error {
 		VoiceID: os.Getenv("DEFAULT_VOICE_ID"),
 		Model:   envOr("DEFAULT_MODEL", cartesia.DefaultTTSModel),
 	}
-	var store *bot.Store
+	var (
+		store  *bot.Store
+		owners bot.Owners
+	)
 	if dbURL := os.Getenv("DATABASE_URL"); dbURL != "" {
-		store, err = bot.OpenPostgresStore(ctx, dbURL, defaults)
+		db, err := bot.OpenDatabase(ctx, dbURL)
+		if err != nil {
+			return err
+		}
+		defer db.Close()
+		if store, err = db.SettingsStore(ctx, defaults); err != nil {
+			return err
+		}
+		owners = db.Owners()
 		log.Info("settings stored in Postgres")
 	} else {
-		path := filepath.Join(envOr("DATA_DIR", "data"), "settings.json")
-		store, err = bot.OpenStore(path, defaults)
-		log.Info("settings stored in a file", "path", path)
-	}
-	if err != nil {
-		return err
+		dir := envOr("DATA_DIR", "data")
+		if store, err = bot.OpenStore(filepath.Join(dir, "settings.json"), defaults); err != nil {
+			return err
+		}
+		if owners, err = bot.OpenFileOwners(filepath.Join(dir, "owners.json")); err != nil {
+			return err
+		}
+		log.Info("settings stored in files", "dir", dir)
 	}
 	defer store.Close()
 
@@ -94,7 +107,7 @@ func run(log *slog.Logger) error {
 
 	resolveDefaultVoice(ctx, log, ct, store)
 
-	b := bot.New(tg, ct, store, bot.Config{
+	b := bot.New(tg, ct, store, owners, bot.Config{
 		AllowedUsers:   allowed,
 		AdminUsers:     admins,
 		MaxTTSChars:    envInt("MAX_TTS_CHARS", 1500),

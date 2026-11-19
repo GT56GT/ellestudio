@@ -289,32 +289,40 @@ type fileStore struct{ path string }
 
 func (fileStore) close() error { return nil }
 
-// save rewrites the whole file atomically (temp file + rename) with
-// owner-only permissions.
 func (f fileStore) save(all map[int64]Settings, _ []int64) error {
 	raw, err := json.MarshalIndent(all, "", "  ")
 	if err != nil {
 		return err
 	}
-	dir := filepath.Dir(f.path)
+	return writeFileAtomic(f.path, raw)
+}
+
+// writeFileAtomic replaces path with raw (temp file + rename) so a crash never
+// leaves a half-written file, and keeps it readable by the bot only.
+func writeFileAtomic(path string, raw []byte) error {
+	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("settings: %w", err)
+		return fmt.Errorf("save %s: %w", filepath.Base(path), err)
 	}
-	tmp, err := os.CreateTemp(dir, ".settings-*.json")
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+"-*")
 	if err != nil {
-		return fmt.Errorf("settings: %w", err)
+		return fmt.Errorf("save %s: %w", filepath.Base(path), err)
 	}
 	defer os.Remove(tmp.Name())
 	if _, err := tmp.Write(raw); err != nil {
 		tmp.Close()
-		return fmt.Errorf("settings: %w", err)
+		return fmt.Errorf("save %s: %w", filepath.Base(path), err)
 	}
 	if err := tmp.Chmod(0o600); err != nil {
 		tmp.Close()
-		return fmt.Errorf("settings: %w", err)
+		return fmt.Errorf("save %s: %w", filepath.Base(path), err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("save %s: %w", filepath.Base(path), err)
 	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("settings: %w", err)
+		return fmt.Errorf("save %s: %w", filepath.Base(path), err)
 	}
-	return os.Rename(tmp.Name(), f.path)
+	return os.Rename(tmp.Name(), path)
 }

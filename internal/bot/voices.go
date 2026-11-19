@@ -7,6 +7,7 @@ import (
 	"mime"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"ellestudio/internal/cartesia"
@@ -67,21 +68,49 @@ func (b *Bot) voicesScreen(ctx context.Context, uid int64, s *browseSession) scr
 	query, gender, owned := s.query, s.gender, s.owned
 	b.sessMu.Unlock()
 
-	res, err := b.ct.ListVoices(ctx, cartesia.ListVoicesParams{
-		Limit: voicesPerPage, Q: query, Gender: gender, OwnedOnly: owned, StartingAfter: cursor,
-	})
-	if err != nil {
-		return errorScreen(err)
+	// "Mine" for a regular user comes straight from the ownership registry, so
+	// it stays fast however many voices other people have made. Everything
+	// else (and an admin's "Mine", which is every account voice) is Cartesia's
+	// listing, filtered to what this user may see.
+	mineOnly := owned && !b.isAdmin(uid)
+	var candidates []cartesia.Voice
+	var owners map[string]int64
+	next := ""
+	if mineOnly {
+		vs, n, err := b.myVoices(ctx, uid, parseCursor(cursor), query, gender)
+		if err != nil {
+			return errorScreen(err)
+		}
+		candidates, next = vs, n
+		owners = map[string]int64{}
+		for _, v := range vs {
+			owners[v.ID] = uid
+		}
+	} else {
+		res, err := b.ct.ListVoices(ctx, cartesia.ListVoicesParams{
+			Limit: voicesPerPage, Q: query, Gender: gender, OwnedOnly: owned, StartingAfter: cursor,
+		})
+		if err != nil {
+			return errorScreen(err)
+		}
+		if res.HasMore {
+			next = res.NextPage
+			if next == "" && len(res.Data) > 0 {
+				next = res.Data[len(res.Data)-1].ID
+			}
+		}
+		rs := make([]resource, len(res.Data))
+		for i, v := range res.Data {
+			rs[i] = voiceRes(v)
+		}
+		if owners, err = b.ownersOf(ctx, kindVoice, rs); err != nil {
+			return errorScreen(err)
+		}
+		candidates = res.Data
 	}
 	b.sessMu.Lock()
-	s.next = ""
-	if res.HasMore {
-		s.next = res.NextPage
-		if s.next == "" && len(res.Data) > 0 {
-			s.next = res.Data[len(res.Data)-1].ID
-		}
-	}
-	hasNext := s.next != ""
+	s.next = next
+	hasNext := next != ""
 	b.sessMu.Unlock()
 
 	cur := b.store.Get(uid)
@@ -111,14 +140,14 @@ func (b *Bot) voicesScreen(ctx context.Context, uid int64, s *browseSession) scr
 	sb.WriteString("\n")
 
 	var visible []cartesia.Voice
-	for _, v := range res.Data {
-		if b.canList(uid, v) && (!owned || b.isAdmin(uid) || isMine(uid, v)) {
+	for _, v := range candidates {
+		if b.visible(uid, voiceRes(v), owners) {
 			visible = append(visible, v)
 		}
 	}
 	k := &keys{}
 	switch {
-	case len(visible) == 0 && owned && !b.isAdmin(uid) && !hasNext:
+	case len(visible) == 0 && mineOnly && page == 1 && query == "" && gender == "" && !hasNext:
 		sb.WriteString("You haven't created any voices yet.\nClone your own voice in a minute, then share it with anyone using its link.")
 		k.row(btn(icCreate+" Clone a voice", "do:clone"))
 	case len(visible) == 0 && hasNext:
@@ -131,7 +160,7 @@ func (b *Bot) voicesScreen(ctx context.Context, uid int64, s *browseSession) scr
 		if v.Tagline != "" {
 			sb.WriteString(" — " + html.EscapeString(v.Tagline))
 		}
-		sb.WriteString("\n<i>" + html.EscapeString(voiceFacts(v, isMine(uid, v))) + "</i>\n\n")
+		sb.WriteString("\n<i>" + html.EscapeString(voiceFacts(v, isMineIn(uid, voiceRes(v), owners))) + "</i>\n\n")
 		if len("vc:"+v.ID) > 64 {
 			continue
 		}
@@ -159,6 +188,67 @@ func (b *Bot) voicesScreen(ctx context.Context, uid int64, s *browseSession) scr
 	}
 	k.nav("", "")
 	return screen{strings.TrimRight(sb.String(), "\n"), k.build()}
+}
+
+// myVoices returns one page of the voices uid created, newest first, and the
+// cursor for the next page ("" if none). Filters apply within the page, so a
+// page can show fewer voices. Voices deleted outside the bot are pruned.
+func (b *Bot) myVoices(ctx context.Context, uid int64, after Cursor, query, gender string) ([]cartesia.Voice, string, error) {
+	items, err := b.owners.List(ctx, kindVoice, uid, after, voicesPerPage+1)
+	if err != nil {
+		return nil, "", b.storageErr(err)
+	}
+	next := ""
+	if len(items) > voicesPerPage {
+		items = items[:voicesPerPage]
+		next = cursorOf(items[len(items)-1]).String()
+	}
+	voices := make([]*cartesia.Voice, len(items))
+	errs := make([]error, len(items))
+	var wg sync.WaitGroup
+	for i, it := range items {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			voices[i], errs[i] = b.ct.GetVoice(ctx, it.ID, false)
+		}()
+	}
+	wg.Wait()
+	q := strings.ToLower(strings.TrimSpace(query))
+	var out []cartesia.Voice
+	for i, v := range voices {
+		if err := errs[i]; err != nil {
+			if ae, ok := cartesia.AsAPIError(err); ok && (ae.StatusCode == 404 || ae.ErrorCode == cartesia.ErrVoiceNotFound) {
+				b.releaseOwner(ctx, kindVoice, items[i].ID)
+				continue
+			}
+			return nil, "", err
+		}
+		if gender != "" && v.Gender != gender {
+			continue
+		}
+		if q != "" && !strings.Contains(strings.ToLower(v.Name+" "+v.Tagline+" "+v.Description), q) {
+			continue
+		}
+		out = append(out, *v)
+	}
+	return out, next, nil
+}
+
+// keepCreatedVoice records uid as the creator of a voice the bot just made.
+// If that fails the voice is deleted again: a voice nobody owns could never
+// be renamed, shared or removed, and would silently use up account space.
+func (b *Bot) keepCreatedVoice(ctx context.Context, uid int64, id string) error {
+	err := b.claimOwner(ctx, kindVoice, id, uid)
+	if err == nil {
+		return nil
+	}
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	if derr := b.ct.DeleteVoice(dctx, id); derr != nil {
+		b.log.Error("orphaned voice: created but could not record its owner or delete it", "voice", id, "user", uid, "err", derr)
+	}
+	return err
 }
 
 func voiceFacts(v cartesia.Voice, mine bool) string {
@@ -268,7 +358,12 @@ func (b *Bot) voiceCard(ctx context.Context, uid int64, id string) screen {
 		return errorScreen(err)
 	}
 	current := b.store.Get(uid).VoiceID == v.ID
-	mine := isMine(uid, *v)
+	owner, known, err := b.ownerOf(ctx, kindVoice, voiceRes(*v))
+	if err != nil {
+		return errorScreen(err)
+	}
+	mine := v.IsOwner && known && owner == uid
+	manage := v.IsOwner && (mine || b.isAdmin(uid))
 	text := voiceDetails(v, mine)
 	switch {
 	case current:
@@ -282,7 +377,7 @@ func (b *Bot) voiceCard(ctx context.Context, uid int64, id string) screen {
 	} else {
 		k.row(btn(icOK+" Use this voice", "v:"+v.ID), btn("🔊 Preview", "p:"+v.ID))
 	}
-	if b.canManage(uid, *v) {
+	if manage {
 		k.row(btn("🔗 Share", "sh:"+v.ID), btn("✏️ Rename", "rn:"+v.ID), btn("🗑 Delete", "dv:"+v.ID))
 		if current {
 			k.row(btn(icLocalize+" Localize into another accent", "nav:localize"))
@@ -417,7 +512,9 @@ func (b *Bot) localizeScreen(ctx context.Context, uid int64) screen {
 	if err != nil {
 		return errorScreen(err)
 	}
-	if !b.canManage(uid, *v) {
+	if ok, err := b.canManage(ctx, uid, *v); err != nil {
+		return errorScreen(err)
+	} else if !ok {
 		return screen{header(icLocalize, "Localize a voice", "") +
 			"You can localize voices you created. <b>" + html.EscapeString(v.Name) + "</b> isn't one of them.\n\n" +
 			"Clone your own voice first, then make it sound native in another accent.",
@@ -460,8 +557,8 @@ func (b *Bot) runLocalize(ctx context.Context, uid int64, target *telegram.Messa
 		draw(errorScreen(err))
 		return
 	}
-	if !b.canManage(uid, *src) {
-		draw(errorScreen(errNotYourVoice))
+	if err := b.mustManage(ctx, uid, *src); err != nil {
+		draw(errorScreen(err))
 		return
 	}
 	if ok, ls := b.spendMake(uid); !ok {
@@ -476,10 +573,13 @@ func (b *Bot) runLocalize(ctx context.Context, uid int64, target *telegram.Messa
 	tctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	v, err := b.ct.LocalizeVoice(tctx, cartesia.LocalizeVoiceRequest{
 		VoiceID: s.VoiceID, Name: fmt.Sprintf("%s (%s)", orDefault(stripTags(src.Name), "Voice"), accent), Accent: accent,
-		Description: withOwner("Localized in Ellie Studio from "+src.Name, uid),
+		Description: "Localized in Ellie Studio",
 	})
 	cancel()
 	b.release()
+	if err == nil {
+		err = b.keepCreatedVoice(ctx, uid, v.ID)
+	}
 	if err != nil {
 		b.refundMake(uid)
 		draw(errorScreen(err))
@@ -512,8 +612,8 @@ func (b *Bot) shareScreen(ctx context.Context, uid int64, id string) screen {
 	if err != nil {
 		return errorScreen(err)
 	}
-	if !b.canManage(uid, *v) {
-		return errorScreen(errNotYourVoice)
+	if err := b.mustManage(ctx, uid, *v); err != nil {
+		return errorScreen(err)
 	}
 	link := b.shareLink(v.ID)
 	text := header("🔗", "Share "+v.Name, "Anyone with this link or ID can use the voice") +
@@ -538,8 +638,8 @@ func (b *Bot) openVoiceRef(ctx context.Context, chatID, replyTo, uid int64, id s
 
 func (b *Bot) renameVoice(ctx context.Context, m *telegram.Message, id, name string) {
 	cur, err := b.ct.GetVoice(ctx, id, false)
-	if err == nil && !b.canManage(m.From.ID, *cur) {
-		err = errNotYourVoice
+	if err == nil {
+		err = b.mustManage(ctx, m.From.ID, *cur)
 	}
 	if err != nil {
 		b.fail(ctx, m, "rename", err)
@@ -567,7 +667,9 @@ func (b *Bot) deleteConfirmScreen(ctx context.Context, uid int64, id string) scr
 	if err != nil {
 		return errorScreen(err)
 	}
-	if !b.canManage(uid, *v) {
+	if ok, err := b.canManage(ctx, uid, *v); err != nil {
+		return errorScreen(err)
+	} else if !ok {
 		return screen{header("🗑", "Can't delete "+v.Name, "") + "You can only delete voices you created.",
 			(&keys{}).nav("Voice", "vc:"+v.ID).build()}
 	}
@@ -578,8 +680,8 @@ func (b *Bot) deleteConfirmScreen(ctx context.Context, uid int64, id string) scr
 
 func (b *Bot) deleteVoice(ctx context.Context, q *telegram.CallbackQuery, id string) {
 	v, err := b.ct.GetVoice(ctx, id, false)
-	if err == nil && !b.canManage(q.From.ID, *v) {
-		err = errNotYourVoice
+	if err == nil {
+		err = b.mustManage(ctx, q.From.ID, *v)
 	}
 	if err == nil {
 		err = b.ct.DeleteVoice(ctx, id)
@@ -589,6 +691,7 @@ func (b *Bot) deleteVoice(ctx context.Context, q *telegram.CallbackQuery, id str
 		b.show(ctx, q, errorScreen(err))
 		return
 	}
+	b.releaseOwner(ctx, kindVoice, id)
 	if err := b.store.ForgetVoice(id); err != nil {
 		b.log.Warn("forget voice", "err", err)
 	}

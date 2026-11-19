@@ -162,8 +162,8 @@ func (b *Bot) startRename(ctx context.Context, chatID, uid int64, id string) {
 		return
 	}
 	v, err := b.ct.GetVoice(ctx, id, false)
-	if err == nil && !b.canManage(uid, *v) {
-		err = errNotYourVoice
+	if err == nil {
+		err = b.mustManage(ctx, uid, *v)
 	}
 	if err != nil {
 		b.sendScreen(ctx, chatID, 0, errorScreen(err))

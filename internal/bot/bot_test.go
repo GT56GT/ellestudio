@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"ellestudio/internal/cartesia"
 	"ellestudio/internal/telegram"
@@ -88,6 +90,7 @@ type fixture struct {
 	cloned    bool
 	cloneDesc string
 	ttsFail   bool
+	deleted   []string // Cartesia paths that received DELETE
 }
 
 func press(uid int64, data string) telegram.Update {
@@ -118,6 +121,11 @@ func newFixture(t *testing.T, cfg Config) *fixture {
 	t.Cleanup(tgSrv.Close)
 
 	ctSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			fx.deleted = append(fx.deleted, r.URL.Path)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		switch r.URL.Path {
 		case "/tts/bytes":
 			if fx.ttsFail {
@@ -145,6 +153,13 @@ func newFixture(t *testing.T, cfg Config) *fixture {
 			_, _ = io.WriteString(w, `{"id":"v-secret","name":"Someone Else","is_owner":true,"description":"Cloned in Ellie Studio [ellie-owner:99]","preview_file_url":"`+"http://"+r.Host+`/p.mp3"}`)
 		case "/voices/v-mine":
 			_, _ = io.WriteString(w, `{"id":"v-mine","name":"My Clone","is_owner":true,"description":"Cloned in Ellie Studio [ellie-owner:7]"}`)
+		case "/voices/v-legacy":
+			_, _ = io.WriteString(w, `{"id":"v-legacy","name":"Old Clone","is_owner":true,"description":"made elsewhere"}`)
+		case "/voices/v-clone":
+			_, _ = io.WriteString(w, `{"id":"v-clone","name":"My Voice","is_owner":true,"language":"en","description":"Cloned in Ellie Studio"}`)
+		case "/voices/v-gone":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"error_code":"voice_not_found","title":"Not found","message":"no such voice","request_id":"r2"}`)
 		case "/pronunciation-dicts/d-secret":
 			_, _ = io.WriteString(w, `{"id":"d-secret","name":"Their words","is_owner":true,"description":"Created in Ellie Studio [ellie-owner:99]","items":[]}`)
 		case "/voices/clone":
@@ -173,7 +188,7 @@ func newFixture(t *testing.T, cfg Config) *fixture {
 	fx.bot = New(
 		telegram.New("TOKEN", tgSrv.URL),
 		cartesia.New("sk_car_test", cartesia.WithBaseURL(ctSrv.URL)),
-		store, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store, nil, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
 	return fx
 }
@@ -590,16 +605,18 @@ func TestOverEstimateIsRefunded(t *testing.T) {
 	}
 }
 
-func TestOwnerTag(t *testing.T) {
-	d := withOwner("Cloned in Ellie Studio", 42)
-	if id, ok := ownerOf(d); !ok || id != 42 {
-		t.Fatalf("ownerOf(%q) = %d, %v", d, id, ok)
+func TestLegacyOwnerTag(t *testing.T) {
+	d := "Cloned in Ellie Studio [ellie-owner:42]"
+	if id, ok := legacyOwner(d); !ok || id != 42 {
+		t.Fatalf("legacyOwner(%q) = %d, %v", d, id, ok)
 	}
 	if got := cleanDescription(d); got != "Cloned in Ellie Studio" {
 		t.Errorf("cleanDescription = %q", got)
 	}
-	if _, ok := ownerOf("no tag here"); ok {
-		t.Error("untagged description has no owner")
+	for _, bad := range []string{"no tag here", "[ellie-owner:0]", "x [ellie-owner:-5]"} {
+		if _, ok := legacyOwner(bad); ok {
+			t.Errorf("legacyOwner(%q) should not find an owner", bad)
+		}
 	}
 }
 
@@ -611,13 +628,17 @@ func TestDictionariesArePrivate(t *testing.T) {
 	}
 }
 
-func TestClonesAreTaggedWithTheirCreator(t *testing.T) {
+func TestClonesAreRecordedForTheirCreator(t *testing.T) {
 	fx := newFixture(t, Config{AdminUsers: map[int64]bool{1: true}})
 	u := msg(1, "/clone Studio Voice")
 	u.Message.Voice = &telegram.Voice{FileID: "f1", Duration: 8, FileSize: 16}
 	fx.bot.handleUpdate(context.Background(), u)
-	if owner, ok := ownerOf(fx.cloneDesc); !ok || owner != 1 {
-		t.Fatalf("clone description %q should carry the creator's tag", fx.cloneDesc)
+	got, _ := fx.bot.owners.Lookup(context.Background(), kindVoice, []string{"v-clone"})
+	if got["v-clone"] != 1 {
+		t.Fatalf("the clone should be recorded for user 1, registry has %v", got)
+	}
+	if strings.Contains(fx.cloneDesc, "ellie-owner") {
+		t.Errorf("new voices must not carry owner tags: %q", fx.cloneDesc)
 	}
 }
 
@@ -735,8 +756,8 @@ func TestAnyoneCanCloneWithinTheDailyLimit(t *testing.T) {
 	if !fx.cloned {
 		t.Fatal("a regular user should be able to clone")
 	}
-	if owner, ok := ownerOf(fx.cloneDesc); !ok || owner != 7 {
-		t.Errorf("the clone should be tagged with user 7: %q", fx.cloneDesc)
+	if got, _ := fx.bot.owners.Lookup(ctx, kindVoice, []string{"v-clone"}); got["v-clone"] != 7 {
+		t.Errorf("the clone should belong to user 7: %v", got)
 	}
 	fx.cloned = false
 	clone("Second")
@@ -778,23 +799,155 @@ func cartesiaWithDicts(t *testing.T, created *int) *cartesia.Client {
 }
 
 func TestOwnerTagCannotBeInjected(t *testing.T) {
-	// A voice renamed to carry someone else's tag, then copied into a
-	// description, must still belong to the real creator.
-	evil := "Nice voice [ellie-owner:99]"
-	d := withOwner("Localized in Ellie Studio from "+evil, 7)
-	if owner, ok := ownerOf(d); !ok || owner != 7 {
-		t.Fatalf("owner = %d, %v (desc %q); want 7", owner, ok, d)
-	}
-	if strings.Count(d, "ellie-owner") != 1 {
-		t.Errorf("only the real tag may remain: %q", d)
-	}
-	// A tag anywhere but the end is ignored.
-	if _, ok := ownerOf("[ellie-owner:99] Cloned in Ellie Studio"); ok {
+	// Only a tag at the very end of a description counted in older versions.
+	if _, ok := legacyOwner("[ellie-owner:99] Cloned in Ellie Studio"); ok {
 		t.Error("a tag that isn't at the end must not count")
 	}
 	for _, in := range []string{"x [ellie-owner:99]", "x [ Ellie_Owner : 99 ]", "x [ellie-owner:99"} {
 		if got := stripTags(in); strings.Contains(strings.ToLower(got), "owner") {
 			t.Errorf("stripTags(%q) = %q", in, got)
+		}
+	}
+}
+
+func TestRegistryOverridesLegacyTags(t *testing.T) {
+	fx := newFixture(t, Config{AdminUsers: map[int64]bool{1: true}})
+	ctx := context.Background()
+	// v-mine's description says user 7, but the registry says user 99.
+	if err := fx.bot.owners.Claim(ctx, kindVoice, "v-mine", 99); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := fx.bot.canManage(ctx, 7, cartesia.Voice{ID: "v-mine", IsOwner: true,
+		Description: "Cloned in Ellie Studio [ellie-owner:7]"}); err != nil || ok {
+		t.Fatalf("the registry must win over a tag: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestLegacyVoicesAreAdoptedOnSight(t *testing.T) {
+	fx := newFixture(t, Config{AdminUsers: map[int64]bool{1: true}})
+	ctx := context.Background()
+	fx.bot.voiceCard(ctx, 7, "v-mine")
+	if got, _ := fx.bot.owners.Lookup(ctx, kindVoice, []string{"v-mine"}); got["v-mine"] != 7 {
+		t.Fatalf("a tagged voice should be adopted into the registry: %v", got)
+	}
+}
+
+func TestStartupImportsLegacyOwners(t *testing.T) {
+	fx := newFixture(t, Config{AdminUsers: map[int64]bool{1: true}})
+	ctx := context.Background()
+	fx.bot.importLegacyOwners(ctx)
+	got, _ := fx.bot.owners.Lookup(ctx, kindVoice, []string{"v-mine", "v-secret", "v-legacy", "v-new"})
+	if got["v-mine"] != 7 || got["v-secret"] != 99 {
+		t.Errorf("tagged voices should be imported: %v", got)
+	}
+	if _, ok := got["v-legacy"]; ok {
+		t.Error("an untagged voice has no owner to import")
+	}
+	if _, ok := got["v-new"]; ok {
+		t.Error("public voices are never owned")
+	}
+}
+
+func TestRegistryAloneDecidesOwnership(t *testing.T) {
+	// v-legacy has no tag at all; recording it makes it user 7's.
+	fx := newFixture(t, Config{AdminUsers: map[int64]bool{1: true}})
+	ctx := context.Background()
+	if err := fx.bot.owners.Claim(ctx, kindVoice, "v-legacy", 7); err != nil {
+		t.Fatal(err)
+	}
+	owned := true
+	mine := fx.bot.voicesScreen(ctx, 7, fx.bot.resetSession(7, "", &owned))
+	if !strings.Contains(mine.text, "Old Clone") {
+		t.Errorf("🗂 Mine should list registry-owned voices: %q", mine.text)
+	}
+	if s := fx.bot.deleteConfirmScreen(ctx, 7, "v-legacy"); !strings.Contains(s.text, "Delete Old Clone?") {
+		t.Errorf("the registered creator should be able to delete: %q", s.text)
+	}
+	if s := fx.bot.deleteConfirmScreen(ctx, 8, "v-legacy"); !strings.Contains(s.text, "only delete voices you created") {
+		t.Errorf("another user must be refused: %q", s.text)
+	}
+	list := fx.bot.voicesScreen(ctx, 8, fx.bot.resetSession(8, "", nil))
+	if strings.Contains(list.text, "Old Clone") {
+		t.Error("someone else's voice must stay unlisted")
+	}
+}
+
+func TestDeleteReleasesOwnership(t *testing.T) {
+	fx := newFixture(t, Config{AdminUsers: map[int64]bool{1: true}})
+	ctx := context.Background()
+	fx.bot.handleUpdate(ctx, press(7, "dvy:v-mine"))
+	if len(fx.deleted) != 1 || fx.deleted[0] != "/voices/v-mine" {
+		t.Fatalf("the voice should be deleted in Cartesia: %v", fx.deleted)
+	}
+	if got, _ := fx.bot.owners.Lookup(ctx, kindVoice, []string{"v-mine"}); len(got) != 0 {
+		t.Errorf("a deleted voice must leave the registry: %v", got)
+	}
+}
+
+func TestMinePrunesVoicesDeletedElsewhere(t *testing.T) {
+	fx := newFixture(t, Config{AdminUsers: map[int64]bool{1: true}})
+	ctx := context.Background()
+	_ = fx.bot.owners.Claim(ctx, kindVoice, "v-gone", 7)
+	_ = fx.bot.owners.Claim(ctx, kindVoice, "v-legacy", 7)
+	owned := true
+	mine := fx.bot.voicesScreen(ctx, 7, fx.bot.resetSession(7, "", &owned))
+	if !strings.Contains(mine.text, "Old Clone") || strings.Contains(mine.text, "Something went wrong") {
+		t.Fatalf("a missing voice should be skipped, not break the list: %q", mine.text)
+	}
+	if got, _ := fx.bot.owners.Lookup(ctx, kindVoice, []string{"v-gone"}); len(got) != 0 {
+		t.Errorf("a voice gone from Cartesia should be pruned: %v", got)
+	}
+}
+
+// failingOwners is a registry whose database is down.
+type failingOwners struct{ Owners }
+
+var errDBDown = errors.New("dial tcp 10.0.0.5:5432: connection refused")
+
+func (failingOwners) Lookup(context.Context, string, []string) (map[string]int64, error) {
+	return nil, errDBDown
+}
+func (failingOwners) Claim(context.Context, string, string, int64) error { return errDBDown }
+
+func TestDatabaseErrorsFailClosed(t *testing.T) {
+	fx := newFixture(t, Config{AdminUsers: map[int64]bool{1: true}})
+	fx.bot.owners = failingOwners{}
+	ctx := context.Background()
+	s := fx.bot.deleteConfirmScreen(ctx, 7, "v-mine")
+	if strings.Contains(s.text, "Delete My Clone?") {
+		t.Fatal("without the registry, managing must be refused")
+	}
+	if strings.Contains(s.text, "10.0.0.5") || !strings.Contains(s.text, "try again") {
+		t.Errorf("users get a friendly message, never database details: %q", s.text)
+	}
+}
+
+func TestUnrecordedCloneIsRolledBack(t *testing.T) {
+	fx := newFixture(t, Config{AdminUsers: map[int64]bool{1: true}, DailyCreations: 3})
+	fx.bot.owners = failingOwners{}
+	ctx := context.Background()
+	u := msg(7, "/clone Mine")
+	u.Message.Voice = &telegram.Voice{FileID: "f1", Duration: 8, FileSize: 16}
+	fx.bot.handleUpdate(ctx, u)
+	if len(fx.deleted) != 1 || fx.deleted[0] != "/voices/v-clone" {
+		t.Fatalf("a clone whose owner can't be recorded must be deleted: %v", fx.deleted)
+	}
+	if fx.bot.store.UsageOn(7, today()).Makes != 0 {
+		t.Error("the failed clone must not count against the daily limit")
+	}
+	if fx.bot.store.Get(7).VoiceID == "v-clone" {
+		t.Error("the user must not be switched to a rolled-back voice")
+	}
+}
+
+func TestCursorRoundTrip(t *testing.T) {
+	c := Cursor{time.Date(2026, 11, 19, 9, 30, 0, 123456000, time.UTC), "v-1|odd"}
+	if got := parseCursor(c.String()); !got.Created.Equal(c.Created) || got.ID != c.ID {
+		t.Fatalf("round trip = %+v, want %+v", got, c)
+	}
+	for _, bad := range []string{"", "nope", "x|y", "123|"} {
+		if !parseCursor(bad).IsZero() {
+			t.Errorf("parseCursor(%q) should be the start", bad)
 		}
 	}
 }

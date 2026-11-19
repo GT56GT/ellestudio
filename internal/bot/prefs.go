@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"ellestudio/internal/cartesia"
@@ -351,20 +352,23 @@ func (b *Bot) langScreen(ctx context.Context, uid int64) screen {
 	return screen{text, k.build()}
 }
 
+// dictsShown is how many dictionaries the picker lists (newest first).
+const dictsShown = 20
+
 func (b *Bot) dictsScreen(ctx context.Context, uid int64) screen {
-	page, err := b.ct.ListPronunciationDicts(ctx, 20, "")
+	dicts, err := b.listDicts(ctx, uid)
 	if err != nil {
 		return errorScreen(err)
 	}
 	cur := b.store.Get(uid).DictID
 	text := header(icDict, "Pronunciation", "Teach me how to say names and brands") +
 		"Now: <b>" + html.EscapeString(orDefault(b.store.Get(uid).DictName, "none")) + "</b>"
-	if len(page.Data) == 0 {
+	if len(dicts) == 0 {
 		text += "\n\nYou don't have any dictionaries yet."
 	}
 	k := &keys{}
-	for _, d := range page.Data {
-		if b.canUseDict(uid, d) && len("d:"+d.ID) <= 64 {
+	for _, d := range dicts {
+		if len("d:"+d.ID) <= 64 {
 			k.row(btn(mark(fmt.Sprintf("%s · %d words", truncate(d.Name, 28), len(d.Items)), d.ID == cur), "d:"+d.ID))
 		}
 	}
@@ -390,8 +394,19 @@ func (b *Bot) createDict(ctx context.Context, m *telegram.Message, name string, 
 		}
 	}
 	d, err := b.ct.CreatePronunciationDict(ctx, cartesia.PronunciationDictRequest{
-		Name: orDefault(stripTags(name), "My words"), Description: withOwner("Created in Ellie Studio", uid), Items: items,
+		Name: orDefault(stripTags(name), "My words"), Description: "Created in Ellie Studio", Items: items,
 	})
+	if err == nil {
+		if cerr := b.claimOwner(ctx, kindDict, d.ID, uid); cerr != nil {
+			// An unowned dictionary could never be picked again; undo it.
+			dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			if derr := b.ct.DeletePronunciationDict(dctx, d.ID); derr != nil {
+				b.log.Error("orphaned dictionary: created but could not record its owner or delete it", "dict", d.ID, "user", uid, "err", derr)
+			}
+			cancel()
+			err = cerr
+		}
+	}
 	if err != nil {
 		if !b.isAdmin(uid) {
 			b.store.RefundDict(uid, today())
@@ -405,6 +420,45 @@ func (b *Bot) createDict(ctx context.Context, m *telegram.Message, name string, 
 	text := header(icDict, d.Name+" is on", fmt.Sprintf("%d words", len(d.Items))) + "Send some text with those words to hear the difference."
 	k := (&keys{}).row(btn(icDict+" Pronunciation", "nav:dicts")).nav("", "")
 	b.replyHTML(ctx, m, text, k.build())
+}
+
+// listDicts returns the dictionaries uid may pick: their own, newest first,
+// from the ownership registry. Admins see the account's dictionaries.
+func (b *Bot) listDicts(ctx context.Context, uid int64) ([]cartesia.PronunciationDict, error) {
+	if b.isAdmin(uid) {
+		page, err := b.ct.ListPronunciationDicts(ctx, dictsShown, "")
+		if err != nil {
+			return nil, err
+		}
+		return page.Data, nil
+	}
+	items, err := b.owners.List(ctx, kindDict, uid, Cursor{}, dictsShown)
+	if err != nil {
+		return nil, b.storageErr(err)
+	}
+	dicts := make([]*cartesia.PronunciationDict, len(items))
+	errs := make([]error, len(items))
+	var wg sync.WaitGroup
+	for i, it := range items {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			dicts[i], errs[i] = b.ct.GetPronunciationDict(ctx, it.ID)
+		}()
+	}
+	wg.Wait()
+	var out []cartesia.PronunciationDict
+	for i, d := range dicts {
+		if err := errs[i]; err != nil {
+			if ae, ok := cartesia.AsAPIError(err); ok && ae.StatusCode == 404 {
+				b.releaseOwner(ctx, kindDict, items[i].ID)
+				continue
+			}
+			return nil, err
+		}
+		out = append(out, *d)
+	}
+	return out, nil
 }
 
 // parseDict reads "name\ntext = pronunciation\n..." (also accepts "=>" or ":").
@@ -589,8 +643,12 @@ func (b *Bot) handleCallback(ctx context.Context, q *telegram.CallbackQuery) {
 		id, name := "", ""
 		if val != "-" {
 			d, err := b.ct.GetPronunciationDict(ctx, val)
-			if err == nil && !b.canUseDict(uid, *d) {
-				err = errPrivateDict
+			if err == nil {
+				if ok, cerr := b.canUseDict(ctx, uid, *d); cerr != nil {
+					err = cerr
+				} else if !ok {
+					err = errPrivateDict
+				}
 			}
 			if err != nil {
 				ack("")

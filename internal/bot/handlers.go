@@ -551,11 +551,14 @@ func (b *Bot) runClone(ctx context.Context, m *telegram.Message, a audioRef, nam
 		Clip:        bytes.NewReader(data),
 		Filename:    filename,
 		Name:        name,
-		Description: withOwner("Cloned in Ellie Studio", uid),
+		Description: "Cloned in Ellie Studio",
 		Language:    lang,
 	})
 	cancel()
 	b.release()
+	if err == nil {
+		err = b.keepCreatedVoice(ctx, uid, v.ID)
+	}
 	if err != nil {
 		b.refundMake(uid)
 		pr.finish(ctx, m.Chat.ID, errorScreen(err))

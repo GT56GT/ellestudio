@@ -29,14 +29,28 @@ Don't know your Telegram ID? Start the bot with `ALLOWED_USER_IDS` set to anythi
 - **Errors point to the fix,** for example "voice not found" comes with a 🎧 Pick a voice button.
 - Slash commands still work for power users. Help → Commands lists them all.
 
-## Where settings are kept
+## Where data is kept
 
-Each user's choices (voice, style, output) and today's usage counts are kept in one of two places:
+| What | Where |
+|---|---|
+| Voices and dictionaries | Cartesia |
+| Who created each voice and dictionary | The bot's database (`ellie_ownership`) |
+| Each user's choices (voice, style, output) and today's usage | The bot's database (`ellie_user_settings`) |
 
-- **A file** (default): `DATA_DIR/settings.json`. Good for running locally. On hosts without a persistent disk, such as Render, it's wiped on every deploy.
-- **Postgres**: set `DATABASE_URL` and the bot creates an `ellie_user_settings` table (one JSONB row per user) on startup. Use this in production. On Render, use the database's **Internal** connection string.
+The bot's database is one of:
 
-Voices, dictionaries and who owns them live in Cartesia, so they're safe either way.
+- **Postgres** (production): set `DATABASE_URL`. On Render, use the database's **Internal** connection string. Tables are created and upgraded on startup by versioned migrations (`ellie_schema_migrations`), which are safe when two instances start at once during a deploy.
+- **Files** (local runs): without `DATABASE_URL`, the bot writes `DATA_DIR/settings.json` and `DATA_DIR/owners.json`. Hosts without a persistent disk, such as Render, wipe these on every deploy.
+
+### Ownership
+
+Every user reaches Cartesia through the same API key, so Cartesia can't tell users apart. The bot records the creator's Telegram user ID against each Cartesia voice and dictionary ID:
+
+- The owner is recorded as soon as Cartesia creates the resource. If it can't be recorded, the new voice or dictionary is deleted again and the user's daily allowance is refunded, so nothing is ever left without an owner.
+- Every check reads the database directly (no cache), so instances running side by side agree.
+- If the database can't be reached, the bot refuses to rename, delete or share rather than guessing, and shows the user a "try again" message. The real error goes to the logs only.
+- 🗂 Mine and the dictionary list come straight from the registry, newest first, however many voices other people have made. Voices deleted outside the bot are pruned automatically.
+- Earlier versions stored the owner as an `[ellie-owner:<id>]` tag at the end of the Cartesia description. Those tags are imported at startup, and a tagged voice the import missed is adopted the first time it's looked at. New resources are never tagged, so rolling back to a pre-registry version would show new voices to admins only.
 
 ## Opening it to everyone
 
@@ -46,7 +60,7 @@ Leave `ALLOWED_USER_IDS` empty and keep your own ID in `ADMIN_USER_IDS`. Then:
 - Each user runs **one request at a time**, so nobody can tie up the shared Cartesia slots.
 - **Everyone can clone** (and localize their own voices), up to `DAILY_VOICE_CREATIONS` new voices a day (default 3). Anyone can create pronunciation dictionaries.
 - **Voices are unlisted, and the ID is the key.** Your library shows Cartesia's public voices plus voices *you* made, never anyone else's. To share one, open it and tap 🔗 **Share**. You get a link (`t.me/EllieStudioBot?start=v_<id>`) and the voice ID. Whoever has either can use the voice: tapping the link, pasting it, or pasting the ID opens the voice right away.
-- **Only the creator** (or an admin) can rename, delete, localize or share a voice. Ownership is a tag in the voice's Cartesia description, so it survives redeploys.
+- **Only the creator** (or an admin) can rename, delete, localize or share a voice. Ownership is recorded in the bot's database (see [Ownership](#ownership)).
 - Usage stays admin-only.
 
 ## What it does
@@ -122,8 +136,8 @@ go test -race ./...
 
 The bot tests run the full flow against fake Telegram and Cartesia servers: text → TTS → voice note, voice note → STT → transcript, access control, admin gating, and button handling.
 
-To also test the Postgres store, point it at a scratch database (it only touches two test rows with negative user IDs and deletes them):
+To also test the Postgres backend, point it at a database. The tests apply the migrations, then only touch rows with negative user IDs or `test-` resource IDs, and delete them afterwards:
 
 ```bash
-TEST_DATABASE_URL=postgres://user:pass@host:5432/db go test ./internal/bot -run Postgres
+TEST_DATABASE_URL=postgres://user:pass@host:5432/db go test ./internal/bot -run 'Postgres|Migrations' 
 ```

@@ -50,11 +50,12 @@ type Config struct {
 
 // Bot is the running studio.
 type Bot struct {
-	tg    *telegram.Client
-	ct    *cartesia.Client
-	store *Store
-	cfg   Config
-	log   *slog.Logger
+	tg     *telegram.Client
+	ct     *cartesia.Client
+	store  *Store
+	owners Owners // who created each voice and dictionary
+	cfg    Config
+	log    *slog.Logger
 
 	cartesiaSlots chan struct{} // bounds concurrent Cartesia work
 	inflight      chan struct{} // bounds concurrent update handlers
@@ -74,8 +75,11 @@ type recent struct {
 	transcript string
 }
 
-// New wires a bot together.
-func New(tg *telegram.Client, ct *cartesia.Client, store *Store, cfg Config, log *slog.Logger) *Bot {
+// New wires a bot together. A nil owners keeps ownership in memory only.
+func New(tg *telegram.Client, ct *cartesia.Client, store *Store, owners Owners, cfg Config, log *slog.Logger) *Bot {
+	if owners == nil {
+		owners, _ = OpenFileOwners("")
+	}
 	if cfg.MaxTTSChars <= 0 {
 		cfg.MaxTTSChars = 1500
 	}
@@ -92,6 +96,7 @@ func New(tg *telegram.Client, ct *cartesia.Client, store *Store, cfg Config, log
 		tg:            tg,
 		ct:            ct,
 		store:         store,
+		owners:        owners,
 		cfg:           cfg,
 		log:           log,
 		cartesiaSlots: make(chan struct{}, cfg.Concurrency),
@@ -140,6 +145,7 @@ func (b *Bot) Run(ctx context.Context) error {
 	if err := b.tg.SetMyShortDescription(ctx, botShortDescription); err != nil {
 		b.log.Warn("setMyShortDescription failed", "err", err)
 	}
+	b.importLegacyOwners(ctx)
 
 	var offset int64
 	backoff := time.Second
