@@ -415,7 +415,7 @@ func voiceDetails(v *cartesia.Voice, mine bool) string {
 
 // sendPreview plays a voice's free preview clip with a button to choose it.
 func (b *Bot) sendPreview(ctx context.Context, uid, chatID, replyTo int64, id string) {
-	_ = b.tg.SendChatAction(ctx, chatID, "upload_voice")
+	_ = b.tg.SendChatAction(ctx, chatID, 0, "upload_voice")
 	v, err := b.ct.GetVoice(ctx, id, true)
 	if err != nil {
 		b.sendScreen(ctx, chatID, replyTo, errorScreen(err))

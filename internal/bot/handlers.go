@@ -20,6 +20,10 @@ import (
 // most specific answer: commands, then menu buttons, then a guided step in
 // progress, then the defaults (audio → transcript, text → speech).
 func (b *Bot) handleMessage(ctx context.Context, m *telegram.Message) {
+	if isGroupChat(m.Chat.ID) {
+		b.handleGroupMessage(ctx, m)
+		return
+	}
 	if m.From == nil || m.From.IsBot {
 		return
 	}
@@ -34,7 +38,10 @@ func (b *Bot) handleMessage(ctx context.Context, m *telegram.Message) {
 	if text == "" {
 		text = strings.TrimSpace(m.Caption)
 	}
-	cmd, args := parseCommand(text)
+	cmd, target, args := parseCommandTarget(text)
+	if cmd != "" && !b.forMe(target) {
+		return // "/start@SomeOtherBot"
+	}
 	a, hasAudio := audioOf(m)
 
 	if cmd != "" {
@@ -123,16 +130,22 @@ func (b *Bot) audioCommand(ctx context.Context, m *telegram.Message, cmd string,
 
 // parseCommand splits "/cmd@bot args" into ("cmd", "args").
 func parseCommand(text string) (string, string) {
+	cmd, _, args := parseCommandTarget(text)
+	return cmd, args
+}
+
+// parseCommandTarget splits "/cmd@bot args" into ("cmd", "bot", "args").
+func parseCommandTarget(text string) (cmd, target, args string) {
 	if !strings.HasPrefix(text, "/") {
-		return "", ""
+		return "", "", ""
 	}
 	head, rest, _ := strings.Cut(text[1:], " ")
 	if nl := strings.IndexByte(head, '\n'); nl >= 0 {
 		rest = head[nl+1:] + " " + rest
 		head = head[:nl]
 	}
-	head, _, _ = strings.Cut(head, "@")
-	return strings.ToLower(head), strings.TrimSpace(rest)
+	head, target, _ = strings.Cut(head, "@")
+	return strings.ToLower(head), target, strings.TrimSpace(rest)
 }
 
 // ---------------------------------------------------------------- audio attachments
@@ -224,26 +237,28 @@ func (b *Bot) fetchAudio(ctx context.Context, a audioRef, limit int64) ([]byte, 
 
 // progress is a "⏳ working…" message that later turns into the result.
 type progress struct {
-	b   *Bot
-	msg *telegram.Message
+	b      *Bot
+	msg    *telegram.Message
+	thread int64 // forum topic of the request
 }
 
 func (b *Bot) startProgress(ctx context.Context, m *telegram.Message, text string) *progress {
-	msg := b.sendScreen(ctx, m.Chat.ID, m.MessageID, screen{icWait + " " + text, nil})
-	return &progress{b, msg}
+	msg := b.sendScreenTo(ctx, m.Chat.ID, m.Thread(), m.MessageID, screen{icWait + " " + text, nil})
+	return &progress{b, msg, m.Thread()}
 }
 
 // finish replaces the progress message with s (or posts s if that fails).
 func (p *progress) finish(ctx context.Context, chatID int64, s screen) {
 	if p.msg != nil {
 		err := p.b.tg.EditMessageText(ctx, telegram.SendMessageParams{
-			ChatID: chatID, MessageID: p.msg.MessageID, Text: s.text, ParseMode: "HTML", ReplyMarkup: s.kb, NoPreview: true,
+			ChatID: chatID, MessageID: p.msg.MessageID, Text: s.text, ParseMode: "HTML",
+			ReplyMarkup: p.b.inlineFor(chatID, s.kb), NoPreview: true,
 		})
 		if err == nil {
 			return
 		}
 	}
-	p.b.sendScreen(ctx, chatID, 0, s)
+	p.b.sendScreenTo(ctx, chatID, p.thread, 0, s)
 }
 
 // ---------------------------------------------------------------- remembered text
@@ -323,21 +338,25 @@ func (b *Bot) speak(ctx context.Context, m *telegram.Message, text string) {
 		b.replyHTML(ctx, m, ls.text, ls.kb)
 		return
 	}
+	if !b.spendGroup(ctx, m, chars, 0) {
+		b.refund(uid, chars, 0)
+		return
+	}
 
 	action := "record_voice"
 	if s.AsFile {
 		action = "upload_document"
 	}
-	_ = b.tg.SendChatAction(ctx, m.Chat.ID, action)
+	_ = b.tg.SendChatAction(ctx, m.Chat.ID, m.Thread(), action)
 
 	if !b.acquire(ctx) {
-		b.refund(uid, chars, 0)
+		b.refundAll(m, chars, 0)
 		return
 	}
 	audio, err := b.ttsWithRetry(ctx, req)
 	b.release()
 	if err != nil {
-		b.refund(uid, chars, 0)
+		b.refundAll(m, chars, 0)
 		b.fail(ctx, m, "tts", err)
 		return
 	}
@@ -367,8 +386,8 @@ func (b *Bot) ttsWithRetry(ctx context.Context, req cartesia.TTSRequest) ([]byte
 
 func (b *Bot) sendSpeech(ctx context.Context, m *telegram.Message, s Settings, text string, audio []byte) {
 	p := telegram.MediaParams{
-		ChatID: m.Chat.ID, ReplyTo: m.MessageID, Caption: speechCaption(s),
-		Filename: "ellie-studio.mp3", Data: audio, ReplyMarkup: afterSpeech(),
+		ChatID: m.Chat.ID, ReplyTo: m.MessageID, ThreadID: m.Thread(), Caption: speechCaption(s),
+		Filename: "ellie-studio.mp3", Data: audio, ReplyMarkup: b.markupFor(m.Chat.ID, afterSpeech()),
 	}
 	if !s.AsFile {
 		_, err := b.tg.SendVoice(ctx, p)
@@ -430,13 +449,19 @@ func (b *Bot) reserveAudio(ctx context.Context, m *telegram.Message, a audioRef,
 		b.replyHTML(ctx, m, ls.text, ls.kb)
 		return 0, false
 	}
+	if !b.spendGroup(ctx, m, 0, secs) {
+		b.refund(m.From.ID, 0, secs)
+		return 0, false
+	}
 	return secs, true
 }
 
 // settleAudio corrects a reservation to the real length Cartesia reported:
 // it refunds an over-estimate and records an under-estimate (without
 // refusing, since the work is already done).
-func (b *Bot) settleAudio(uid int64, claimed int, actual float64) {
+func (b *Bot) settleAudio(m *telegram.Message, claimed int, actual float64) {
+	b.settleGroup(m, claimed, actual)
+	uid := m.From.ID
 	if actual <= 0 || b.isAdmin(uid) {
 		return
 	}
@@ -464,13 +489,13 @@ func (b *Bot) transcribe(ctx context.Context, m *telegram.Message, a audioRef) {
 	pr := b.startProgress(ctx, m, "Listening…")
 	data, name, err := b.fetchAudio(ctx, a, telegram.MaxDownloadBytes)
 	if err != nil {
-		b.refund(uid, 0, claimed)
+		b.refundAll(m, 0, claimed)
 		pr.finish(ctx, m.Chat.ID, errorScreen(err))
 		return
 	}
 	s := b.store.Get(uid)
 	if !b.acquire(ctx) {
-		b.refund(uid, 0, claimed)
+		b.refundAll(m, 0, claimed)
 		return
 	}
 	tctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
@@ -482,11 +507,11 @@ func (b *Bot) transcribe(ctx context.Context, m *telegram.Message, a audioRef) {
 	cancel()
 	b.release()
 	if err != nil {
-		b.refund(uid, 0, claimed)
+		b.refundAll(m, 0, claimed)
 		pr.finish(ctx, m.Chat.ID, errorScreen(err))
 		return
 	}
-	b.settleAudio(uid, claimed, tr.Duration)
+	b.settleAudio(m, claimed, tr.Duration)
 	text := strings.TrimSpace(tr.Text)
 	if text == "" {
 		pr.finish(ctx, m.Chat.ID, screen{
@@ -516,7 +541,7 @@ func (b *Bot) transcribe(ctx context.Context, m *telegram.Message, a audioRef) {
 		if i == len(chunks)-2 {
 			kb = afterTranscript()
 		}
-		b.sendScreen(ctx, m.Chat.ID, 0, screen{html.EscapeString(c), kb})
+		b.sendScreenTo(ctx, m.Chat.ID, m.Thread(), 0, screen{html.EscapeString(c), kb})
 	}
 }
 
@@ -592,12 +617,12 @@ func (b *Bot) detect(ctx context.Context, m *telegram.Message, a audioRef) {
 	pr := b.startProgress(ctx, m, "Checking for a watermark…")
 	data, name, err := b.fetchAudio(ctx, a, cartesia.MaxWatermarkBytes)
 	if err != nil {
-		b.refund(uid, 0, claimed)
+		b.refundAll(m, 0, claimed)
 		pr.finish(ctx, m.Chat.ID, errorScreen(err))
 		return
 	}
 	if !b.acquire(ctx) {
-		b.refund(uid, 0, claimed)
+		b.refundAll(m, 0, claimed)
 		return
 	}
 	tctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
@@ -605,7 +630,7 @@ func (b *Bot) detect(ctx context.Context, m *telegram.Message, a audioRef) {
 	cancel()
 	b.release()
 	if err != nil {
-		b.refund(uid, 0, claimed)
+		b.refundAll(m, 0, claimed)
 		pr.finish(ctx, m.Chat.ID, errorScreen(err))
 		return
 	}

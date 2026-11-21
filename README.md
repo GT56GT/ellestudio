@@ -36,11 +36,12 @@ Don't know your Telegram ID? Start the bot with `ALLOWED_USER_IDS` set to anythi
 | Voices and dictionaries | Cartesia |
 | Who created each voice and dictionary | The bot's database (`ellie_ownership`) |
 | Each user's choices (voice, style, output) and today's usage | The bot's database (`ellie_user_settings`) |
+| Groups the bot is in, blocked groups, and each group's usage today | The bot's database (`ellie_chats`) |
 
 The bot's database is one of:
 
 - **Postgres** (production): set `DATABASE_URL`. On Render, use the database's **Internal** connection string. Tables are created and upgraded on startup by versioned migrations (`ellie_schema_migrations`), which are safe when two instances start at once during a deploy.
-- **Files** (local runs): without `DATABASE_URL`, the bot writes `DATA_DIR/settings.json` and `DATA_DIR/owners.json`. Hosts without a persistent disk, such as Render, wipe these on every deploy.
+- **Files** (local runs): without `DATABASE_URL`, the bot writes `DATA_DIR/settings.json`, `DATA_DIR/owners.json` and `DATA_DIR/chats.json`. Hosts without a persistent disk, such as Render, wipe these on every deploy.
 
 ### Ownership
 
@@ -62,6 +63,28 @@ Leave `ALLOWED_USER_IDS` empty and keep your own ID in `ADMIN_USER_IDS`. Then:
 - **Voices are unlisted, and the ID is the key.** Your library shows Cartesia's public voices plus voices *you* made, never anyone else's. To share one, open it and tap 🔗 **Share**. You get a link (`t.me/EllieStudioBot?start=v_<id>`) and the voice ID. Whoever has either can use the voice: tapping the link, pasting it, or pasting the ID opens the voice right away.
 - **Only the creator** (or an admin) can rename, delete, localize or share a voice. Ownership is recorded in the bot's database (see [Ownership](#ownership)).
 - Usage stays admin-only.
+
+## Groups
+
+Add the bot to any group or supergroup. Keep **privacy mode on** in @BotFather (the default) and don't make the bot an admin: then Telegram only sends it commands, @mentions and replies to its messages, and it answers only when someone talks to it.
+
+| In the group | What happens |
+|---|---|
+| `/say Good morning!` | Spoken in the **sender's own** voice and style |
+| Reply `/say` to a message | That message is read aloud |
+| Reply `/transcribe` to a voice note | The transcript is posted |
+| `@EllieStudioBot good morning` | Same as `/say` (a bare mention replying to a message reads or transcribes it) |
+| `/voices`, `/style`, `/clone`, … | A **Continue in private chat** button that opens that screen in the private chat |
+
+- **Private stays private.** Group messages never carry callback buttons, only a link into the private chat, so nobody can press someone else's menu. Pressing a button on an old group message just opens the private chat. Guided steps (clone, rename, search) only run in the private chat, so group messages can't be mistaken for their answers. Commands addressed to other bots (`/say@OtherBot`) are ignored.
+- **Everyone keeps their own allowance.** Each member's speech counts against their own daily allowance, as in the private chat.
+- **Each group shares an allowance too:** `GROUP_DAILY_CHAR_LIMIT` characters (default 5,000) and `GROUP_DAILY_TRANSCRIBE_MINUTES` minutes (default 30) a day. All groups together share `GROUPS_TOTAL_DAILY_CHAR_LIMIT` (default 50,000) and `GROUPS_TOTAL_DAILY_TRANSCRIBE_MINUTES` (default 120), so one busy public group can't spend the whole budget. The checks are atomic in Postgres, so two instances during a deploy can't overspend. Failed requests are refunded. Admins are exempt.
+- **No spamming:** each member waits `GROUP_COOLDOWN_SECONDS` (default 10) between requests, with one reminder per cooldown, and at most `GROUP_CONCURRENCY` jobs (default 2) run per group at once.
+- **Telegram's flood limits are respected:** sends to a group are paced to about 20 a minute (a burst of 5, then one every 3 seconds), and short "retry after" waits from Telegram are sat out and retried automatically.
+- **Forum topics:** replies stay in the topic they were asked in.
+- **Who can add the bot:** `GROUP_MODE=open` (anyone, the default), `admins` (only `ADMIN_USER_IDS`; the bot leaves groups anyone else adds) or `off` (the bot leaves every group).
+- **Your controls (admins, in the private chat):** `/groups` shows today's busiest groups and the totals, `/blockgroup <id>` makes the bot leave a group for good, `/unblockgroup <id>` lets it back. `/blockgroup` sent inside a group blocks that group.
+- When the bot joins it posts a short how-to. When a group is upgraded to a supergroup (its ID changes), its record, block and today's usage move with it.
 
 ## What it does
 

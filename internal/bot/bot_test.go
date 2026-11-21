@@ -188,7 +188,7 @@ func newFixture(t *testing.T, cfg Config) *fixture {
 	fx.bot = New(
 		telegram.New("TOKEN", tgSrv.URL),
 		cartesia.New("sk_car_test", cartesia.WithBaseURL(ctSrv.URL)),
-		store, nil, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store, nil, nil, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
 	return fx
 }

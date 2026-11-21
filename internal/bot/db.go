@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -39,6 +40,22 @@ var migrations = []string{
 	);
 	CREATE INDEX ellie_ownership_by_owner
 		ON ellie_ownership (owner_id, kind, created_at DESC, resource_id DESC)`,
+	// 3: groups the bot is in, and their shared daily usage. Row 0 is the
+	// total across every group.
+	`CREATE TABLE ellie_chats (
+		chat_id    BIGINT      PRIMARY KEY,
+		type       TEXT        NOT NULL DEFAULT '',
+		title      TEXT        NOT NULL DEFAULT '',
+		status     TEXT        NOT NULL DEFAULT '',
+		blocked    BOOLEAN     NOT NULL DEFAULT false,
+		added_by   BIGINT      NOT NULL DEFAULT 0,
+		usage_day  TEXT        NOT NULL DEFAULT '',
+		chars      INT         NOT NULL DEFAULT 0 CHECK (chars >= 0),
+		secs       INT         NOT NULL DEFAULT 0 CHECK (secs >= 0),
+		created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+	);
+	CREATE INDEX ellie_chats_by_usage ON ellie_chats (usage_day, chars DESC) WHERE chat_id <> 0`,
 }
 
 // migrationLock is the advisory lock key ("ellie") that serialises
@@ -252,4 +269,173 @@ func (p pgOwners) Release(ctx context.Context, kind, id string) error {
 		return fmt.Errorf("database: release: %w", err)
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------- groups
+
+// Chats returns the group registry. Like Owners it reads the database on
+// every call, so instances running side by side during a deploy agree.
+func (d *DB) Chats() Chats { return pgChats{d.pool, allGroups} }
+
+type pgChats struct {
+	pool  *pgxpool.Pool
+	total int64 // the row that sums every group (allGroups; tests use their own)
+}
+
+const chatCols = `chat_id, type, title, status, blocked, added_by, usage_day, chars, secs`
+
+func chatDest(c *ChatInfo) []any {
+	return []any{&c.ID, &c.Type, &c.Title, &c.Status, &c.Blocked, &c.AddedBy, &c.Day, &c.Chars, &c.Secs}
+}
+
+func (p pgChats) Get(ctx context.Context, id int64) (ChatInfo, bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, pgTimeout)
+	defer cancel()
+	var c ChatInfo
+	err := p.pool.QueryRow(ctx, `SELECT `+chatCols+` FROM ellie_chats WHERE chat_id = $1`, id).Scan(chatDest(&c)...)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return ChatInfo{}, false, nil
+	case err != nil:
+		return ChatInfo{}, false, fmt.Errorf("database: get chat: %w", err)
+	}
+	return c, true, nil
+}
+
+func (p pgChats) Upsert(ctx context.Context, c ChatInfo) error {
+	ctx, cancel := context.WithTimeout(ctx, pgTimeout)
+	defer cancel()
+	_, err := p.pool.Exec(ctx, `INSERT INTO ellie_chats (chat_id, type, title, status, added_by) VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (chat_id) DO UPDATE SET
+			type       = COALESCE(NULLIF(EXCLUDED.type, ''), ellie_chats.type),
+			title      = COALESCE(NULLIF(EXCLUDED.title, ''), ellie_chats.title),
+			status     = COALESCE(NULLIF(EXCLUDED.status, ''), ellie_chats.status),
+			added_by   = CASE WHEN EXCLUDED.added_by <> 0 THEN EXCLUDED.added_by ELSE ellie_chats.added_by END,
+			updated_at = now()`, c.ID, c.Type, c.Title, c.Status, c.AddedBy)
+	if err != nil {
+		return fmt.Errorf("database: save chat: %w", err)
+	}
+	return nil
+}
+
+func (p pgChats) SetBlocked(ctx context.Context, id int64, blocked bool) error {
+	ctx, cancel := context.WithTimeout(ctx, pgTimeout)
+	defer cancel()
+	_, err := p.pool.Exec(ctx, `INSERT INTO ellie_chats (chat_id, blocked) VALUES ($1, $2)
+		ON CONFLICT (chat_id) DO UPDATE SET blocked = EXCLUDED.blocked, updated_at = now()`, id, blocked)
+	if err != nil {
+		return fmt.Errorf("database: block chat: %w", err)
+	}
+	return nil
+}
+
+// lockChats creates any missing rows and locks them in ID order, so two
+// transactions touching the same groups can never deadlock.
+func lockChats(ctx context.Context, tx pgx.Tx, ids ...int64) (map[int64]ChatInfo, error) {
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, id := range ids {
+		if _, err := tx.Exec(ctx, `INSERT INTO ellie_chats (chat_id) VALUES ($1) ON CONFLICT DO NOTHING`, id); err != nil {
+			return nil, err
+		}
+	}
+	rows, err := tx.Query(ctx, `SELECT `+chatCols+` FROM ellie_chats WHERE chat_id = ANY($1) ORDER BY chat_id FOR UPDATE`, ids)
+	if err != nil {
+		return nil, err
+	}
+	out := map[int64]ChatInfo{}
+	var c ChatInfo
+	_, err = pgx.ForEachRow(rows, chatDest(&c), func() error { out[c.ID] = c; return nil })
+	return out, err
+}
+
+func saveUsage(ctx context.Context, tx pgx.Tx, c ChatInfo) error {
+	_, err := tx.Exec(ctx, `UPDATE ellie_chats SET usage_day = $2, chars = $3, secs = $4, updated_at = now() WHERE chat_id = $1`,
+		c.ID, c.Day, c.Chars, c.Secs)
+	return err
+}
+
+func (p pgChats) Spend(ctx context.Context, id int64, day string, chars, secs int, lim GroupLimits) error {
+	ctx, cancel := context.WithTimeout(ctx, pgTimeout)
+	defer cancel()
+	var refused error
+	err := pgx.BeginFunc(ctx, p.pool, func(tx pgx.Tx) error {
+		rows, err := lockChats(ctx, tx, id, p.total)
+		if err != nil {
+			return err
+		}
+		g, all := rows[id], rows[p.total]
+		if refused = lim.fits(g, all, day, chars, secs); refused != nil {
+			return nil
+		}
+		g.add(day, chars, secs)
+		all.add(day, chars, secs)
+		if err := saveUsage(ctx, tx, g); err != nil {
+			return err
+		}
+		return saveUsage(ctx, tx, all)
+	})
+	if err != nil {
+		return fmt.Errorf("database: spend group allowance: %w", err)
+	}
+	return refused
+}
+
+func (p pgChats) Refund(ctx context.Context, id int64, day string, chars, secs int) error {
+	ctx, cancel := context.WithTimeout(ctx, pgTimeout)
+	defer cancel()
+	_, err := p.pool.Exec(ctx, `UPDATE ellie_chats SET chars = GREATEST(0, chars - $3), secs = GREATEST(0, secs - $4), updated_at = now()
+		WHERE chat_id = ANY($1) AND usage_day = $2`, []int64{id, p.total}, day, chars, secs)
+	if err != nil {
+		return fmt.Errorf("database: refund group allowance: %w", err)
+	}
+	return nil
+}
+
+func (p pgChats) Migrate(ctx context.Context, from, to int64) error {
+	if from == to {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, pgTimeout)
+	defer cancel()
+	err := pgx.BeginFunc(ctx, p.pool, func(tx pgx.Tx) error {
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM ellie_chats WHERE chat_id = $1)`, from).Scan(&exists); err != nil || !exists {
+			return err
+		}
+		rows, err := lockChats(ctx, tx, from, to)
+		if err != nil {
+			return err
+		}
+		dst := rows[to]
+		merge(&dst, rows[from])
+		dst.Type = "supergroup"
+		if _, err := tx.Exec(ctx, `UPDATE ellie_chats SET type = $2, title = $3, status = $4, blocked = $5, added_by = $6,
+			usage_day = $7, chars = $8, secs = $9, updated_at = now() WHERE chat_id = $1`,
+			dst.ID, dst.Type, dst.Title, dst.Status, dst.Blocked, dst.AddedBy, dst.Day, dst.Chars, dst.Secs); err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, `DELETE FROM ellie_chats WHERE chat_id = $1`, from)
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("database: migrate chat: %w", err)
+	}
+	return nil
+}
+
+func (p pgChats) Busiest(ctx context.Context, day string, n int) ([]ChatInfo, error) {
+	ctx, cancel := context.WithTimeout(ctx, pgTimeout)
+	defer cancel()
+	rows, err := p.pool.Query(ctx, `SELECT `+chatCols+` FROM ellie_chats
+		WHERE chat_id <> $3 AND usage_day = $1 AND (chars > 0 OR secs > 0)
+		ORDER BY chars DESC, chat_id LIMIT $2`, day, n, p.total)
+	if err != nil {
+		return nil, fmt.Errorf("database: busiest chats: %w", err)
+	}
+	var out []ChatInfo
+	var c ChatInfo
+	if _, err := pgx.ForEachRow(rows, chatDest(&c), func() error { out = append(out, c); return nil }); err != nil {
+		return nil, fmt.Errorf("database: busiest chats: %w", err)
+	}
+	return out, nil
 }

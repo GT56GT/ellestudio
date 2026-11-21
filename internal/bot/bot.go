@@ -46,6 +46,17 @@ type Config struct {
 	// DailyDicts caps new pronunciation dictionaries per user per UTC day
 	// (0 = unlimited). Admins are exempt.
 	DailyDicts int
+
+	// GroupMode says who may add the bot to groups: GroupsOpen (default),
+	// GroupsAdmins or GroupsOff.
+	GroupMode string
+	// GroupLimits caps what each group, and all groups together, use per UTC
+	// day, on top of each member's own allowance. Admins are exempt.
+	GroupLimits GroupLimits
+	// GroupCooldown is how long one person waits between requests in a group.
+	GroupCooldown time.Duration
+	// GroupConcurrency caps the jobs running at once in one group.
+	GroupConcurrency int
 }
 
 // Bot is the running studio.
@@ -54,6 +65,7 @@ type Bot struct {
 	ct     *cartesia.Client
 	store  *Store
 	owners Owners // who created each voice and dictionary
+	chats  Chats  // groups the bot is in, and their shared allowance
 	cfg    Config
 	log    *slog.Logger
 
@@ -67,6 +79,11 @@ type Bot struct {
 	recent   map[int64]*recent // last spoken text / transcript, for Again and Read aloud
 	busy     map[int64]bool    // users with a Cartesia job running
 	username string            // the bot's @username, for share links
+
+	groupMu    sync.Mutex
+	lastUse    map[chatUser]time.Time // last accepted request per person per group
+	lastNotice map[chatUser]time.Time // last cooldown reminder per person per group
+	groupJobs  map[int64]int          // jobs running per group
 }
 
 // recent remembers what a user last heard or transcribed.
@@ -75,10 +92,17 @@ type recent struct {
 	transcript string
 }
 
-// New wires a bot together. A nil owners keeps ownership in memory only.
-func New(tg *telegram.Client, ct *cartesia.Client, store *Store, owners Owners, cfg Config, log *slog.Logger) *Bot {
+// New wires a bot together. A nil owners or chats keeps that registry in
+// memory only.
+func New(tg *telegram.Client, ct *cartesia.Client, store *Store, owners Owners, chats Chats, cfg Config, log *slog.Logger) *Bot {
 	if owners == nil {
 		owners, _ = OpenFileOwners("")
+	}
+	if chats == nil {
+		chats, _ = OpenFileChats("")
+	}
+	if cfg.GroupMode == "" {
+		cfg.GroupMode = GroupsOpen
 	}
 	if cfg.MaxTTSChars <= 0 {
 		cfg.MaxTTSChars = 1500
@@ -97,6 +121,7 @@ func New(tg *telegram.Client, ct *cartesia.Client, store *Store, owners Owners, 
 		ct:            ct,
 		store:         store,
 		owners:        owners,
+		chats:         chats,
 		cfg:           cfg,
 		log:           log,
 		cartesiaSlots: make(chan struct{}, cfg.Concurrency),
@@ -105,6 +130,9 @@ func New(tg *telegram.Client, ct *cartesia.Client, store *Store, owners Owners, 
 		flows:         map[int64]*flow{},
 		recent:        map[int64]*recent{},
 		busy:          map[int64]bool{},
+		lastUse:       map[chatUser]time.Time{},
+		lastNotice:    map[chatUser]time.Time{},
+		groupJobs:     map[int64]int{},
 	}
 }
 
@@ -136,8 +164,17 @@ func (b *Bot) Run(ctx context.Context) error {
 	}
 	b.username = me.Username
 	b.log.Info("connected to Telegram", "bot", "@"+me.Username)
-	if err := b.tg.SetMyCommands(ctx, Commands); err != nil {
-		b.log.Warn("setMyCommands failed", "err", err)
+	for _, c := range []struct {
+		scope string
+		cmds  []telegram.BotCommand
+	}{
+		{telegram.ScopeDefault, Commands},
+		{telegram.ScopePrivateChats, Commands},
+		{telegram.ScopeGroupChats, GroupCommands},
+	} {
+		if err := b.tg.SetMyCommands(ctx, c.cmds, c.scope); err != nil {
+			b.log.Warn("setMyCommands failed", "scope", c.scope, "err", err)
+		}
 	}
 	if err := b.tg.SetMyDescription(ctx, botDescription); err != nil {
 		b.log.Warn("setMyDescription failed", "err", err)
@@ -214,6 +251,8 @@ func (b *Bot) handleUpdate(ctx context.Context, u telegram.Update) {
 		b.handleMessage(ctx, u.Message)
 	case u.CallbackQuery != nil:
 		b.handleCallback(ctx, u.CallbackQuery)
+	case u.MyChatMember != nil:
+		b.onMembership(ctx, u.MyChatMember)
 	}
 }
 
@@ -247,7 +286,7 @@ func (b *Bot) release() { <-b.cartesiaSlots }
 // reply sends plain text, splitting anything longer than Telegram allows.
 func (b *Bot) reply(ctx context.Context, m *telegram.Message, text string) {
 	for i, chunk := range splitText(text, telegram.MaxMessageLen-96) {
-		p := telegram.SendMessageParams{ChatID: m.Chat.ID, Text: chunk, NoPreview: true}
+		p := telegram.SendMessageParams{ChatID: m.Chat.ID, ThreadID: m.Thread(), Text: chunk, NoPreview: true}
 		if i == 0 {
 			p.ReplyTo = m.MessageID
 		}
@@ -261,8 +300,8 @@ func (b *Bot) reply(ctx context.Context, m *telegram.Message, text string) {
 // replyHTML sends one HTML-formatted message, optionally with a keyboard.
 func (b *Bot) replyHTML(ctx context.Context, m *telegram.Message, text string, kb *telegram.InlineKeyboardMarkup) {
 	p := telegram.SendMessageParams{
-		ChatID: m.Chat.ID, Text: text, ParseMode: "HTML", ReplyTo: m.MessageID,
-		ReplyMarkup: kb, NoPreview: true,
+		ChatID: m.Chat.ID, ThreadID: m.Thread(), Text: text, ParseMode: "HTML", ReplyTo: m.MessageID,
+		ReplyMarkup: b.inlineFor(m.Chat.ID, kb), NoPreview: true,
 	}
 	if _, err := b.tg.SendMessage(ctx, p); err != nil {
 		b.log.Warn("sendMessage failed", "chat", m.Chat.ID, "err", err)
@@ -273,7 +312,7 @@ func (b *Bot) replyHTML(ctx context.Context, m *telegram.Message, text string, k
 func (b *Bot) editHTML(ctx context.Context, m *telegram.Message, text string, kb *telegram.InlineKeyboardMarkup) {
 	p := telegram.SendMessageParams{
 		ChatID: m.Chat.ID, MessageID: m.MessageID, Text: text, ParseMode: "HTML",
-		ReplyMarkup: kb, NoPreview: true,
+		ReplyMarkup: b.inlineFor(m.Chat.ID, kb), NoPreview: true,
 	}
 	if err := b.tg.EditMessageText(ctx, p); err != nil && !strings.Contains(err.Error(), "message is not modified") {
 		b.log.Warn("editMessageText failed", "chat", m.Chat.ID, "err", err)
@@ -282,9 +321,14 @@ func (b *Bot) editHTML(ctx context.Context, m *telegram.Message, text string, kb
 
 // sendScreen posts a screen as a new message.
 func (b *Bot) sendScreen(ctx context.Context, chatID, replyTo int64, s screen) *telegram.Message {
+	return b.sendScreenTo(ctx, chatID, 0, replyTo, s)
+}
+
+// sendScreenTo posts a screen into a forum topic (thread 0 = none).
+func (b *Bot) sendScreenTo(ctx context.Context, chatID, thread, replyTo int64, s screen) *telegram.Message {
 	msg, err := b.tg.SendMessage(ctx, telegram.SendMessageParams{
-		ChatID: chatID, Text: s.text, ParseMode: "HTML", ReplyTo: replyTo,
-		ReplyMarkup: s.kb, NoPreview: true,
+		ChatID: chatID, ThreadID: thread, Text: s.text, ParseMode: "HTML", ReplyTo: replyTo,
+		ReplyMarkup: b.inlineFor(chatID, s.kb), NoPreview: true,
 	})
 	if err != nil {
 		b.log.Warn("sendMessage failed", "chat", chatID, "err", err)

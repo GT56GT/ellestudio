@@ -50,6 +50,10 @@ func (b *Bot) welcome(ctx context.Context, m *telegram.Message, startArg string)
 		b.sendScreen(ctx, m.Chat.ID, 0, b.voiceCard(ctx, uid, sharedID))
 		return
 	}
+	if deepLinks[startArg] { // a "Continue in private chat" link from a group
+		b.openDeepLink(ctx, m, startArg)
+		return
+	}
 	b.sendScreen(ctx, m.Chat.ID, 0, b.homeScreen(uid))
 }
 
@@ -208,6 +212,16 @@ func (b *Bot) command(ctx context.Context, m *telegram.Message, cmd, args string
 		send(b.statusScreen(ctx))
 	case "usage":
 		send(b.usageScreen(ctx, uid))
+	case "groups", "blockgroup", "unblockgroup":
+		if !b.isOwner(uid) {
+			b.command(ctx, m, "unknown", "")
+			return
+		}
+		if cmd == "groups" {
+			send(b.groupsScreen(ctx))
+			return
+		}
+		b.cmdBlockGroup(ctx, m, cmd == "blockgroup", args)
 	default:
 		send(screen{header("🤔", "Unknown command", "") + "Tap Help to see what I can do, or just send me some text.",
 			(&keys{}).row(btn(icHelp+" Help", "nav:help")).nav("", "").build()})
@@ -546,6 +560,16 @@ func (b *Bot) usageScreen(ctx context.Context, uid int64) screen {
 // ---------------------------------------------------------------- buttons
 
 func (b *Bot) handleCallback(ctx context.Context, q *telegram.CallbackQuery) {
+	if q.Message != nil && isGroupChat(q.Message.Chat.ID) {
+		// Group messages carry no callback buttons; one from an older
+		// message must not act on (or show) anyone's private settings.
+		if link := b.startLink("studio"); link != "" {
+			_ = b.tg.AnswerCallbackQueryURL(ctx, q.ID, link)
+		} else {
+			_ = b.tg.AnswerCallbackQuery(ctx, q.ID, "Open Ellie Studio in a private chat to use the buttons.")
+		}
+		return
+	}
 	if !b.allowed(q.From.ID) {
 		_ = b.tg.AnswerCallbackQuery(ctx, q.ID, "Ellie Studio is private.")
 		return

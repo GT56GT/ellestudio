@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -31,7 +32,24 @@ type Client struct {
 	token string
 	base  string
 	http  *http.Client
+
+	// Group sends are paced to stay under Telegram's per-group flood limit
+	// (about 20 messages a minute): a burst of groupBurst, then one message
+	// every groupGap.
+	groupGap   time.Duration
+	groupBurst float64
+	paceMu     sync.Mutex
+	buckets    map[int64]*bucket
 }
+
+type bucket struct {
+	tokens float64
+	at     time.Time
+}
+
+// maxRetryAfter is the longest flood wait the client sits out by itself;
+// longer waits are returned to the caller as errors.
+const maxRetryAfter = 30 * time.Second
 
 // New creates a client. apiURL may be "" for the public API.
 func New(token, apiURL string) *Client {
@@ -43,7 +61,62 @@ func New(token, apiURL string) *Client {
 		base:  strings.TrimRight(apiURL, "/"),
 		// Long polls hold the connection for up to the poll timeout, so the
 		// per-request deadline comes from ctx rather than a global timeout.
-		http: &http.Client{},
+		http:       &http.Client{},
+		groupGap:   3 * time.Second,
+		groupBurst: 5,
+		buckets:    map[int64]*bucket{},
+	}
+}
+
+// SetGroupPacing changes how sends to groups are spaced (tests use a tiny gap).
+func (c *Client) SetGroupPacing(gap time.Duration, burst int) {
+	c.paceMu.Lock()
+	defer c.paceMu.Unlock()
+	c.groupGap, c.groupBurst = gap, float64(max(burst, 1))
+}
+
+// pace waits for a send slot in a group or channel (negative chat IDs).
+// Private chats are not paced.
+func (c *Client) pace(ctx context.Context, chatID int64) error {
+	if chatID >= 0 {
+		return nil
+	}
+	c.paceMu.Lock()
+	now := time.Now()
+	bk := c.buckets[chatID]
+	if bk == nil {
+		bk = &bucket{tokens: c.groupBurst, at: now}
+		c.buckets[chatID] = bk
+	}
+	bk.tokens = min(c.groupBurst, bk.tokens+float64(now.Sub(bk.at))/float64(c.groupGap))
+	bk.at = now
+	bk.tokens--
+	var wait time.Duration
+	if bk.tokens < 0 {
+		wait = time.Duration(-bk.tokens * float64(c.groupGap))
+	}
+	if len(c.buckets) > 10000 { // forget idle groups
+		for id, o := range c.buckets {
+			if o.tokens >= c.groupBurst {
+				delete(c.buckets, id)
+			}
+		}
+	}
+	c.paceMu.Unlock()
+	return sleepCtx(ctx, wait)
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
 	}
 }
 
@@ -57,9 +130,14 @@ type User struct {
 }
 
 type Chat struct {
-	ID   int64  `json:"id"`
-	Type string `json:"type"`
+	ID      int64  `json:"id"`
+	Type    string `json:"type"` // "private", "group", "supergroup" or "channel"
+	Title   string `json:"title"`
+	IsForum bool   `json:"is_forum"`
 }
+
+// IsGroup reports whether the chat is a group or supergroup.
+func (c Chat) IsGroup() bool { return c.Type == "group" || c.Type == "supergroup" }
 
 type Voice struct {
 	FileID   string `json:"file_id"`
@@ -94,6 +172,47 @@ type Message struct {
 	VideoNote      *Voice    `json:"video_note"`
 	Document       *Document `json:"document"`
 	ReplyToMessage *Message  `json:"reply_to_message"`
+
+	MessageThreadID   int64 `json:"message_thread_id"`
+	IsTopicMessage    bool  `json:"is_topic_message"`
+	SenderChat        *Chat `json:"sender_chat"`
+	MigrateToChatID   int64 `json:"migrate_to_chat_id"`
+	MigrateFromChatID int64 `json:"migrate_from_chat_id"`
+}
+
+// Thread is the forum topic the message belongs to (0 outside topics).
+func (m *Message) Thread() int64 {
+	if m == nil || !m.IsTopicMessage {
+		return 0
+	}
+	return m.MessageThreadID
+}
+
+// ChatMember is a user's membership in a chat.
+type ChatMember struct {
+	Status string `json:"status"` // creator, administrator, member, restricted, left, kicked
+	User   User   `json:"user"`
+	// IsMember is set for "restricted" members who are still in the chat.
+	IsMember bool `json:"is_member"`
+}
+
+// Present reports whether the member is in the chat.
+func (m ChatMember) Present() bool {
+	switch m.Status {
+	case "creator", "administrator", "member":
+		return true
+	case "restricted":
+		return m.IsMember
+	}
+	return false
+}
+
+// ChatMemberUpdated reports a change to the bot's own membership.
+type ChatMemberUpdated struct {
+	Chat          Chat       `json:"chat"`
+	From          User       `json:"from"`
+	OldChatMember ChatMember `json:"old_chat_member"`
+	NewChatMember ChatMember `json:"new_chat_member"`
 }
 
 type CallbackQuery struct {
@@ -104,9 +223,10 @@ type CallbackQuery struct {
 }
 
 type Update struct {
-	UpdateID      int64          `json:"update_id"`
-	Message       *Message       `json:"message"`
-	CallbackQuery *CallbackQuery `json:"callback_query"`
+	UpdateID      int64              `json:"update_id"`
+	Message       *Message           `json:"message"`
+	CallbackQuery *CallbackQuery     `json:"callback_query"`
+	MyChatMember  *ChatMemberUpdated `json:"my_chat_member"`
 }
 
 type InlineKeyboardButton struct {
@@ -192,7 +312,23 @@ func (c *Client) scrub(err error) error {
 	return errors.New(strings.ReplaceAll(err.Error(), c.token, "<token>"))
 }
 
-func (c *Client) post(ctx context.Context, method string, body io.Reader, contentType string, out any) error {
+// post sends body, sitting out short flood waits (HTTP 429 with a
+// retry_after of up to maxRetryAfter) and trying again, at most twice.
+func (c *Client) post(ctx context.Context, method string, body []byte, contentType string, out any) error {
+	for attempt := 0; ; attempt++ {
+		err := c.postOnce(ctx, method, bytes.NewReader(body), contentType, out)
+		var te *Error
+		if attempt >= 2 || !errors.As(err, &te) || te.Code != http.StatusTooManyRequests ||
+			te.RetryAfter <= 0 || time.Duration(te.RetryAfter)*time.Second > maxRetryAfter {
+			return err
+		}
+		if serr := sleepCtx(ctx, time.Duration(te.RetryAfter)*time.Second); serr != nil {
+			return err
+		}
+	}
+}
+
+func (c *Client) postOnce(ctx context.Context, method string, body io.Reader, contentType string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.methodURL(method), body)
 	if err != nil {
 		return c.scrub(err)
@@ -228,7 +364,7 @@ func (c *Client) call(ctx context.Context, method string, params, out any) error
 	if err != nil {
 		return err
 	}
-	return c.post(ctx, method, bytes.NewReader(buf), "application/json", out)
+	return c.post(ctx, method, buf, "application/json", out)
 }
 
 // ---------------------------------------------------------------- methods
@@ -244,7 +380,7 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64, timeout time.Dura
 	params := map[string]any{
 		"offset":          offset,
 		"timeout":         int(timeout.Seconds()),
-		"allowed_updates": []string{"message", "callback_query"},
+		"allowed_updates": []string{"message", "callback_query", "my_chat_member"},
 	}
 	var ups []Update
 	return ups, c.call(ctx, "getUpdates", params, &ups)
@@ -257,7 +393,8 @@ type SendMessageParams struct {
 	Text        string
 	ParseMode   string
 	ReplyTo     int64
-	ReplyMarkup any // *InlineKeyboardMarkup or *ReplyKeyboardMarkup (edits: inline only)
+	ThreadID    int64 // forum topic, send only
+	ReplyMarkup any   // *InlineKeyboardMarkup or *ReplyKeyboardMarkup (edits: inline only)
 	NoPreview   bool
 }
 
@@ -265,6 +402,8 @@ func (p SendMessageParams) payload() map[string]any {
 	m := map[string]any{"chat_id": p.ChatID, "text": p.Text}
 	if p.MessageID != 0 {
 		m["message_id"] = p.MessageID
+	} else if p.ThreadID != 0 {
+		m["message_thread_id"] = p.ThreadID
 	}
 	if p.ParseMode != "" {
 		m["parse_mode"] = p.ParseMode
@@ -283,6 +422,9 @@ func (p SendMessageParams) payload() map[string]any {
 
 // SendMessage sends a text message.
 func (c *Client) SendMessage(ctx context.Context, p SendMessageParams) (*Message, error) {
+	if err := c.pace(ctx, p.ChatID); err != nil {
+		return nil, err
+	}
 	var m Message
 	return &m, c.call(ctx, "sendMessage", p.payload(), &m)
 }
@@ -297,14 +439,40 @@ func (c *Client) AnswerCallbackQuery(ctx context.Context, id, text string) error
 	return c.call(ctx, "answerCallbackQuery", map[string]any{"callback_query_id": id, "text": text}, nil)
 }
 
-// SendChatAction shows "recording voice…" etc. for about 5 seconds.
-func (c *Client) SendChatAction(ctx context.Context, chatID int64, action string) error {
-	return c.call(ctx, "sendChatAction", map[string]any{"chat_id": chatID, "action": action}, nil)
+// AnswerCallbackQueryURL acknowledges a button press by opening url, which
+// may be a t.me/<bot>?start=<payload> link into the private chat.
+func (c *Client) AnswerCallbackQueryURL(ctx context.Context, id, url string) error {
+	return c.call(ctx, "answerCallbackQuery", map[string]any{"callback_query_id": id, "url": url}, nil)
 }
 
-// SetMyCommands sets the command menu shown in clients.
-func (c *Client) SetMyCommands(ctx context.Context, cmds []BotCommand) error {
-	return c.call(ctx, "setMyCommands", map[string]any{"commands": cmds}, nil)
+// SendChatAction shows "recording voice…" etc. for about 5 seconds.
+func (c *Client) SendChatAction(ctx context.Context, chatID, threadID int64, action string) error {
+	p := map[string]any{"chat_id": chatID, "action": action}
+	if threadID != 0 {
+		p["message_thread_id"] = threadID
+	}
+	return c.call(ctx, "sendChatAction", p, nil)
+}
+
+// Command scopes for SetMyCommands.
+const (
+	ScopeDefault      = "default"
+	ScopePrivateChats = "all_private_chats"
+	ScopeGroupChats   = "all_group_chats"
+)
+
+// SetMyCommands sets the command menu clients show in the given scope.
+func (c *Client) SetMyCommands(ctx context.Context, cmds []BotCommand, scope string) error {
+	p := map[string]any{"commands": cmds}
+	if scope != "" && scope != ScopeDefault {
+		p["scope"] = map[string]any{"type": scope}
+	}
+	return c.call(ctx, "setMyCommands", p, nil)
+}
+
+// LeaveChat removes the bot from a group.
+func (c *Client) LeaveChat(ctx context.Context, chatID int64) error {
+	return c.call(ctx, "leaveChat", map[string]any{"chat_id": chatID}, nil)
 }
 
 // SetMyDescription sets the text shown in an empty chat before /start.
@@ -326,6 +494,7 @@ func (c *Client) DeleteMessage(ctx context.Context, chatID, messageID int64) err
 type MediaParams struct {
 	ChatID   int64
 	ReplyTo  int64
+	ThreadID int64 // forum topic
 	Caption  string
 	Filename string
 	Data     []byte
@@ -350,9 +519,15 @@ func (c *Client) SendDocument(ctx context.Context, p MediaParams) (*Message, err
 }
 
 func (c *Client) sendMedia(ctx context.Context, method, field string, p MediaParams) (*Message, error) {
+	if err := c.pace(ctx, p.ChatID); err != nil {
+		return nil, err
+	}
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
 	_ = w.WriteField("chat_id", strconv.FormatInt(p.ChatID, 10))
+	if p.ThreadID != 0 {
+		_ = w.WriteField("message_thread_id", strconv.FormatInt(p.ThreadID, 10))
+	}
 	if p.Caption != "" {
 		_ = w.WriteField("caption", p.Caption)
 	}
@@ -381,7 +556,7 @@ func (c *Client) sendMedia(ctx context.Context, method, field string, p MediaPar
 		return nil, err
 	}
 	var m Message
-	return &m, c.post(ctx, method, &buf, w.FormDataContentType(), &m)
+	return &m, c.post(ctx, method, buf.Bytes(), w.FormDataContentType(), &m)
 }
 
 // GetFile resolves a file_id to a downloadable path.

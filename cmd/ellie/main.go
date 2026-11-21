@@ -77,6 +77,7 @@ func run(log *slog.Logger) error {
 	var (
 		store  *bot.Store
 		owners bot.Owners
+		chats  bot.Chats
 	)
 	if dbURL := os.Getenv("DATABASE_URL"); dbURL != "" {
 		db, err := bot.OpenDatabase(ctx, dbURL)
@@ -88,6 +89,7 @@ func run(log *slog.Logger) error {
 			return err
 		}
 		owners = db.Owners()
+		chats = db.Chats()
 		log.Info("settings stored in Postgres")
 	} else {
 		dir := envOr("DATA_DIR", "data")
@@ -95,6 +97,9 @@ func run(log *slog.Logger) error {
 			return err
 		}
 		if owners, err = bot.OpenFileOwners(filepath.Join(dir, "owners.json")); err != nil {
+			return err
+		}
+		if chats, err = bot.OpenFileChats(filepath.Join(dir, "chats.json")); err != nil {
 			return err
 		}
 		log.Info("settings stored in files", "dir", dir)
@@ -107,7 +112,14 @@ func run(log *slog.Logger) error {
 
 	resolveDefaultVoice(ctx, log, ct, store)
 
-	b := bot.New(tg, ct, store, owners, bot.Config{
+	groupMode := strings.ToLower(envOr("GROUP_MODE", bot.GroupsOpen))
+	switch groupMode {
+	case bot.GroupsOpen, bot.GroupsAdmins, bot.GroupsOff:
+	default:
+		return fmt.Errorf("GROUP_MODE must be %s, %s or %s, not %q", bot.GroupsOpen, bot.GroupsAdmins, bot.GroupsOff, groupMode)
+	}
+
+	b := bot.New(tg, ct, store, owners, chats, bot.Config{
 		AllowedUsers:   allowed,
 		AdminUsers:     admins,
 		MaxTTSChars:    envInt("MAX_TTS_CHARS", 1500),
@@ -116,6 +128,16 @@ func run(log *slog.Logger) error {
 		DailyAudioSecs: envLimit("DAILY_TRANSCRIBE_MINUTES", 10) * 60,
 		DailyCreations: envLimit("DAILY_VOICE_CREATIONS", 3),
 		DailyDicts:     envLimit("DAILY_DICTIONARIES", 5),
+
+		GroupMode: groupMode,
+		GroupLimits: bot.GroupLimits{
+			Chars:    envLimit("GROUP_DAILY_CHAR_LIMIT", 5000),
+			Secs:     envLimit("GROUP_DAILY_TRANSCRIBE_MINUTES", 30) * 60,
+			AllChars: envLimit("GROUPS_TOTAL_DAILY_CHAR_LIMIT", 50000),
+			AllSecs:  envLimit("GROUPS_TOTAL_DAILY_TRANSCRIBE_MINUTES", 120) * 60,
+		},
+		GroupCooldown:    time.Duration(envLimit("GROUP_COOLDOWN_SECONDS", 10)) * time.Second,
+		GroupConcurrency: envInt("GROUP_CONCURRENCY", 2),
 	}, log)
 	log.Info("Ellie Studio starting", "cartesia_version", cartesia.APIVersion, "default_voice", store.Defaults().VoiceName)
 	return b.Run(ctx)
