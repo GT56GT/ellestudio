@@ -51,7 +51,8 @@ type Config struct {
 	// GroupsAdmins or GroupsOff.
 	GroupMode string
 	// GroupLimits caps what each group, and all groups together, use per UTC
-	// day, on top of each member's own allowance. Admins are exempt.
+	// day, on top of each member's own allowance. Only the named AdminUsers
+	// are exempt (when AdminUsers is empty, nobody is).
 	GroupLimits GroupLimits
 	// GroupCooldown is how long one person waits between requests in a group.
 	GroupCooldown time.Duration

@@ -24,6 +24,7 @@ func groupFixture(t *testing.T, cfg Config) *fixture {
 	}
 	fx := newFixture(t, cfg)
 	fx.bot.username = "EllieStudioBot"
+	fx.bot.tg.SetGroupPacing(time.Millisecond, 100, time.Minute) // keep tests fast
 	return fx
 }
 
@@ -472,5 +473,44 @@ func TestMentionCommand(t *testing.T) {
 		if cmd, args := mentionCommand(tc.rest, m); cmd != tc.cmd || args != tc.args {
 			t.Errorf("mentionCommand(%q) = %q %q, want %q %q", tc.rest, cmd, args, tc.cmd, tc.args)
 		}
+	}
+}
+
+func TestGroupExemptionsNeedANamedAdmin(t *testing.T) {
+	// With no ADMIN_USER_IDS every user counts as an admin in the private
+	// chat, but nobody may skip a group's shared limits or add the bot
+	// under GroupsAdmins.
+	fx := groupFixture(t, Config{AdminUsers: map[int64]bool{}, GroupLimits: GroupLimits{Chars: 4}, GroupMode: GroupsAdmins})
+	ctx := context.Background()
+	fx.bot.handleUpdate(ctx, joined(7, telegram.Chat{ID: testGroup, Type: "group"}))
+	if len(fx.tg.find("leaveChat")) != 1 {
+		t.Fatal("anyone could add the bot because no admins were named")
+	}
+
+	fx = groupFixture(t, Config{AdminUsers: map[int64]bool{}, GroupLimits: GroupLimits{Chars: 4}})
+	fx.bot.handleUpdate(ctx, gmsg(7, testGroup, "/say too long"))
+	if fx.ttsIn != nil {
+		t.Error("a member skipped the group's allowance because no admins were named")
+	}
+}
+
+func TestFloodingGroupDropsNewWork(t *testing.T) {
+	fx := groupFixture(t, Config{})
+	fx.bot.tg.SetGroupPacing(time.Hour, 1, time.Hour) // one send, then a long backlog
+	ctx := context.Background()
+	fx.bot.handleUpdate(ctx, gmsg(7, testGroup, "/say first"))
+	if fx.ttsIn == nil {
+		t.Fatal("the first request was refused")
+	}
+	fx.ttsIn = nil
+	before := fx.tg.count()
+	fx.bot.handleUpdate(ctx, gmsg(8, testGroup, "/say second"))
+	if fx.ttsIn != nil || fx.tg.count() != before {
+		t.Error("started work, or replied, in a group whose sends are backed up")
+	}
+	// Other groups are unaffected.
+	fx.bot.handleUpdate(ctx, gmsg(8, -2002, "/say elsewhere"))
+	if fx.ttsIn == nil {
+		t.Error("another group was held up")
 	}
 }

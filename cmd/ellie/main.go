@@ -118,6 +118,9 @@ func run(log *slog.Logger) error {
 	default:
 		return fmt.Errorf("GROUP_MODE must be %s, %s or %s, not %q", bot.GroupsOpen, bot.GroupsAdmins, bot.GroupsOff, groupMode)
 	}
+	if groupMode == bot.GroupsAdmins && len(admins) == 0 {
+		return errors.New("GROUP_MODE=admins needs ADMIN_USER_IDS: with no admins nobody could add the bot to a group")
+	}
 
 	b := bot.New(tg, ct, store, owners, chats, bot.Config{
 		AllowedUsers:   allowed,

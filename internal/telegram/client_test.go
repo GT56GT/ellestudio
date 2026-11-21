@@ -57,7 +57,7 @@ func TestLongFloodWaitIsReturned(t *testing.T) {
 
 func TestGroupSendsArePaced(t *testing.T) {
 	c := New("T", okServer(t).URL)
-	c.SetGroupPacing(100*time.Millisecond, 2)
+	c.SetGroupPacing(100*time.Millisecond, 2, time.Minute)
 	ctx := context.Background()
 	send := func(chat int64) {
 		t.Helper()
@@ -111,5 +111,41 @@ func TestMemberPresence(t *testing.T) {
 	}
 	if !(ChatMember{Status: "restricted", IsMember: true}).Present() || (ChatMember{Status: "restricted"}).Present() {
 		t.Error("restricted members are present only while is_member")
+	}
+}
+
+func TestFloodedGroupSendsFailFast(t *testing.T) {
+	c := New("T", okServer(t).URL)
+	c.SetGroupPacing(100*time.Millisecond, 1, 250*time.Millisecond)
+	ctx := context.Background()
+	errs := make(chan error, 6)
+	start := time.Now()
+	for range 6 {
+		go func() {
+			_, err := c.SendMessage(ctx, SendMessageParams{ChatID: -100, Text: "hi"})
+			errs <- err
+		}()
+	}
+	flood := 0
+	for range 6 {
+		if err := <-errs; errors.Is(err, ErrFlood) {
+			flood++
+		} else if err != nil {
+			t.Fatal(err)
+		}
+	}
+	// One goes at once and two wait 100ms and 200ms; the rest would wait
+	// past 250ms, so they fail instead of queueing.
+	if flood != 3 {
+		t.Errorf("%d of 6 sends failed with ErrFlood, want 3", flood)
+	}
+	if d := time.Since(start); d > 400*time.Millisecond {
+		t.Errorf("flooded sends were held for %v", d)
+	}
+	if b := c.Backlog(-100); b <= 0 {
+		t.Errorf("backlog = %v right after a flood", b)
+	}
+	if c.Backlog(42) != 0 {
+		t.Error("private chats have no backlog")
 	}
 }

@@ -63,8 +63,13 @@ func isGroupChat(id int64) bool { return id < 0 }
 
 // isOwner reports whether uid is one of the studio's named admins. Unlike
 // isAdmin it is false for everyone when no admins are configured, so it can
-// guard commands that affect every user.
+// guard commands and exemptions that affect other people: blocking groups,
+// adding the bot under GroupsAdmins, and skipping a group's shared limits.
 func (b *Bot) isOwner(uid int64) bool { return b.cfg.AdminUsers[uid] }
+
+// groupBacklogLimit is how far behind a group's sends may be before new
+// requests there are dropped unanswered (Telegram would reject the replies).
+const groupBacklogLimit = 6 * time.Second
 
 // ---------------------------------------------------------------- keyboards
 
@@ -332,7 +337,12 @@ func (b *Bot) groupTurn(ctx context.Context, m *telegram.Message) (done func(), 
 	chat, uid := m.Chat.ID, m.From.ID
 	key := chatUser{chat, uid}
 	now := time.Now()
-	exempt := b.isAdmin(uid)
+	exempt := b.isOwner(uid)
+	if !exempt && b.tg.Backlog(chat) > groupBacklogLimit {
+		// The group is flooding; don't start work whose answer can't be sent.
+		b.log.Warn("group request dropped, send backlog full", "chat", chat)
+		return nil, false
+	}
 
 	b.groupMu.Lock()
 	if cd := b.cfg.GroupCooldown; !exempt && cd > 0 {
@@ -381,9 +391,9 @@ func (b *Bot) groupTurn(ctx context.Context, m *telegram.Message) (done func(), 
 
 // spendGroup reserves chars and secs from the group's shared allowance (and
 // the all-groups total). On refusal it tells the group why and returns false.
-// Private chats and admins are not counted.
+// Private chats and named admins are not counted.
 func (b *Bot) spendGroup(ctx context.Context, m *telegram.Message, chars, secs int) bool {
-	if !isGroupChat(m.Chat.ID) || b.isAdmin(m.From.ID) {
+	if !isGroupChat(m.Chat.ID) || b.isOwner(m.From.ID) {
 		return true
 	}
 	err := b.chats.Spend(ctx, m.Chat.ID, today(), chars, secs, b.cfg.GroupLimits)
@@ -415,7 +425,7 @@ func (b *Bot) spendGroup(ctx context.Context, m *telegram.Message, chars, secs i
 
 // refundGroup returns usage to a group's allowance after a failed job.
 func (b *Bot) refundGroup(m *telegram.Message, chars, secs int) {
-	if !isGroupChat(m.Chat.ID) || b.isAdmin(m.From.ID) || (chars == 0 && secs == 0) {
+	if !isGroupChat(m.Chat.ID) || b.isOwner(m.From.ID) || (chars == 0 && secs == 0) {
 		return
 	}
 	// The job may have failed because ctx ended; the refund must still land.
@@ -434,7 +444,7 @@ func (b *Bot) refundAll(m *telegram.Message, chars, secs int) {
 
 // settleGroup corrects a group's audio reservation to the real length.
 func (b *Bot) settleGroup(m *telegram.Message, claimed int, actual float64) {
-	if actual <= 0 || !isGroupChat(m.Chat.ID) || b.isAdmin(m.From.ID) {
+	if actual <= 0 || !isGroupChat(m.Chat.ID) || b.isOwner(m.From.ID) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), pgTimeout)
@@ -522,7 +532,7 @@ func (b *Bot) onMembership(ctx context.Context, u *telegram.ChatMemberUpdated) {
 	case b.cfg.GroupMode == GroupsOff:
 		b.leaveGroup(ctx, c.ID, groupsOffText)
 		return
-	case b.cfg.GroupMode == GroupsAdmins && !b.isAdmin(u.From.ID):
+	case b.cfg.GroupMode == GroupsAdmins && !b.isOwner(u.From.ID):
 		b.leaveGroup(ctx, c.ID, groupsAdminsText)
 		return
 	}

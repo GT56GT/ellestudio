@@ -35,12 +35,18 @@ type Client struct {
 
 	// Group sends are paced to stay under Telegram's per-group flood limit
 	// (about 20 messages a minute): a burst of groupBurst, then one message
-	// every groupGap.
+	// every groupGap. A send that would wait longer than maxWait fails with
+	// ErrFlood instead of queueing, so a flood in one group can't tie up the
+	// caller's workers.
 	groupGap   time.Duration
 	groupBurst float64
+	maxWait    time.Duration
 	paceMu     sync.Mutex
 	buckets    map[int64]*bucket
 }
+
+// ErrFlood means a group already has as many sends queued as it may.
+var ErrFlood = errors.New("telegram: too many messages queued for this group")
 
 type bucket struct {
 	tokens float64
@@ -64,25 +70,22 @@ func New(token, apiURL string) *Client {
 		http:       &http.Client{},
 		groupGap:   3 * time.Second,
 		groupBurst: 5,
+		maxWait:    10 * time.Second,
 		buckets:    map[int64]*bucket{},
 	}
 }
 
-// SetGroupPacing changes how sends to groups are spaced (tests use a tiny gap).
-func (c *Client) SetGroupPacing(gap time.Duration, burst int) {
+// SetGroupPacing changes how sends to groups are spaced and how long one
+// may wait (tests use tiny values).
+func (c *Client) SetGroupPacing(gap time.Duration, burst int, maxWait time.Duration) {
 	c.paceMu.Lock()
 	defer c.paceMu.Unlock()
-	c.groupGap, c.groupBurst = gap, float64(max(burst, 1))
+	c.groupGap, c.groupBurst, c.maxWait = gap, float64(max(burst, 1)), maxWait
 }
 
-// pace waits for a send slot in a group or channel (negative chat IDs).
-// Private chats are not paced.
-func (c *Client) pace(ctx context.Context, chatID int64) error {
-	if chatID >= 0 {
-		return nil
-	}
-	c.paceMu.Lock()
-	now := time.Now()
+// refill tops a group's bucket up for the time since it was last used.
+// paceMu must be held.
+func (c *Client) refill(chatID int64, now time.Time) *bucket {
 	bk := c.buckets[chatID]
 	if bk == nil {
 		bk = &bucket{tokens: c.groupBurst, at: now}
@@ -90,11 +93,40 @@ func (c *Client) pace(ctx context.Context, chatID int64) error {
 	}
 	bk.tokens = min(c.groupBurst, bk.tokens+float64(now.Sub(bk.at))/float64(c.groupGap))
 	bk.at = now
-	bk.tokens--
-	var wait time.Duration
-	if bk.tokens < 0 {
-		wait = time.Duration(-bk.tokens * float64(c.groupGap))
+	return bk
+}
+
+// Backlog is how long a new send to chatID would wait (0 for private chats).
+func (c *Client) Backlog(chatID int64) time.Duration {
+	if chatID >= 0 {
+		return 0
 	}
+	c.paceMu.Lock()
+	defer c.paceMu.Unlock()
+	if bk := c.refill(chatID, time.Now()); bk.tokens < 1 {
+		return time.Duration((1 - bk.tokens) * float64(c.groupGap))
+	}
+	return 0
+}
+
+// pace waits for a send slot in a group or channel (negative chat IDs), or
+// fails with ErrFlood if the wait would pass maxWait. Private chats are not
+// paced.
+func (c *Client) pace(ctx context.Context, chatID int64) error {
+	if chatID >= 0 {
+		return nil
+	}
+	c.paceMu.Lock()
+	bk := c.refill(chatID, time.Now())
+	var wait time.Duration
+	if left := bk.tokens - 1; left < 0 {
+		wait = time.Duration(-left * float64(c.groupGap))
+	}
+	if wait > c.maxWait {
+		c.paceMu.Unlock()
+		return ErrFlood
+	}
+	bk.tokens--
 	if len(c.buckets) > 10000 { // forget idle groups
 		for id, o := range c.buckets {
 			if o.tokens >= c.groupBurst {
