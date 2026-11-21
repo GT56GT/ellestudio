@@ -205,11 +205,15 @@ type Message struct {
 	Document       *Document `json:"document"`
 	ReplyToMessage *Message  `json:"reply_to_message"`
 
-	MessageThreadID   int64 `json:"message_thread_id"`
-	IsTopicMessage    bool  `json:"is_topic_message"`
-	SenderChat        *Chat `json:"sender_chat"`
-	MigrateToChatID   int64 `json:"migrate_to_chat_id"`
-	MigrateFromChatID int64 `json:"migrate_from_chat_id"`
+	MessageThreadID int64 `json:"message_thread_id"`
+	IsTopicMessage  bool  `json:"is_topic_message"`
+	// EphemeralMessageID is set on ephemeral messages: commands only the bot
+	// can see, and the bot's private replies inside a group.
+	EphemeralMessageID int64 `json:"ephemeral_message_id"`
+	ReceiverUser       *User `json:"receiver_user"`
+	SenderChat         *Chat `json:"sender_chat"`
+	MigrateToChatID    int64 `json:"migrate_to_chat_id"`
+	MigrateFromChatID  int64 `json:"migrate_from_chat_id"`
 }
 
 // Thread is the forum topic the message belongs to (0 outside topics).
@@ -306,6 +310,44 @@ type File struct {
 type BotCommand struct {
 	Command     string `json:"command"`
 	Description string `json:"description"`
+	// IsEphemeral makes the command invisible to everyone but the bot, and
+	// lets the bot answer it privately inside a group.
+	IsEphemeral bool `json:"is_ephemeral,omitempty"`
+}
+
+// Ephemeral makes a message visible only to one member of a group. Telegram
+// accepts it within 15 seconds of the member's action: a button press
+// (CallbackQueryID) or an ephemeral command (the ReplyToEphemeral field of
+// the send).
+type Ephemeral struct {
+	ReceiverUserID  int64  // who sees it; leave 0 when answering a button press
+	CallbackQueryID string // the button press being answered
+	ReplaceMessage  bool   // show it in place of the pressed message
+}
+
+func (e *Ephemeral) param() map[string]any {
+	m := map[string]any{}
+	if e.ReceiverUserID != 0 {
+		m["receiver_user_id"] = e.ReceiverUserID
+	}
+	if e.CallbackQueryID != "" {
+		m["callback_query_id"] = e.CallbackQueryID
+	}
+	if e.ReplaceMessage {
+		m["replace_callback_query_message"] = true
+	}
+	return m
+}
+
+// replyParams builds reply_parameters for a send, or nil for none.
+func replyParams(replyTo, replyToEphemeral int64) map[string]any {
+	switch {
+	case replyToEphemeral != 0:
+		return map[string]any{"ephemeral_message_id": replyToEphemeral}
+	case replyTo != 0:
+		return map[string]any{"message_id": replyTo, "allow_sending_without_reply": true}
+	}
+	return nil
 }
 
 // Error is a Bot API failure ({"ok":false,...}).
@@ -428,6 +470,10 @@ type SendMessageParams struct {
 	ThreadID    int64 // forum topic, send only
 	ReplyMarkup any   // *InlineKeyboardMarkup or *ReplyKeyboardMarkup (edits: inline only)
 	NoPreview   bool
+	// Ephemeral sends the message to one member of a group only, and
+	// ReplyToEphemeral answers their ephemeral command (send only).
+	Ephemeral        *Ephemeral
+	ReplyToEphemeral int64
 }
 
 func (p SendMessageParams) payload() map[string]any {
@@ -440,8 +486,11 @@ func (p SendMessageParams) payload() map[string]any {
 	if p.ParseMode != "" {
 		m["parse_mode"] = p.ParseMode
 	}
-	if p.ReplyTo != 0 {
-		m["reply_parameters"] = map[string]any{"message_id": p.ReplyTo, "allow_sending_without_reply": true}
+	if rp := replyParams(p.ReplyTo, p.ReplyToEphemeral); rp != nil {
+		m["reply_parameters"] = rp
+	}
+	if p.Ephemeral != nil {
+		m["ephemeral_message_parameters"] = p.Ephemeral.param()
 	}
 	if hasMarkup(p.ReplyMarkup) {
 		m["reply_markup"] = p.ReplyMarkup
@@ -454,12 +503,59 @@ func (p SendMessageParams) payload() map[string]any {
 
 // SendMessage sends a text message.
 func (c *Client) SendMessage(ctx context.Context, p SendMessageParams) (*Message, error) {
-	if err := c.pace(ctx, p.ChatID); err != nil {
-		return nil, err
+	if p.Ephemeral == nil { // private replies don't add to the group's timeline
+		if err := c.pace(ctx, p.ChatID); err != nil {
+			return nil, err
+		}
 	}
 	var m Message
 	return &m, c.call(ctx, "sendMessage", p.payload(), &m)
 }
+
+// EphemeralEdit identifies an ephemeral message to edit.
+type EphemeralEdit struct {
+	ChatID      int64
+	UserID      int64 // who received it
+	EphemeralID int64
+	Text        string
+	ParseMode   string
+	ReplyMarkup *InlineKeyboardMarkup
+	NoPreview   bool
+}
+
+// EditEphemeralMessageText replaces the text and keyboard of an ephemeral
+// message. Telegram doesn't guarantee the member sees the edit.
+func (c *Client) EditEphemeralMessageText(ctx context.Context, e EphemeralEdit) error {
+	p := map[string]any{
+		"chat_id": e.ChatID, "receiver_user_id": e.UserID, "ephemeral_message_id": e.EphemeralID, "text": e.Text,
+	}
+	if e.ParseMode != "" {
+		p["parse_mode"] = e.ParseMode
+	}
+	if e.ReplyMarkup != nil {
+		p["reply_markup"] = e.ReplyMarkup
+	}
+	if e.NoPreview {
+		p["link_preview_options"] = map[string]any{"is_disabled": true}
+	}
+	return c.call(ctx, "editEphemeralMessageText", p, nil)
+}
+
+// DeleteEphemeralMessage removes an ephemeral message.
+func (c *Client) DeleteEphemeralMessage(ctx context.Context, chatID, userID, ephemeralID int64) error {
+	return c.call(ctx, "deleteEphemeralMessage", map[string]any{
+		"chat_id": chatID, "receiver_user_id": userID, "ephemeral_message_id": ephemeralID,
+	}, nil)
+}
+
+// GetChatMember returns a user's membership in a chat.
+func (c *Client) GetChatMember(ctx context.Context, chatID, userID int64) (*ChatMember, error) {
+	var m ChatMember
+	return &m, c.call(ctx, "getChatMember", map[string]any{"chat_id": chatID, "user_id": userID}, &m)
+}
+
+// IsAdmin reports whether the member runs the chat.
+func (m ChatMember) IsAdmin() bool { return m.Status == "creator" || m.Status == "administrator" }
 
 // EditMessageText replaces the text (and keyboard) of an existing message.
 func (c *Client) EditMessageText(ctx context.Context, p SendMessageParams) error {
@@ -491,6 +587,7 @@ const (
 	ScopeDefault      = "default"
 	ScopePrivateChats = "all_private_chats"
 	ScopeGroupChats   = "all_group_chats"
+	ScopeGroupAdmins  = "all_chat_administrators"
 )
 
 // SetMyCommands sets the command menu clients show in the given scope.
@@ -527,10 +624,13 @@ type MediaParams struct {
 	ChatID   int64
 	ReplyTo  int64
 	ThreadID int64 // forum topic
-	Caption  string
-	Filename string
-	Data     []byte
-	Title    string // sendAudio only
+	// Ephemeral and ReplyToEphemeral work as in SendMessageParams.
+	Ephemeral        *Ephemeral
+	ReplyToEphemeral int64
+	Caption          string
+	Filename         string
+	Data             []byte
+	Title            string // sendAudio only
 	// ReplyMarkup is an optional keyboard attached under the media.
 	ReplyMarkup any
 }
@@ -551,8 +651,10 @@ func (c *Client) SendDocument(ctx context.Context, p MediaParams) (*Message, err
 }
 
 func (c *Client) sendMedia(ctx context.Context, method, field string, p MediaParams) (*Message, error) {
-	if err := c.pace(ctx, p.ChatID); err != nil {
-		return nil, err
+	if p.Ephemeral == nil {
+		if err := c.pace(ctx, p.ChatID); err != nil {
+			return nil, err
+		}
 	}
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
@@ -566,9 +668,13 @@ func (c *Client) sendMedia(ctx context.Context, method, field string, p MediaPar
 	if p.Title != "" {
 		_ = w.WriteField("title", p.Title)
 	}
-	if p.ReplyTo != 0 {
-		rp, _ := json.Marshal(map[string]any{"message_id": p.ReplyTo, "allow_sending_without_reply": true})
-		_ = w.WriteField("reply_parameters", string(rp))
+	if rp := replyParams(p.ReplyTo, p.ReplyToEphemeral); rp != nil {
+		raw, _ := json.Marshal(rp)
+		_ = w.WriteField("reply_parameters", string(raw))
+	}
+	if p.Ephemeral != nil {
+		raw, _ := json.Marshal(p.Ephemeral.param())
+		_ = w.WriteField("ephemeral_message_parameters", string(raw))
 	}
 	if hasMarkup(p.ReplyMarkup) {
 		rm, err := json.Marshal(p.ReplyMarkup)

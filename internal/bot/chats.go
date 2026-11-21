@@ -26,6 +26,20 @@ const (
 	chatLeft   = "left"   // the bot left or was removed
 )
 
+// GroupSettings are the choices a group's own admins make. The zero value
+// is the default: everything on, for everyone, within the studio's limits.
+type GroupSettings struct {
+	Paused       bool `json:"paused,omitempty"`        // Ellie ignores requests
+	AdminsOnly   bool `json:"admins_only,omitempty"`   // only group admins may use it
+	NoSpeak      bool `json:"no_speak,omitempty"`      // /say is off
+	NoTranscribe bool `json:"no_transcribe,omitempty"` // /transcribe is off
+	// DailyChars lowers the group's shared daily allowance (0 = the
+	// studio's). It can never raise it.
+	DailyChars int `json:"daily_chars,omitempty"`
+	// MaxChars lowers the longest text one /say may read (0 = the studio's).
+	MaxChars int `json:"max_chars,omitempty"`
+}
+
 // ChatInfo is one group in the registry.
 type ChatInfo struct {
 	ID      int64  `json:"id"`
@@ -37,6 +51,8 @@ type ChatInfo struct {
 	Day     string `json:"day"` // UTC day the usage counts belong to
 	Chars   int    `json:"chars"`
 	Secs    int    `json:"secs"`
+
+	Settings GroupSettings `json:"settings"`
 }
 
 // usageOn returns the counts for day (zero when they belong to another day).
@@ -91,6 +107,8 @@ type Chats interface {
 	Upsert(ctx context.Context, c ChatInfo) error
 	// SetBlocked blocks or unblocks a group, creating it if needed.
 	SetBlocked(ctx context.Context, id int64, blocked bool) error
+	// SetSettings saves a group's own settings, creating it if needed.
+	SetSettings(ctx context.Context, id int64, s GroupSettings) error
 	// Spend adds usage to a group and to the all-groups total, or refuses
 	// with errGroupLimit / errGroupsLimit and changes nothing.
 	Spend(ctx context.Context, id int64, day string, chars, secs int, lim GroupLimits) error
@@ -110,6 +128,9 @@ func merge(dst *ChatInfo, src ChatInfo) {
 	dst.Status = orDefault(dst.Status, src.Status)
 	if dst.AddedBy == 0 {
 		dst.AddedBy = src.AddedBy
+	}
+	if dst.Settings == (GroupSettings{}) {
+		dst.Settings = src.Settings
 	}
 	switch {
 	case dst.Day == src.Day:
@@ -198,6 +219,15 @@ func (f *fileChats) SetBlocked(_ context.Context, id int64, blocked bool) error 
 	return f.change(func(rows map[int64]ChatInfo) error {
 		cur := rows[id]
 		cur.ID, cur.Blocked = id, blocked
+		rows[id] = cur
+		return nil
+	})
+}
+
+func (f *fileChats) SetSettings(_ context.Context, id int64, gs GroupSettings) error {
+	return f.change(func(rows map[int64]ChatInfo) error {
+		cur := rows[id]
+		cur.ID, cur.Settings = id, gs
 		rows[id] = cur
 		return nil
 	})

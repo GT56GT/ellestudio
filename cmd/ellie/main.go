@@ -141,6 +141,7 @@ func run(log *slog.Logger) error {
 		},
 		GroupCooldown:    time.Duration(envLimit("GROUP_COOLDOWN_SECONDS", 10)) * time.Second,
 		GroupConcurrency: envInt("GROUP_CONCURRENCY", 2),
+		GroupNoticeTTL:   time.Duration(envLimit("GROUP_NOTICE_SECONDS", 45)) * time.Second,
 	}, log)
 	log.Info("Ellie Studio starting", "cartesia_version", cartesia.APIVersion, "default_voice", store.Defaults().VoiceName)
 	return b.Run(ctx)

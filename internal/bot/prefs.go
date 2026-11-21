@@ -561,13 +561,7 @@ func (b *Bot) usageScreen(ctx context.Context, uid int64) screen {
 
 func (b *Bot) handleCallback(ctx context.Context, q *telegram.CallbackQuery) {
 	if q.Message != nil && isGroupChat(q.Message.Chat.ID) {
-		// Group messages carry no callback buttons; one from an older
-		// message must not act on (or show) anyone's private settings.
-		if link := b.startLink("studio"); link != "" {
-			_ = b.tg.AnswerCallbackQueryURL(ctx, q.ID, link)
-		} else {
-			_ = b.tg.AnswerCallbackQuery(ctx, q.ID, "Open Ellie Studio in a private chat to use the buttons.")
-		}
+		b.handleGroupCallback(ctx, q)
 		return
 	}
 	if !b.allowed(q.From.ID) {
@@ -578,12 +572,19 @@ func (b *Bot) handleCallback(ctx context.Context, q *telegram.CallbackQuery) {
 		_ = b.tg.AnswerCallbackQuery(ctx, q.ID, "")
 		return
 	}
+	b.dispatchCallback(ctx, q)
+}
+
+// dispatchCallback runs a button. In a group it is reached only for the
+// buttons handleGroupCallback allows, and only inside a private view.
+func (b *Bot) dispatchCallback(ctx context.Context, q *telegram.CallbackQuery) {
 	uid := q.From.ID
 	kind, val, _ := strings.Cut(q.Data, ":")
 	ack := func(text string) { _ = b.tg.AnswerCallbackQuery(ctx, q.ID, text) }
 	// Any button other than Cancel or one that starts a guided step leaves
 	// the step, so a later text message is never mistaken for its answer.
-	if kind != "cancel" && !(kind == "do" && contains([]string{"search", "clone", "newdict", "rename", "voiceid"}, val)) {
+	// (Group presses leave private steps alone: those never run in groups.)
+	if !isGroupChat(q.Message.Chat.ID) && kind != "cancel" && !(kind == "do" && contains([]string{"search", "clone", "newdict", "rename", "voiceid"}, val)) {
 		b.clearFlow(uid)
 	}
 	// as is a message stand-in so speech handlers can answer in this chat.

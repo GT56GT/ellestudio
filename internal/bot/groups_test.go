@@ -11,8 +11,9 @@ import (
 )
 
 const (
-	testGroup = int64(-1001)
-	owner     = int64(1) // the studio admin in group tests
+	testGroup  = int64(-1001)
+	owner      = int64(1) // the studio admin in group tests
+	groupAdmin = int64(5) // an admin of the test group (not of the studio)
 )
 
 // groupFixture is a fixture whose bot knows its username, with user 7 an
@@ -40,14 +41,24 @@ func replyTo(u telegram.Update, to *telegram.Message) telegram.Update {
 	return u
 }
 
-// callbackButtons reports whether any recorded call carried a callback button.
+// callbackButtons reports whether any public message carried a button that
+// acts on someone's settings. Only "gm:" and "gs:" may appear there: they act
+// for whoever presses them, in a view only that person sees. Ephemeral
+// (private) sends are skipped.
 func (f *fakeTelegram) callbackButtons() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, c := range f.calls {
+		if c.JSON["ephemeral_message_parameters"] != nil || c.Form["ephemeral_message_parameters"] != "" ||
+			strings.HasPrefix(c.Method, "editEphemeral") {
+			continue
+		}
 		raw, _ := json.Marshal(c.JSON["reply_markup"])
-		if strings.Contains(string(raw), "callback_data") || strings.Contains(c.Form["reply_markup"], "callback_data") {
-			return true
+		markup := string(raw) + c.Form["reply_markup"]
+		for _, part := range strings.Split(markup, `"callback_data":"`)[1:] {
+			if !strings.HasPrefix(part, "gm:") && !strings.HasPrefix(part, "gs:") {
+				return true
+			}
 		}
 	}
 	return false
@@ -133,7 +144,7 @@ func TestGroupPrivateFeaturesLinkToThePrivateChat(t *testing.T) {
 	fx := groupFixture(t, Config{})
 	ctx := context.Background()
 	for cmd, link := range map[string]string{
-		"/voices": "start=voices", "/clone": "start=clone", "/rename x": "start=studio", "/deletevoice": "start=studio",
+		"/voices": "gm:voices", "/style": "gm:style", "/clone": "start=clone", "/rename x": "start=studio", "/deletevoice": "start=studio",
 	} {
 		before := len(fx.tg.find("sendMessage"))
 		fx.bot.handleUpdate(ctx, gmsg(7, testGroup, cmd))
@@ -142,7 +153,7 @@ func TestGroupPrivateFeaturesLinkToThePrivateChat(t *testing.T) {
 			t.Fatalf("%s: want one reply, got %d", cmd, len(sent)-before)
 		}
 		raw, _ := json.Marshal(sent[len(sent)-1].JSON["reply_markup"])
-		if !strings.Contains(string(raw), "t.me/EllieStudioBot?start=") || !strings.Contains(string(raw), link) {
+		if !strings.Contains(string(raw), "t.me/EllieStudioBot") || !strings.Contains(string(raw), link) {
 			t.Errorf("%s: markup = %s, want a %s link", cmd, raw, link)
 		}
 	}
@@ -512,5 +523,283 @@ func TestFloodingGroupDropsNewWork(t *testing.T) {
 	fx.bot.handleUpdate(ctx, gmsg(8, -2002, "/say elsewhere"))
 	if fx.ttsIn == nil {
 		t.Error("another group was held up")
+	}
+}
+
+// ephemeral is a command only the bot can see.
+func ephemeral(uid int64, text string) telegram.Update {
+	u := gmsg(uid, testGroup, text)
+	u.Message.EphemeralMessageID = 77
+	return u
+}
+
+// pressIn is a button press in the test group: on a private view when
+// private, else on a public message.
+func pressIn(uid int64, data string, private bool) telegram.Update {
+	u := press(uid, data)
+	u.CallbackQuery.Message.Chat = telegram.Chat{ID: testGroup, Type: "supergroup"}
+	if private {
+		u.CallbackQuery.Message.EphemeralMessageID = 88
+	}
+	return u
+}
+
+func (f *fakeTelegram) last(method string) tgCall {
+	calls := f.find(method)
+	if len(calls) == 0 {
+		return tgCall{}
+	}
+	return calls[len(calls)-1]
+}
+
+func TestEphemeralCommandsAnswerPrivately(t *testing.T) {
+	fx := groupFixture(t, Config{})
+	fx.bot.handleUpdate(context.Background(), ephemeral(7, "/voices"))
+	c := fx.tg.last("sendMessage")
+	eph, _ := c.JSON["ephemeral_message_parameters"].(map[string]any)
+	reply, _ := c.JSON["reply_parameters"].(map[string]any)
+	if eph["receiver_user_id"] != float64(7) || reply["ephemeral_message_id"] != float64(77) {
+		t.Fatalf("not a private reply to the command: %v", c.JSON)
+	}
+	if raw, _ := json.Marshal(c.JSON["reply_markup"]); !strings.Contains(string(raw), `"v:v-new"`) {
+		t.Errorf("the private voice picker has no voice buttons: %s", raw)
+	}
+	if fx.tg.callbackButtons() {
+		t.Error("a public message carried private buttons")
+	}
+
+	fx.bot.handleUpdate(context.Background(), ephemeral(7, "/say hello"))
+	if fx.ttsIn != nil || !strings.Contains(fx.tg.lastText(), "Only you can see that") {
+		t.Errorf("a private /say should explain, not speak: tts=%v text=%q", fx.ttsIn, fx.tg.lastText())
+	}
+}
+
+func TestPrivateViewButtonsActForThePresser(t *testing.T) {
+	fx := groupFixture(t, Config{})
+	ctx := context.Background()
+	fx.bot.handleUpdate(ctx, pressIn(7, "v:v-new", true))
+	if got := fx.bot.store.Get(7).VoiceID; got != "v-new" {
+		t.Fatalf("voice = %q, want v-new", got)
+	}
+	e := fx.tg.last("editEphemeralMessageText")
+	if e.JSON["receiver_user_id"] != float64(7) || e.JSON["ephemeral_message_id"] != float64(88) {
+		t.Errorf("the private view wasn't redrawn for its owner: %v", e.JSON)
+	}
+	if len(fx.tg.find("editMessageText")) != 0 || len(fx.tg.find("sendMessage")) != 0 {
+		t.Error("a private choice showed up publicly")
+	}
+
+	fx.bot.handleUpdate(ctx, pressIn(7, "e:calm", true))
+	if fx.bot.store.Get(7).Emotion != "calm" {
+		t.Error("style buttons don't work in a private view")
+	}
+}
+
+func TestPrivateViewsSendBigActionsToThePrivateChat(t *testing.T) {
+	fx := groupFixture(t, Config{})
+	ctx := context.Background()
+	for _, data := range []string{"dv:v-mine", "dvy:v-mine", "rn:v-mine", "sh:v-mine", "do:sample", "do:clone", "nav:dicts", "reset", "loc:british"} {
+		before := len(fx.tg.find("editEphemeralMessageText"))
+		fx.bot.handleUpdate(ctx, pressIn(7, data, true))
+		ack := fx.tg.last("answerCallbackQuery")
+		if url, _ := ack.JSON["url"].(string); !strings.Contains(url, "t.me/EllieStudioBot") {
+			t.Errorf("%s: should open the private chat, got %v", data, ack.JSON)
+		}
+		if len(fx.tg.find("editEphemeralMessageText")) != before {
+			t.Errorf("%s: ran inside the group", data)
+		}
+	}
+	if fx.ttsIn != nil || len(fx.deleted) != 0 || fx.cloned {
+		t.Error("a private-chat action ran in the group")
+	}
+}
+
+func TestMyVoiceButtonOpensAPrivateView(t *testing.T) {
+	fx := groupFixture(t, Config{})
+	fx.bot.handleUpdate(context.Background(), pressIn(8, "gm:home", false))
+	c := fx.tg.last("sendMessage")
+	eph, _ := c.JSON["ephemeral_message_parameters"].(map[string]any)
+	if eph["callback_query_id"] != "cb" || eph["replace_callback_query_message"] != nil {
+		t.Fatalf("not a private answer to the press: %v", c.JSON)
+	}
+	if text, _ := c.JSON["text"].(string); !strings.Contains(text, "Only you can see this") || !strings.Contains(text, "Ellie") {
+		t.Errorf("menu = %q", text)
+	}
+	if raw, _ := json.Marshal(c.JSON["reply_markup"]); strings.Contains(string(raw), "gs:open") {
+		t.Error("a member who doesn't run the group was offered its settings")
+	}
+	fx.bot.handleUpdate(context.Background(), pressIn(groupAdmin, "gm:home", false))
+	if raw, _ := json.Marshal(fx.tg.last("sendMessage").JSON["reply_markup"]); !strings.Contains(string(raw), "gs:open") {
+		t.Error("the group's admin wasn't offered its settings")
+	}
+}
+
+func TestPreviewPlaysPrivately(t *testing.T) {
+	fx := groupFixture(t, Config{})
+	fx.bot.handleUpdate(context.Background(), pressIn(7, "p:v-secret", true))
+	a := fx.tg.last("sendAudio")
+	if !strings.Contains(a.Form["ephemeral_message_parameters"], `"callback_query_id":"cb"`) || string(a.File) != "ID3-preview" {
+		t.Fatalf("preview not sent privately: %+v", a.Form)
+	}
+}
+
+func TestGroupSettingsNeedAGroupAdmin(t *testing.T) {
+	fx := groupFixture(t, Config{})
+	ctx := context.Background()
+	fx.bot.handleUpdate(ctx, ephemeral(7, "/groupsettings"))
+	if !strings.Contains(fx.tg.lastText(), "Only group admins") {
+		t.Errorf("a member opened the group settings: %q", fx.tg.lastText())
+	}
+	fx.bot.handleUpdate(ctx, pressIn(7, "gs:pause", true))
+	if c, _, _ := fx.bot.chats.Get(ctx, testGroup); c.Settings.Paused {
+		t.Fatal("a member paused the group")
+	}
+	if ack := fx.tg.last("answerCallbackQuery"); !strings.Contains(ack.JSON["text"].(string), "Only this group's admins") {
+		t.Errorf("ack = %v", ack.JSON)
+	}
+	fx.bot.handleUpdate(ctx, ephemeral(groupAdmin, "/groupsettings"))
+	if !strings.Contains(fx.tg.lastText(), "Group settings") {
+		t.Errorf("the group's admin couldn't open the settings: %q", fx.tg.lastText())
+	}
+}
+
+func TestGroupAdminControls(t *testing.T) {
+	fx := groupFixture(t, Config{})
+	ctx := context.Background()
+	set := func(button string) GroupSettings {
+		t.Helper()
+		fx.bot.handleUpdate(ctx, pressIn(groupAdmin, "gs:"+button, true))
+		c, _, _ := fx.bot.chats.Get(ctx, testGroup)
+		return c.Settings
+	}
+	say := func(uid int64) bool {
+		fx.ttsIn = nil
+		fx.bot.handleUpdate(ctx, gmsg(uid, testGroup, "/say hi"))
+		return fx.ttsIn != nil
+	}
+
+	if gs := set("pause"); !gs.Paused {
+		t.Fatal("pause didn't stick")
+	}
+	notices := len(fx.tg.find("sendMessage"))
+	if say(7) || say(7) {
+		t.Fatal("spoke while paused")
+	}
+	if n := len(fx.tg.find("sendMessage")) - notices; n != 1 {
+		t.Errorf("want one 'paused' notice for repeated requests, got %d", n)
+	}
+	set("pause")
+
+	set("who")
+	if say(7) {
+		t.Error("a member spoke in an admins-only group")
+	}
+	if !say(groupAdmin) {
+		t.Error("the group's admin couldn't speak in an admins-only group")
+	}
+	set("who")
+
+	set("speak")
+	if say(7) {
+		t.Error("spoke with speaking turned off")
+	}
+	note := &telegram.Message{MessageID: 4, Voice: &telegram.Voice{FileID: "f1", Duration: 3, FileSize: 16}}
+	fx.bot.handleUpdate(ctx, replyTo(gmsg(8, testGroup, "/transcribe"), note))
+	if fx.sttIn == nil {
+		t.Error("turning speaking off stopped transcribing too")
+	}
+	set("speak")
+	if !say(7) {
+		t.Error("speaking didn't come back on")
+	}
+}
+
+func TestGroupAdminLowersLimits(t *testing.T) {
+	fx := groupFixture(t, Config{GroupLimits: GroupLimits{Chars: 3000}})
+	ctx := context.Background()
+	fx.bot.handleUpdate(ctx, pressIn(groupAdmin, "gs:cap", true))
+	if c, _, _ := fx.bot.chats.Get(ctx, testGroup); c.Settings.DailyChars != 2500 {
+		t.Fatalf("allowance preset = %d, want 2500", c.Settings.DailyChars)
+	}
+	if err := fx.bot.chats.SetSettings(ctx, testGroup, GroupSettings{DailyChars: 4}); err != nil {
+		t.Fatal(err)
+	}
+	fx.bot.handleUpdate(ctx, gmsg(7, testGroup, "/say hello"))
+	if fx.ttsIn != nil || !strings.Contains(fx.tg.lastText(), "daily allowance is used up") {
+		t.Errorf("the group's own allowance wasn't applied: %q", fx.tg.lastText())
+	}
+	if err := fx.bot.chats.SetSettings(ctx, testGroup, GroupSettings{MaxChars: 3}); err != nil {
+		t.Fatal(err)
+	}
+	fx.bot.handleUpdate(ctx, gmsg(7, testGroup, "/say hello"))
+	if fx.ttsIn != nil || !strings.Contains(fx.tg.lastText(), "a lot of text") {
+		t.Errorf("the group's longest message wasn't applied: %q", fx.tg.lastText())
+	}
+	// Private chats keep the studio's limits.
+	fx.bot.handleUpdate(ctx, msg(7, "hello"))
+	if fx.ttsIn == nil {
+		t.Error("a group's limits leaked into the private chat")
+	}
+}
+
+func TestPresetsNeverRaiseTheStudiosLimit(t *testing.T) {
+	for _, tc := range []struct{ cur, ceiling, want int }{
+		{0, 3000, 2500}, {2500, 3000, 1000}, {500, 3000, 0},
+		{0, 1000, 500}, {500, 1000, 0}, {0, 100, 0}, {0, 0, 2500}, {777, 3000, 0},
+	} {
+		if got := nextPreset(tc.cur, dailyPresets, tc.ceiling); got != tc.want {
+			t.Errorf("nextPreset(%d, ceiling %d) = %d, want %d", tc.cur, tc.ceiling, got, tc.want)
+		}
+	}
+	if effCap(5000, 0) != 5000 || effCap(5000, 1000) != 1000 || effCap(5000, 9000) != 5000 || effCap(0, 1000) != 1000 {
+		t.Error("effCap must pick the tighter limit")
+	}
+}
+
+func TestGroupLimitNoticeKeepsNumbersPrivate(t *testing.T) {
+	fx := groupFixture(t, Config{DailyChars: 3})
+	fx.bot.handleUpdate(context.Background(), gmsg(7, testGroup, "/say hello"))
+	c := fx.tg.last("sendMessage")
+	if text, _ := c.JSON["text"].(string); strings.Contains(text, "You've used <b>") {
+		t.Errorf("usage shown to the whole group: %q", text)
+	}
+	if raw, _ := json.Marshal(c.JSON["reply_markup"]); !strings.Contains(string(raw), "gm:studio") {
+		t.Errorf("no private way to see the allowance: %s", raw)
+	}
+}
+
+func TestGroupNoticesTidyThemselvesAway(t *testing.T) {
+	fx := groupFixture(t, Config{GroupNoticeTTL: 10 * time.Millisecond})
+	fx.bot.handleUpdate(context.Background(), gmsg(7, testGroup, "/say"))
+	deadline := time.Now().Add(2 * time.Second)
+	for len(fx.tg.find("deleteMessage")) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the hint was never deleted")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if d := fx.tg.find("deleteMessage")[0]; d.JSON["chat_id"] != float64(testGroup) {
+		t.Errorf("deleted in the wrong chat: %v", d.JSON)
+	}
+}
+
+func TestGroupCommandMenus(t *testing.T) {
+	private := map[string]bool{}
+	for _, c := range GroupCommands {
+		private[c.Command] = c.IsEphemeral
+	}
+	if private["say"] || private["transcribe"] {
+		t.Error("/say and /transcribe must be public so the group hears them")
+	}
+	if !private["voices"] || !private["style"] || !private["help"] {
+		t.Errorf("personal commands must be private: %v", private)
+	}
+	if len(GroupAdminCommands) != len(GroupCommands)+1 || GroupAdminCommands[len(GroupAdminCommands)-1].Command != "groupsettings" {
+		t.Error("the admin menu should add /groupsettings")
+	}
+	for _, c := range GroupCommands {
+		if c.Command == "groupsettings" {
+			t.Error("members' menu lists /groupsettings")
+		}
 	}
 }

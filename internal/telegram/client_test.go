@@ -149,3 +149,38 @@ func TestFloodedGroupSendsFailFast(t *testing.T) {
 		t.Error("private chats have no backlog")
 	}
 }
+
+func TestEphemeralPayloads(t *testing.T) {
+	p := SendMessageParams{ChatID: -1, Text: "x", ReplyTo: 9, ReplyToEphemeral: 77,
+		Ephemeral: &Ephemeral{ReceiverUserID: 7}}.payload()
+	rp := p["reply_parameters"].(map[string]any)
+	if rp["ephemeral_message_id"] != int64(77) || rp["message_id"] != nil || rp["allow_sending_without_reply"] != nil {
+		t.Errorf("a reply to an ephemeral command must name only the ephemeral message: %v", rp)
+	}
+	if e := p["ephemeral_message_parameters"].(map[string]any); e["receiver_user_id"] != int64(7) || len(e) != 1 {
+		t.Errorf("ephemeral parameters = %v", e)
+	}
+	cb := (&Ephemeral{CallbackQueryID: "q1", ReplaceMessage: true}).param()
+	if cb["callback_query_id"] != "q1" || cb["replace_callback_query_message"] != true || cb["receiver_user_id"] != nil {
+		t.Errorf("callback ephemeral = %v", cb)
+	}
+}
+
+func TestEphemeralSendsAreNotPaced(t *testing.T) {
+	c := New("T", okServer(t).URL)
+	c.SetGroupPacing(time.Hour, 1, time.Hour)
+	ctx := context.Background()
+	if _, err := c.SendMessage(ctx, SendMessageParams{ChatID: -100, Text: "public"}); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	for range 3 {
+		if _, err := c.SendMessage(ctx, SendMessageParams{ChatID: -100, Text: "private",
+			Ephemeral: &Ephemeral{CallbackQueryID: "q"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if d := time.Since(start); d > 100*time.Millisecond {
+		t.Errorf("private replies waited behind the group's public queue: %v", d)
+	}
+}

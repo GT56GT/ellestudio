@@ -165,5 +165,5 @@ func (b *Bot) end(uid int64) {
 
 func (b *Bot) busyNotice(ctx context.Context, m *telegram.Message) {
 	s := noticeScreen(icWait, "One moment", "I'm still working on your last request. Send this again once it arrives.")
-	b.replyHTML(ctx, m, s.text, s.kb)
+	b.replyNotice(ctx, m, s)
 }

@@ -296,16 +296,15 @@ func (b *Bot) lastTranscript(uid int64) string {
 
 func (b *Bot) speak(ctx context.Context, m *telegram.Message, text string) {
 	uid := m.From.ID
-	if n := utf8.RuneCountInString(text); n > b.cfg.MaxTTSChars {
+	if n, limit := utf8.RuneCountInString(text), b.maxChars(ctx, m); n > limit {
 		s := noticeScreen(icWarn, "That's a lot of text", fmt.Sprintf(
-			"It's <b>%d</b> characters. I can read up to <b>%d</b> at a time, so split it into smaller messages.", n, b.cfg.MaxTTSChars))
-		b.replyHTML(ctx, m, s.text, s.kb)
+			"It's <b>%d</b> characters. I can read up to <b>%d</b> at a time, so split it into smaller messages.", n, limit))
+		b.replyNotice(ctx, m, s)
 		return
 	}
 	s := b.store.Get(uid)
 	if s.VoiceID == "" {
-		ns := noVoiceScreen()
-		b.replyHTML(ctx, m, ns.text, ns.kb)
+		b.replyNotice(ctx, m, noVoiceScreen())
 		return
 	}
 
@@ -334,8 +333,7 @@ func (b *Bot) speak(ctx context.Context, m *telegram.Message, text string) {
 	defer b.end(uid)
 	chars := utf8.RuneCountInString(text)
 	if ok, u := b.spendChars(uid, chars); !ok {
-		ls := b.limitScreen(true, u, chars)
-		b.replyHTML(ctx, m, ls.text, ls.kb)
+		b.refuseLimit(ctx, m, true, u, chars)
 		return
 	}
 	if !b.spendGroup(ctx, m, chars, 0) {
@@ -445,8 +443,7 @@ func (b *Bot) reserveAudio(ctx context.Context, m *telegram.Message, a audioRef,
 		secs = min(secs, capSecs)
 	}
 	if ok, u := b.spendSecs(m.From.ID, secs); !ok {
-		ls := b.limitScreen(false, u, secs)
-		b.replyHTML(ctx, m, ls.text, ls.kb)
+		b.refuseLimit(ctx, m, false, u, secs)
 		return 0, false
 	}
 	if !b.spendGroup(ctx, m, 0, secs) {

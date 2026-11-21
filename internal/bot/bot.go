@@ -58,6 +58,9 @@ type Config struct {
 	GroupCooldown time.Duration
 	// GroupConcurrency caps the jobs running at once in one group.
 	GroupConcurrency int
+	// GroupNoticeTTL is how long short group notices (hints, cooldowns,
+	// refusals) stay before the bot deletes them. 0 keeps them.
+	GroupNoticeTTL time.Duration
 }
 
 // Bot is the running studio.
@@ -82,9 +85,11 @@ type Bot struct {
 	username string            // the bot's @username, for share links
 
 	groupMu    sync.Mutex
-	lastUse    map[chatUser]time.Time // last accepted request per person per group
-	lastNotice map[chatUser]time.Time // last cooldown reminder per person per group
-	groupJobs  map[int64]int          // jobs running per group
+	lastUse    map[chatUser]time.Time  // last accepted request per person per group
+	lastNotice map[chatUser]time.Time  // last cooldown reminder per person per group
+	groupJobs  map[int64]int           // jobs running per group
+	adminCache map[chatUser]adminEntry // who runs each group, briefly cached
+	noticeAt   map[noticeKey]time.Time // last reminder of each kind per member
 }
 
 // recent remembers what a user last heard or transcribed.
@@ -134,6 +139,8 @@ func New(tg *telegram.Client, ct *cartesia.Client, store *Store, owners Owners, 
 		lastUse:       map[chatUser]time.Time{},
 		lastNotice:    map[chatUser]time.Time{},
 		groupJobs:     map[int64]int{},
+		adminCache:    map[chatUser]adminEntry{},
+		noticeAt:      map[noticeKey]time.Time{},
 	}
 }
 
@@ -172,6 +179,7 @@ func (b *Bot) Run(ctx context.Context) error {
 		{telegram.ScopeDefault, Commands},
 		{telegram.ScopePrivateChats, Commands},
 		{telegram.ScopeGroupChats, GroupCommands},
+		{telegram.ScopeGroupAdmins, GroupAdminCommands},
 	} {
 		if err := b.tg.SetMyCommands(ctx, c.cmds, c.scope); err != nil {
 			b.log.Warn("setMyCommands failed", "scope", c.scope, "err", err)
@@ -343,6 +351,10 @@ func (b *Bot) sendScreenTo(ctx context.Context, chatID, thread, replyTo int64, s
 // to replace).
 func (b *Bot) show(ctx context.Context, q *telegram.CallbackQuery, s screen) {
 	m := q.Message
+	if isGroupChat(m.Chat.ID) {
+		b.showPrivately(ctx, q, s) // only the presser sees their screens
+		return
+	}
 	if m.Voice != nil || m.Audio != nil || m.Document != nil || m.VideoNote != nil {
 		b.sendScreen(ctx, m.Chat.ID, 0, s)
 		return

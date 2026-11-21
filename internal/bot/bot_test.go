@@ -63,8 +63,15 @@ func (f *fakeTelegram) handler(t *testing.T) http.HandlerFunc {
 		switch method {
 		case "getFile":
 			result = `{"file_id":"f1","file_size":16,"file_path":"voice/file_1.oga"}`
-		case "sendChatAction", "answerCallbackQuery", "editMessageText", "setMyCommands":
+		case "sendChatAction", "answerCallbackQuery", "editMessageText", "setMyCommands",
+			"editEphemeralMessageText", "deleteEphemeralMessage", "deleteMessage", "leaveChat":
 			result = `true`
+		case "getChatMember":
+			status := "member"
+			if c.JSON["user_id"] == float64(groupAdmin) {
+				status = "administrator"
+			}
+			result = `{"status":"` + status + `","user":{"id":1}}`
 		}
 		_, _ = io.WriteString(w, `{"ok":true,"result":`+result+`}`)
 	}
@@ -171,6 +178,9 @@ func newFixture(t *testing.T, cfg Config) *fixture {
 			_, _ = io.WriteString(w, `{"data":[{"id":"sonic-3.6","capability":"tts","supported_languages":["en","fr"]},{"id":"ink-whisper","capability":"stt"}]}`)
 		case "/pronunciation-dicts/":
 			_, _ = io.WriteString(w, `{"data":[],"has_more":false}`)
+		case "/p.mp3":
+			w.Header().Set("Content-Type", "audio/mpeg")
+			_, _ = io.WriteString(w, "ID3-preview")
 		case "/":
 			_, _ = io.WriteString(w, `{"ok":true,"version":"2026-08-14"}`)
 		default:

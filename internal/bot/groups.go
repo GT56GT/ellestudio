@@ -42,12 +42,20 @@ const (
 	GroupsOff    = "off"    // nobody; the bot leaves
 )
 
-// GroupCommands is the command menu Telegram shows in groups.
+// GroupCommands is the command menu Telegram shows in groups. The
+// ephemeral ones are invisible to the rest of the group and get a reply only
+// the sender can see.
 var GroupCommands = []telegram.BotCommand{
 	{Command: "say", Description: "Speak text in your voice, or reply to a message"},
 	{Command: "transcribe", Description: "Reply to a voice note to write it down"},
-	{Command: "help", Description: "How Ellie works in groups"},
+	{Command: "voices", Description: "Pick your voice (only you see this)", IsEphemeral: true},
+	{Command: "style", Description: "Emotion, speed and language (only you see this)", IsEphemeral: true},
+	{Command: "help", Description: "How Ellie works in groups (only you see this)", IsEphemeral: true},
 }
+
+// GroupAdminCommands is the group menu for the group's own admins.
+var GroupAdminCommands = append(append([]telegram.BotCommand{}, GroupCommands...),
+	telegram.BotCommand{Command: "groupsettings", Description: "Ellie's settings for this group (only you see this)", IsEphemeral: true})
 
 // deepLinks are /start payloads that open a screen in the private chat.
 var deepLinks = map[string]bool{
@@ -85,16 +93,30 @@ func (b *Bot) startLink(payload string) string {
 	return link
 }
 
-// groupKeys is the only keyboard a group message carries: a link into the
-// private chat.
-func (b *Bot) groupKeys(label, payload string) *telegram.InlineKeyboardMarkup {
-	link := b.startLink(orDefault(payload, "studio"))
-	if link == "" {
+// menuLabels name the private views a "gm:<view>" button opens.
+var menuLabels = map[string]string{
+	"home":   "🎛 My voice & style",
+	"voices": "🎧 Pick my voice",
+	"voice":  "🎧 My voice",
+	"style":  icStyle + " My style",
+	"studio": "🎟 My allowance",
+}
+
+// groupKeys is the keyboard a public group message carries: a button that
+// shows whoever presses it their own settings, privately (menu, "" for
+// none), and a link into the private chat.
+func (b *Bot) groupKeys(menu, label, payload string) *telegram.InlineKeyboardMarkup {
+	k := &keys{}
+	if menu != "" {
+		k.row(btn(menuLabels[menu], "gm:"+menu))
+	}
+	if link := b.startLink(orDefault(payload, "studio")); link != "" {
+		k.row(telegram.InlineKeyboardButton{Text: orDefault(label, "💬 Private chat"), URL: link})
+	}
+	if len(k.rows) == 0 {
 		return nil
 	}
-	return &telegram.InlineKeyboardMarkup{InlineKeyboard: [][]telegram.InlineKeyboardButton{
-		{{Text: orDefault(label, icStudio+" Open Ellie Studio"), URL: link}},
-	}}
+	return k.build()
 }
 
 func hasCallbacks(kb *telegram.InlineKeyboardMarkup) bool {
@@ -108,13 +130,28 @@ func hasCallbacks(kb *telegram.InlineKeyboardMarkup) bool {
 	return false
 }
 
-// inlineFor adapts an inline keyboard to the chat: groups get a link into
-// the private chat in place of callback buttons.
+// inlineFor adapts an inline keyboard for a public message: in a group,
+// buttons that act on one person's settings are replaced by groupKeys, whose
+// menu button opens each presser's own settings privately. Private views
+// (ephemeral messages) are sent with their full keyboards instead.
 func (b *Bot) inlineFor(chatID int64, kb *telegram.InlineKeyboardMarkup) *telegram.InlineKeyboardMarkup {
-	if !isGroupChat(chatID) || kb == nil || !hasCallbacks(kb) {
+	if !isGroupChat(chatID) || kb == nil || !hasCallbacks(kb) || publicSafe(kb) {
 		return kb
 	}
-	return b.groupKeys("", "")
+	return b.groupKeys("home", "", "")
+}
+
+// publicSafe reports whether every callback button on kb is one a group
+// message may carry: "gm:" and "gs:" act only for the person who presses.
+func publicSafe(kb *telegram.InlineKeyboardMarkup) bool {
+	for _, row := range kb.InlineKeyboard {
+		for _, k := range row {
+			if d := k.CallbackData; d != "" && !strings.HasPrefix(d, "gm:") && !strings.HasPrefix(d, "gs:") {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // markupFor is inlineFor for any keyboard; groups never get the reply
@@ -208,26 +245,44 @@ func (b *Bot) handleGroupMessage(ctx context.Context, m *telegram.Message) {
 		cmd, args = mentionCommand(rest, m)
 	}
 
-	if ok, err := b.admitGroup(ctx, m.Chat); err != nil {
+	info, ok, err := b.admitGroup(ctx, m.Chat)
+	if err != nil {
 		b.log.Error("group registry unavailable", "chat", m.Chat.ID, "err", err)
 		b.replyHTML(ctx, m, errorScreen(storageError{err}).text, nil)
 		return
 	} else if !ok {
 		return
 	}
+	gs := info.Settings
+	ctx = withGroupSettings(ctx, gs)
 	uid := m.From.ID
 	if !b.allowed(uid) {
 		s := noticeScreen(icLock, "Ellie Studio is private", "Only people the studio owner added can use it.")
-		b.replyHTML(ctx, m, s.text, nil)
+		if m.EphemeralMessageID != 0 {
+			b.replyPrivately(ctx, m, s)
+		} else {
+			b.groupNotice(ctx, m, s, nil)
+		}
+		return
+	}
+	if m.EphemeralMessageID != 0 {
+		b.ephemeralCommand(ctx, m, cmd, args)
+		return
+	}
+	if !b.groupMayRun(ctx, m, cmd, gs) {
 		return
 	}
 
 	switch cmd {
 	case "start", "help":
-		s := b.groupHelpScreen()
+		s := b.groupHelpScreen(gs)
 		b.replyHTML(ctx, m, s.text, s.kb)
 	case "say", "speak":
 		b.groupSpeak(ctx, m, args)
+	case "voices", "myvoices", "voice", "style", "menu", "settings", "studio", "home":
+		b.offerMenu(ctx, m, cmd)
+	case "groupsettings":
+		b.offerGroupSettings(ctx, m)
 	case "transcribe":
 		a, ok := audioOf(m)
 		if !ok {
@@ -235,13 +290,13 @@ func (b *Bot) handleGroupMessage(ctx context.Context, m *telegram.Message) {
 		}
 		if !ok {
 			s := noticeScreen(icListen, "Transcribe", "Reply <code>/transcribe</code> to a voice note or audio file and I'll write it down.")
-			b.replyHTML(ctx, m, s.text, nil)
+			b.groupNotice(ctx, m, s, nil)
 			return
 		}
 		b.groupTranscribe(ctx, m, a)
 	case "cancel":
 		s := noticeScreen(icOK, "Nothing to cancel", "Requests here finish on their own.")
-		b.replyHTML(ctx, m, s.text, nil)
+		b.groupNotice(ctx, m, s, nil)
 	case "blockgroup":
 		if !b.isOwner(uid) {
 			b.privateOnly(ctx, m, cmd)
@@ -282,12 +337,15 @@ func (b *Bot) privateOnly(ctx context.Context, m *telegram.Message, cmd string) 
 	if deepLinks[cmd] {
 		payload = cmd
 	}
-	s := noticeScreen(icLock, "Let's do that in private",
-		"Your voices, style and settings live in our private chat, so they stay yours. Tap below and I'll open it there.")
-	b.replyHTML(ctx, m, s.text, b.groupKeys(icStudio+" Continue in private chat", payload))
+	b.groupNotice(ctx, m, privateOnlyScreen(), b.groupKeys("", icStudio+" Continue in private chat", payload))
 }
 
-func (b *Bot) groupHelpScreen() screen {
+func privateOnlyScreen() screen {
+	return noticeScreen(icLock, "Let's do that in private",
+		"Cloning, dictionaries and managing your voices live in our private chat, so they stay yours. Tap below and I'll open it there.")
+}
+
+func (b *Bot) groupHelpScreen(gs GroupSettings) screen {
 	text := header("👥", "Ellie Studio in groups", "") +
 		"• <code>/say your text</code>: I'll say it in <b>your</b> voice\n" +
 		"• Reply <code>/say</code> to a message: I'll read it aloud\n" +
@@ -295,11 +353,12 @@ func (b *Bot) groupHelpScreen() screen {
 	if b.username != "" {
 		text += "• Or mention me: <code>@" + html.EscapeString(b.username) + " your text</code>\n"
 	}
-	text += "\n🎛 Everyone picks their own voice and style in our private chat, and keeps their own daily allowance."
-	if l := b.cfg.GroupLimits; l.Chars > 0 {
-		text += "\n🎟 This group shares <b>" + fmtInt(l.Chars) + "</b> spoken characters a day."
+	text += "\n🎛 Everyone has their own voice, style and daily allowance. Tap <b>My voice &amp; style</b>, or send " +
+		"<code>/voices</code> or <code>/style</code> from the command menu, to change yours. Only you will see it."
+	if c := effCap(b.cfg.GroupLimits.Chars, gs.DailyChars); c > 0 {
+		text += "\n🎟 This group shares <b>" + fmtInt(c) + "</b> spoken characters a day."
 	}
-	return screen{text, b.groupKeys("", "")}
+	return screen{text, b.groupKeys("home", "", "")}
 }
 
 // ---------------------------------------------------------------- jobs
@@ -311,7 +370,7 @@ func (b *Bot) groupSpeak(ctx context.Context, m *telegram.Message, args string) 
 	}
 	if text == "" {
 		s := noticeScreen(icStudio, "Say something", "Send <code>/say your text</code>, or reply <code>/say</code> to a message and I'll read it aloud.")
-		b.replyHTML(ctx, m, s.text, nil)
+		b.groupNotice(ctx, m, s, nil)
 		return
 	}
 	done, ok := b.groupTurn(ctx, m)
@@ -355,15 +414,17 @@ func (b *Bot) groupTurn(ctx context.Context, m *telegram.Message) (done func(), 
 			if notify {
 				wait := int((cd - since + time.Second - 1) / time.Second)
 				s := noticeScreen(icWait, "One moment", fmt.Sprintf("You can send your next request in <b>%ds</b>.", wait))
-				b.replyHTML(ctx, m, s.text, nil)
+				b.groupNotice(ctx, m, s, nil)
 			}
 			return nil, false
 		}
 	}
 	if n := b.cfg.GroupConcurrency; n > 0 && b.groupJobs[chat] >= n {
 		b.groupMu.Unlock()
-		s := noticeScreen(icWait, "I'm a bit busy here", "I'm already working on a few requests in this group. Try again in a moment.")
-		b.replyHTML(ctx, m, s.text, nil)
+		if b.noticeDue(chat, uid, "busy", b.cfg.GroupCooldown) {
+			s := noticeScreen(icWait, "I'm a bit busy here", "I'm already working on a few requests in this group. Try again in a moment.")
+			b.groupNotice(ctx, m, s, nil)
+		}
 		return nil, false
 	}
 	b.groupJobs[chat]++
@@ -396,14 +457,14 @@ func (b *Bot) spendGroup(ctx context.Context, m *telegram.Message, chars, secs i
 	if !isGroupChat(m.Chat.ID) || b.isOwner(m.From.ID) {
 		return true
 	}
-	err := b.chats.Spend(ctx, m.Chat.ID, today(), chars, secs, b.cfg.GroupLimits)
+	l := b.groupLimits(ctx)
+	err := b.chats.Spend(ctx, m.Chat.ID, today(), chars, secs, l)
 	if err == nil {
 		return true
 	}
 	var s screen
 	switch {
 	case errors.Is(err, errGroupLimit):
-		l := b.cfg.GroupLimits
 		what := fmtInt(l.Chars) + " spoken characters"
 		if secs > 0 {
 			what = fmtMinutes(l.Secs) + " of transcription"
@@ -417,9 +478,10 @@ func (b *Bot) spendGroup(ctx context.Context, m *telegram.Message, chars, secs i
 				"</b> (midnight UTC). You can still use Ellie in our private chat.")
 	default:
 		b.log.Error("group allowance unavailable", "chat", m.Chat.ID, "err", err)
-		s = errorScreen(storageError{err})
+		b.replyHTML(ctx, m, errorScreen(storageError{err}).text, nil)
+		return false
 	}
-	b.replyHTML(ctx, m, s.text, b.groupKeys("", ""))
+	b.groupNotice(ctx, m, s, b.groupKeys("", "", ""))
 	return false
 }
 
@@ -466,31 +528,32 @@ func (b *Bot) settleGroup(m *telegram.Message, claimed int, actual float64) {
 // admitGroup checks that the bot may work in a group, recording groups it
 // meets for the first time. It leaves blocked groups, and groups it may not
 // be in under the current GroupMode.
-func (b *Bot) admitGroup(ctx context.Context, c telegram.Chat) (bool, error) {
+func (b *Bot) admitGroup(ctx context.Context, c telegram.Chat) (ChatInfo, bool, error) {
 	info, found, err := b.chats.Get(ctx, c.ID)
 	if err != nil {
-		return false, err
+		return ChatInfo{}, false, err
 	}
 	switch {
 	case found && info.Blocked:
 		b.leaveGroup(ctx, c.ID, "")
-		return false, nil
+		return info, false, nil
 	case b.cfg.GroupMode == GroupsOff:
 		b.leaveGroup(ctx, c.ID, groupsOffText)
-		return false, nil
+		return info, false, nil
 	case found && info.Status == chatMember:
-		return true, nil
+		return info, true, nil
 	case b.cfg.GroupMode == GroupsAdmins:
 		// Someone other than an admin added the bot, or it joined before
 		// the registry existed; either way no admin vouched for this group.
 		b.leaveGroup(ctx, c.ID, groupsAdminsText)
-		return false, nil
+		return info, false, nil
 	}
 	if err := b.chats.Upsert(ctx, ChatInfo{ID: c.ID, Type: c.Type, Title: c.Title, Status: chatMember}); err != nil {
-		return false, err
+		return ChatInfo{}, false, err
 	}
 	b.log.Info("group registered", "chat", c.ID)
-	return true, nil
+	info.ID, info.Status = c.ID, chatMember
+	return info, true, nil
 }
 
 const (
@@ -540,7 +603,7 @@ func (b *Bot) onMembership(ctx context.Context, u *telegram.ChatMemberUpdated) {
 		b.log.Error("group not registered", "chat", c.ID, "err", err)
 	}
 	b.log.Info("added to group", "chat", c.ID, "by", u.From.ID)
-	s := b.groupHelpScreen()
+	s := b.groupHelpScreen(info.Settings)
 	s.text = "👋 <b>Hi everyone, I'm Ellie!</b> I turn text into lifelike speech.\n\n" + s.text
 	b.sendScreen(ctx, c.ID, 0, s)
 }
@@ -599,6 +662,9 @@ func (b *Bot) groupsScreen(ctx context.Context) screen {
 		}
 		fmt.Fprintf(&sb, "• <b>%s</b>%s\n  <code>%d</code> · %s chars · %s\n",
 			html.EscapeString(orDefault(c.Title, "Untitled group")), flag, c.ID, fmtInt(c.Chars), fmtMinutes(c.Secs))
+		if d := describeGroupSettings(c.Settings); d != "" {
+			sb.WriteString("  <i>" + html.EscapeString(d) + "</i>\n")
+		}
 	}
 	sb.WriteString("\n<i>/blockgroup &lt;id&gt; stops a group; /unblockgroup &lt;id&gt; lets it back.</i>")
 	return screen{sb.String(), nav}

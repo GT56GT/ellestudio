@@ -56,6 +56,8 @@ var migrations = []string{
 		updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 	);
 	CREATE INDEX ellie_chats_by_usage ON ellie_chats (usage_day, chars DESC) WHERE chat_id <> 0`,
+	// 4: each group's own settings, chosen by its admins ('{}' = defaults).
+	`ALTER TABLE ellie_chats ADD COLUMN settings JSONB NOT NULL DEFAULT '{}'`,
 }
 
 // migrationLock is the advisory lock key ("ellie") that serialises
@@ -282,24 +284,62 @@ type pgChats struct {
 	total int64 // the row that sums every group (allGroups; tests use their own)
 }
 
-const chatCols = `chat_id, type, title, status, blocked, added_by, usage_day, chars, secs`
+const chatCols = `chat_id, type, title, status, blocked, added_by, usage_day, chars, secs, settings`
 
-func chatDest(c *ChatInfo) []any {
-	return []any{&c.ID, &c.Type, &c.Title, &c.Status, &c.Blocked, &c.AddedBy, &c.Day, &c.Chars, &c.Secs}
+// chatRow scans one ellie_chats row; settings arrive as raw JSON.
+type chatRow struct {
+	c   ChatInfo
+	raw []byte
+}
+
+func (r *chatRow) dest() []any {
+	c := &r.c
+	return []any{&c.ID, &c.Type, &c.Title, &c.Status, &c.Blocked, &c.AddedBy, &c.Day, &c.Chars, &c.Secs, &r.raw}
+}
+
+// info decodes the row. Unknown settings fields are ignored, so an older
+// build can read what a newer one saved.
+func (r *chatRow) info() (ChatInfo, error) {
+	c := r.c
+	c.Settings = GroupSettings{}
+	if len(r.raw) > 0 {
+		if err := json.Unmarshal(r.raw, &c.Settings); err != nil {
+			return ChatInfo{}, fmt.Errorf("chat %d settings: %w", c.ID, err)
+		}
+	}
+	return c, nil
 }
 
 func (p pgChats) Get(ctx context.Context, id int64) (ChatInfo, bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, pgTimeout)
 	defer cancel()
-	var c ChatInfo
-	err := p.pool.QueryRow(ctx, `SELECT `+chatCols+` FROM ellie_chats WHERE chat_id = $1`, id).Scan(chatDest(&c)...)
+	var r chatRow
+	err := p.pool.QueryRow(ctx, `SELECT `+chatCols+` FROM ellie_chats WHERE chat_id = $1`, id).Scan(r.dest()...)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		return ChatInfo{}, false, nil
 	case err != nil:
 		return ChatInfo{}, false, fmt.Errorf("database: get chat: %w", err)
 	}
+	c, err := r.info()
+	if err != nil {
+		return ChatInfo{}, false, fmt.Errorf("database: get chat: %w", err)
+	}
 	return c, true, nil
+}
+
+func (p pgChats) SetSettings(ctx context.Context, id int64, gs GroupSettings) error {
+	raw, err := json.Marshal(gs)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, pgTimeout)
+	defer cancel()
+	if _, err := p.pool.Exec(ctx, `INSERT INTO ellie_chats (chat_id, settings) VALUES ($1, $2::jsonb)
+		ON CONFLICT (chat_id) DO UPDATE SET settings = EXCLUDED.settings, updated_at = now()`, id, string(raw)); err != nil {
+		return fmt.Errorf("database: save group settings: %w", err)
+	}
+	return nil
 }
 
 func (p pgChats) Upsert(ctx context.Context, c ChatInfo) error {
@@ -343,8 +383,12 @@ func lockChats(ctx context.Context, tx pgx.Tx, ids ...int64) (map[int64]ChatInfo
 		return nil, err
 	}
 	out := map[int64]ChatInfo{}
-	var c ChatInfo
-	_, err = pgx.ForEachRow(rows, chatDest(&c), func() error { out[c.ID] = c; return nil })
+	var r chatRow
+	_, err = pgx.ForEachRow(rows, r.dest(), func() error {
+		c, err := r.info()
+		out[c.ID] = c
+		return err
+	})
 	return out, err
 }
 
@@ -409,9 +453,13 @@ func (p pgChats) Migrate(ctx context.Context, from, to int64) error {
 		dst := rows[to]
 		merge(&dst, rows[from])
 		dst.Type = "supergroup"
+		raw, err := json.Marshal(dst.Settings)
+		if err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `UPDATE ellie_chats SET type = $2, title = $3, status = $4, blocked = $5, added_by = $6,
-			usage_day = $7, chars = $8, secs = $9, updated_at = now() WHERE chat_id = $1`,
-			dst.ID, dst.Type, dst.Title, dst.Status, dst.Blocked, dst.AddedBy, dst.Day, dst.Chars, dst.Secs); err != nil {
+			usage_day = $7, chars = $8, secs = $9, settings = $10::jsonb, updated_at = now() WHERE chat_id = $1`,
+			dst.ID, dst.Type, dst.Title, dst.Status, dst.Blocked, dst.AddedBy, dst.Day, dst.Chars, dst.Secs, string(raw)); err != nil {
 			return err
 		}
 		_, err = tx.Exec(ctx, `DELETE FROM ellie_chats WHERE chat_id = $1`, from)
@@ -433,8 +481,12 @@ func (p pgChats) Busiest(ctx context.Context, day string, n int) ([]ChatInfo, er
 		return nil, fmt.Errorf("database: busiest chats: %w", err)
 	}
 	var out []ChatInfo
-	var c ChatInfo
-	if _, err := pgx.ForEachRow(rows, chatDest(&c), func() error { out = append(out, c); return nil }); err != nil {
+	var r chatRow
+	if _, err := pgx.ForEachRow(rows, r.dest(), func() error {
+		c, err := r.info()
+		out = append(out, c)
+		return err
+	}); err != nil {
 		return nil, fmt.Errorf("database: busiest chats: %w", err)
 	}
 	return out, nil

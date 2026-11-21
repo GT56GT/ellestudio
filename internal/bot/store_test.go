@@ -296,14 +296,28 @@ func exerciseChats(t *testing.T, c Chats, g1, g2, g3 int64, day, next string) {
 	if err := c.SetBlocked(ctx, g2, true); err != nil {
 		t.Fatal(err)
 	}
+	gs := GroupSettings{Paused: true, AdminsOnly: true, NoTranscribe: true, DailyChars: 1000, MaxChars: 200}
+	if err := c.SetSettings(ctx, g2, gs); err != nil {
+		t.Fatal(err)
+	}
+	// Recording the group again must not reset its settings or block.
+	if err := c.Upsert(ctx, ChatInfo{ID: g2, Title: "Renamed", Status: chatMember}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _, _ := c.Get(ctx, g2); got.Settings != gs || !got.Blocked || got.Title != "Renamed" {
+		t.Errorf("settings or block lost on upsert: %+v", got)
+	}
 	if err := c.Migrate(ctx, g2, g3); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok, _ := c.Get(ctx, g2); ok {
 		t.Error("the old ID survived the migration")
 	}
-	if got, ok, _ := c.Get(ctx, g3); !ok || !got.Blocked || got.Chars != 60 || got.Type != "supergroup" {
-		t.Errorf("migration lost the block or usage: %+v", got)
+	if got, ok, _ := c.Get(ctx, g3); !ok || !got.Blocked || got.Chars != 60 || got.Type != "supergroup" || got.Settings != gs {
+		t.Errorf("migration lost the block, usage or settings: %+v", got)
+	}
+	if got, _, _ := c.Get(ctx, g1); got.Settings != (GroupSettings{}) {
+		t.Errorf("another group's settings leaked: %+v", got.Settings)
 	}
 	if err := c.Migrate(ctx, g2, g3); err != nil {
 		t.Errorf("migrating again is a no-op, got %v", err)
