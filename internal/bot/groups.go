@@ -635,7 +635,7 @@ func (b *Bot) blockGroup(ctx context.Context, chatID int64) error {
 
 // groupsScreen lists today's busiest groups for the studio owner.
 func (b *Bot) groupsScreen(ctx context.Context) screen {
-	nav := (&keys{}).nav("", "").build()
+	nav := (&keys{}).nav("Admin", "nav:admin").build()
 	day := today()
 	top, err := b.chats.Busiest(ctx, day, 10)
 	if err != nil {

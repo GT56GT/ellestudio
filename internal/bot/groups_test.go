@@ -803,3 +803,54 @@ func TestGroupCommandMenus(t *testing.T) {
 		}
 	}
 }
+
+func TestAdminScreenIsOnlyForStudioAdmins(t *testing.T) {
+	fx := groupFixture(t, Config{})
+	ctx := context.Background()
+	fx.bot.handleUpdate(ctx, msg(owner, "/admin"))
+	text := fx.tg.lastText()
+	if !strings.Contains(text, "Admin") || !strings.Contains(text, "Cartesia admin key") || !strings.Contains(text, "/blockgroup") {
+		t.Fatalf("admin screen = %q", text)
+	}
+	raw, _ := json.Marshal(fx.tg.last("sendMessage").JSON["reply_markup"])
+	if !strings.Contains(string(raw), "nav:groups") || !strings.Contains(string(raw), "nav:usage") {
+		t.Errorf("admin buttons = %s", raw)
+	}
+	fx.bot.handleUpdate(ctx, press(owner, "nav:groups"))
+	if !strings.Contains(fx.tg.lastText(), "Groups today") {
+		t.Errorf("Groups button opened %q", fx.tg.lastText())
+	}
+
+	fx.bot.handleUpdate(ctx, msg(7, "/admin"))
+	if !strings.Contains(fx.tg.lastText(), "Unknown command") {
+		t.Errorf("a member saw %q", fx.tg.lastText())
+	}
+	for _, data := range []string{"nav:admin", "nav:groups"} {
+		fx.bot.handleUpdate(ctx, press(7, data))
+		if text := fx.tg.lastText(); strings.Contains(text, "Cartesia admin key") || strings.Contains(text, "Groups today") {
+			t.Errorf("%s: a member reached the admin tools: %q", data, text)
+		}
+	}
+}
+
+func TestAdminCommandMenuIsOnlyForAdmins(t *testing.T) {
+	fx := groupFixture(t, Config{})
+	fx.bot.setCommands(context.Background())
+	adminMenus := 0
+	for _, c := range fx.tg.find("setMyCommands") {
+		raw, _ := json.Marshal(c.JSON["commands"])
+		hasAdmin := strings.Contains(string(raw), `"command":"admin"`)
+		scope, _ := c.JSON["scope"].(map[string]any)
+		if scope["type"] == "chat" {
+			if scope["chat_id"] != float64(owner) || !hasAdmin {
+				t.Errorf("per-admin menu = %v", c.JSON)
+			}
+			adminMenus++
+		} else if hasAdmin {
+			t.Errorf("/admin is in a menu everyone sees: %v", scope)
+		}
+	}
+	if adminMenus != 1 {
+		t.Errorf("want one admin menu, got %d", adminMenus)
+	}
+}

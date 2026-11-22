@@ -89,7 +89,7 @@ Add the bot to any group or supergroup. Keep **privacy mode on** in @BotFather (
 - **Telegram's flood limits are respected:** sends to a group are paced to about 20 a minute (a burst of 5, then one every 3 seconds), and short "retry after" waits from Telegram are sat out and retried automatically. If a group floods the bot, sends that would wait more than 10 seconds are dropped, and new requests there are ignored until it catches up, so one busy group never slows down other chats.
 - **Forum topics:** replies stay in the topic they were asked in.
 - **Who can add the bot:** `GROUP_MODE=open` (anyone, the default), `admins` (only `ADMIN_USER_IDS`, which must then be set; the bot leaves groups anyone else adds) or `off` (the bot leaves every group).
-- **Your controls (admins, in the private chat):** `/groups` shows today's busiest groups, their own settings, and the totals, `/blockgroup <id>` makes the bot leave a group for good, `/unblockgroup <id>` lets it back. `/blockgroup` sent inside a group blocks that group.
+- **Your controls (admins, in the private chat):** `/admin` gathers them in one screen (and appears only in admins' own command menus). `/groups` shows today's busiest groups, their own settings, and the totals, `/blockgroup <id>` makes the bot leave a group for good, `/unblockgroup <id>` lets it back. `/blockgroup` sent inside a group blocks that group.
 - When the bot joins it posts a short how-to. When a group is upgraded to a supergroup (its ID changes), its record, block and today's usage move with it.
 
 ## What it does

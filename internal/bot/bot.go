@@ -155,6 +155,34 @@ var Commands = []telegram.BotCommand{
 	{Command: "cancel", Description: "Stop what you're doing"},
 }
 
+// AdminCommands is the private-chat menu for the studio's admins.
+var AdminCommands = append(append([]telegram.BotCommand{}, Commands...),
+	telegram.BotCommand{Command: "admin", Description: "Studio admin tools"})
+
+// setCommands publishes the command menus: one for private chats, one for
+// groups, one for group admins, and one per studio admin with /admin.
+func (b *Bot) setCommands(ctx context.Context) {
+	for _, c := range []struct {
+		scope string
+		cmds  []telegram.BotCommand
+	}{
+		{telegram.ScopeDefault, Commands},
+		{telegram.ScopePrivateChats, Commands},
+		{telegram.ScopeGroupChats, GroupCommands},
+		{telegram.ScopeGroupAdmins, GroupAdminCommands},
+	} {
+		if err := b.tg.SetMyCommands(ctx, c.cmds, c.scope); err != nil {
+			b.log.Warn("setMyCommands failed", "scope", c.scope, "err", err)
+		}
+	}
+	for uid := range b.cfg.AdminUsers {
+		// Fails harmlessly ("chat not found") until the admin has started the bot.
+		if err := b.tg.SetMyCommandsForChat(ctx, AdminCommands, uid); err != nil {
+			b.log.Warn("admin command menu not set", "admin", uid, "err", err)
+		}
+	}
+}
+
 // Profile texts shown in Telegram before the first /start.
 const (
 	botDescription = "🎙 Ellie Studio turns your text into lifelike speech and your voice notes into text.\n\n" +
@@ -172,19 +200,7 @@ func (b *Bot) Run(ctx context.Context) error {
 	}
 	b.username = me.Username
 	b.log.Info("connected to Telegram", "bot", "@"+me.Username)
-	for _, c := range []struct {
-		scope string
-		cmds  []telegram.BotCommand
-	}{
-		{telegram.ScopeDefault, Commands},
-		{telegram.ScopePrivateChats, Commands},
-		{telegram.ScopeGroupChats, GroupCommands},
-		{telegram.ScopeGroupAdmins, GroupAdminCommands},
-	} {
-		if err := b.tg.SetMyCommands(ctx, c.cmds, c.scope); err != nil {
-			b.log.Warn("setMyCommands failed", "scope", c.scope, "err", err)
-		}
-	}
+	b.setCommands(ctx)
 	if err := b.tg.SetMyDescription(ctx, botDescription); err != nil {
 		b.log.Warn("setMyDescription failed", "err", err)
 	}

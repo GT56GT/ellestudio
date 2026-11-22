@@ -599,6 +599,14 @@ func (c *Client) SetMyCommands(ctx context.Context, cmds []BotCommand, scope str
 	return c.call(ctx, "setMyCommands", p, nil)
 }
 
+// SetMyCommandsForChat sets the command menu shown in one chat (for a
+// private chat, the chat ID is the user's ID).
+func (c *Client) SetMyCommandsForChat(ctx context.Context, cmds []BotCommand, chatID int64) error {
+	return c.call(ctx, "setMyCommands", map[string]any{
+		"commands": cmds, "scope": map[string]any{"type": "chat", "chat_id": chatID},
+	}, nil)
+}
+
 // LeaveChat removes the bot from a group.
 func (c *Client) LeaveChat(ctx context.Context, chatID int64) error {
 	return c.call(ctx, "leaveChat", map[string]any{"chat_id": chatID}, nil)

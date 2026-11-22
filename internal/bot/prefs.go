@@ -212,6 +212,12 @@ func (b *Bot) command(ctx context.Context, m *telegram.Message, cmd, args string
 		send(b.statusScreen(ctx))
 	case "usage":
 		send(b.usageScreen(ctx, uid))
+	case "admin":
+		if !b.isOwner(uid) {
+			b.command(ctx, m, "unknown", "")
+			return
+		}
+		send(b.adminScreen(ctx))
 	case "groups", "blockgroup", "unblockgroup":
 		if !b.isOwner(uid) {
 			b.command(ctx, m, "unknown", "")
@@ -507,6 +513,36 @@ func parseDict(args string) (string, []cartesia.PronunciationItem, error) {
 	return name, items, nil
 }
 
+// adminScreen gathers the studio admin's tools in one place.
+func (b *Bot) adminScreen(ctx context.Context) screen {
+	key := "✅ set"
+	if !b.ct.HasAdminKey() {
+		key = "❌ missing (set CARTESIA_ADMIN_KEY)"
+	}
+	var sb strings.Builder
+	sb.WriteString(header("🛠", "Admin", "Only studio admins see this"))
+	sb.WriteString(field("🔑", "Cartesia admin key", key))
+	sb.WriteString(field("👥", "Who can add Ellie to groups", orDefault(b.cfg.GroupMode, GroupsOpen)))
+	if total, _, err := b.chats.Get(ctx, allGroups); err == nil {
+		c, s := total.usageOn(today())
+		sb.WriteString(field("📊", "All groups today", fmtInt(c)+" characters · "+fmtMinutes(s)+" transcribed"))
+	} else {
+		b.log.Warn("group totals unavailable", "err", err)
+	}
+	sb.WriteString(field("🎟", "Each user per day", fmtInt(b.cfg.DailyChars)+" characters · "+fmtMinutes(b.cfg.DailyAudioSecs)+" transcribed"))
+	sb.WriteString("\n<b>Commands</b>\n" +
+		"/usage · Cartesia credit usage\n" +
+		"/groups · today's busiest groups and their settings\n" +
+		"/blockgroup <code>id</code> · make Ellie leave a group for good\n" +
+		"/unblockgroup <code>id</code> · let a group add Ellie again\n" +
+		"/status · service status")
+	k := (&keys{}).
+		row(btn("📈 Usage", "nav:usage"), btn("👥 Groups", "nav:groups")).
+		row(btn("📊 Service status", "nav:status")).
+		nav("", "")
+	return screen{sb.String(), k.build()}
+}
+
 func (b *Bot) statusScreen(ctx context.Context) screen {
 	info, err := b.ct.Status(ctx)
 	if err != nil {
@@ -756,6 +792,14 @@ func (b *Bot) navScreen(ctx context.Context, uid int64, name string) screen {
 		return b.statusScreen(ctx)
 	case "usage":
 		return b.usageScreen(ctx, uid)
+	case "admin", "groups":
+		if !b.isOwner(uid) {
+			return b.homeScreen(uid)
+		}
+		if name == "groups" {
+			return b.groupsScreen(ctx)
+		}
+		return b.adminScreen(ctx)
 	case "reset":
 		return resetScreen()
 	}
