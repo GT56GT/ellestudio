@@ -30,6 +30,19 @@ const guestDeadline = 30 * time.Second
 // guestStatus marks chats known only from guest mentions.
 const guestStatus = "guest"
 
+// GUEST_ACCESS values: who may use the bot through guest mentions.
+const (
+	GuestMembers  = "members"  // people who have used the private chat (default)
+	GuestEveryone = "everyone" // anyone
+)
+
+// join records that uid uses the private chat, which admits them to guest mode.
+func (b *Bot) join(uid int64) {
+	if err := b.store.Join(uid); err != nil {
+		b.log.Warn("save joined", "user", uid, "err", err)
+	}
+}
+
 func (b *Bot) handleGuest(ctx context.Context, m *telegram.Message) {
 	if m.GuestQueryID == "" || m.From == nil || m.From.IsBot {
 		return
@@ -170,6 +183,10 @@ func (b *Bot) guestRefusal(ctx context.Context, m *telegram.Message, text string
 	switch {
 	case !b.allowed(uid):
 		return noticeScreen(icWarn, "Ellie is private", "This studio is open to invited people only."), true
+	case b.cfg.GuestAccess != GuestEveryone && !b.isOwner(uid) && !b.store.Get(uid).Joined:
+		return noticeScreen(icStudio, "Start Ellie first",
+			"I read out loud in other chats for people who use Ellie Studio. "+
+				"Tap the button below, press <b>Start</b>, then mention me again."), true
 	case b.cfg.GroupMode == GroupsOff, b.cfg.GroupMode == GroupsAdmins && !b.isOwner(uid):
 		return noticeScreen(icWarn, "Not available here", "Ellie only works in our private chat right now."), true
 	case b.cfg.GuestStorageChat == 0:

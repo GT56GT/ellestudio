@@ -37,6 +37,11 @@ type Settings struct {
 	UsedSecs  int    `json:"used_secs,omitempty"`
 	UsedMakes int    `json:"used_makes,omitempty"` // voices created today
 	UsedDicts int    `json:"used_dicts,omitempty"` // dictionaries created today
+
+	// Joined is set the first time the user talks to the bot in its private
+	// chat. Only joined users get guest-mode replies (GUEST_ACCESS=members).
+	// Kept across /reset.
+	Joined bool `json:"joined,omitempty"`
 }
 
 // Usage is what a user has spent today.
@@ -254,7 +259,20 @@ func (s *Store) Reset(uid int64) error {
 		return nil
 	}
 	s.data[uid] = Settings{UsageDay: old.UsageDay, UsedChars: old.UsedChars, UsedSecs: old.UsedSecs,
-		UsedMakes: old.UsedMakes, UsedDicts: old.UsedDicts}
+		UsedMakes: old.UsedMakes, UsedDicts: old.UsedDicts, Joined: old.Joined}
+	return s.saveLocked(uid)
+}
+
+// Join marks uid as a user of the private chat. It writes only the first time.
+func (s *Store) Join(uid int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v := s.data[uid]
+	if v.Joined {
+		return nil
+	}
+	v.Joined = true
+	s.data[uid] = v
 	return s.saveLocked(uid)
 }
 

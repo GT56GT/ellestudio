@@ -33,6 +33,8 @@ func (b *Bot) handleMessage(ctx context.Context, m *telegram.Message) {
 		b.replyHTML(ctx, m, s.text, nil)
 		return
 	}
+	// Marked after handling, so /start still greets a first-time user.
+	defer b.join(uid)
 
 	text := strings.TrimSpace(m.Text)
 	if text == "" {

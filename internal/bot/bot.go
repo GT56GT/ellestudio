@@ -59,6 +59,9 @@ type Config struct {
 	// point at a file already on Telegram. Zero means the lowest admin ID;
 	// with no admins, guest mode replies that it isn't set up.
 	GuestStorageChat int64
+	// GuestAccess says who guest mentions serve: GuestMembers (default,
+	// people who have used the private chat) or GuestEveryone.
+	GuestAccess string
 	// GroupCooldown is how long one person waits between requests in a group.
 	GroupCooldown time.Duration
 	// GroupConcurrency caps the jobs running at once in one group.
@@ -114,6 +117,9 @@ func New(tg *telegram.Client, ct *cartesia.Client, store *Store, owners Owners, 
 	}
 	if cfg.GroupMode == "" {
 		cfg.GroupMode = GroupsOpen
+	}
+	if cfg.GuestAccess == "" {
+		cfg.GuestAccess = GuestMembers
 	}
 	if cfg.GuestStorageChat == 0 {
 		for uid, ok := range cfg.AdminUsers {

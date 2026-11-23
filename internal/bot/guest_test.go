@@ -13,6 +13,19 @@ import (
 // guestChat is a group that never added the bot.
 const guestChat = int64(-2002)
 
+// guestFixture is a group fixture whose test users (7 and the group admin)
+// have already used the private chat, as guest mode requires by default.
+func guestFixture(t *testing.T, cfg Config) *fixture {
+	t.Helper()
+	fx := groupFixture(t, cfg)
+	for _, uid := range []int64{7, groupAdmin} {
+		if err := fx.bot.store.Join(uid); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return fx
+}
+
 func guest(uid int64, text string) telegram.Update {
 	return telegram.Update{GuestMessage: &telegram.Message{
 		MessageID: 30, From: &telegram.User{ID: uid, FirstName: "Sam"}, Text: text, GuestQueryID: "gq1",
@@ -42,7 +55,7 @@ func noticeText(res map[string]any) string {
 }
 
 func TestGuestMentionRepliesWithAVoice(t *testing.T) {
-	fx := groupFixture(t, Config{})
+	fx := guestFixture(t, Config{})
 	if _, err := fx.bot.store.Update(7, func(s *Settings) { s.VoiceID, s.VoiceName = "v-mine", "My Clone" }); err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +90,7 @@ func TestGuestMentionRepliesWithAVoice(t *testing.T) {
 }
 
 func TestGuestMentionReadsTheRepliedMessage(t *testing.T) {
-	fx := groupFixture(t, Config{})
+	fx := guestFixture(t, Config{})
 	u := guest(7, "@EllieStudioBot")
 	u.GuestMessage.ReplyToMessage = &telegram.Message{MessageID: 4, Text: "Read this one out"}
 	fx.bot.handleUpdate(context.Background(), u)
@@ -102,7 +115,7 @@ func TestGuestNoticesAreTheOneReply(t *testing.T) {
 		"total limit":   {Config{GroupLimits: GroupLimits{AllChars: 3}}, "@EllieStudioBot hello", "fully booked"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			fx := groupFixture(t, tc.cfg)
+			fx := guestFixture(t, tc.cfg)
 			fx.bot.handleUpdate(context.Background(), guest(7, tc.text))
 			res := guestAnswer(t, fx)
 			if res["type"] != "article" || !strings.Contains(noticeText(res), tc.want) {
@@ -123,7 +136,7 @@ func TestGuestNoticesAreTheOneReply(t *testing.T) {
 }
 
 func TestGuestFailureRefundsEveryone(t *testing.T) {
-	fx := groupFixture(t, Config{})
+	fx := guestFixture(t, Config{})
 	fx.ttsFail = true
 	fx.bot.handleUpdate(context.Background(), guest(7, "@EllieStudioBot hello"))
 	if res := guestAnswer(t, fx); res["type"] != "article" {
@@ -138,7 +151,7 @@ func TestGuestFailureRefundsEveryone(t *testing.T) {
 }
 
 func TestGuestBlockedChatGetsNoReply(t *testing.T) {
-	fx := groupFixture(t, Config{})
+	fx := guestFixture(t, Config{})
 	if err := fx.bot.chats.SetBlocked(context.Background(), guestChat, true); err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +162,7 @@ func TestGuestBlockedChatGetsNoReply(t *testing.T) {
 }
 
 func TestGuestOwnerIsNotChargedAndModeIsKept(t *testing.T) {
-	fx := groupFixture(t, Config{GroupMode: GroupsAdmins, GroupLimits: GroupLimits{Chars: 1}})
+	fx := guestFixture(t, Config{GroupMode: GroupsAdmins, GroupLimits: GroupLimits{Chars: 1}})
 	fx.bot.handleUpdate(context.Background(), guest(owner, "@EllieStudioBot hello"))
 	if res := guestAnswer(t, fx); res["type"] != "voice" {
 		t.Fatalf("the studio admin should get a voice, got %v", res)
@@ -160,11 +173,11 @@ func TestGuestOwnerIsNotChargedAndModeIsKept(t *testing.T) {
 }
 
 func TestGuestStorageDefaultsToLowestAdmin(t *testing.T) {
-	fx := groupFixture(t, Config{AdminUsers: map[int64]bool{40: true, 9: true, 3: false}})
+	fx := guestFixture(t, Config{AdminUsers: map[int64]bool{40: true, 9: true, 3: false}})
 	if fx.bot.cfg.GuestStorageChat != 9 {
 		t.Errorf("storage chat = %d, want the lowest admin 9", fx.bot.cfg.GuestStorageChat)
 	}
-	fx = groupFixture(t, Config{AdminUsers: map[int64]bool{}})
+	fx = guestFixture(t, Config{AdminUsers: map[int64]bool{}})
 	fx.bot.handleUpdate(context.Background(), guest(7, "@EllieStudioBot hello"))
 	if res := guestAnswer(t, fx); !strings.Contains(noticeText(res), "Not set up") {
 		t.Errorf("with no storage chat, reply = %v", res)
@@ -187,7 +200,7 @@ func TestGuestObeysTheGroupsOwnSettings(t *testing.T) {
 		"smaller allowance":  {GroupSettings{DailyChars: 3}, 7, "@EllieStudioBot hello", "3 spoken characters"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			fx := groupFixture(t, Config{})
+			fx := guestFixture(t, Config{})
 			if err := fx.bot.chats.SetSettings(ctx, guestChat, tc.gs); err != nil {
 				t.Fatal(err)
 			}
@@ -208,7 +221,7 @@ func TestGuestObeysTheGroupsOwnSettings(t *testing.T) {
 
 func TestGuestCooldownAndChatJobLimit(t *testing.T) {
 	ctx := context.Background()
-	fx := groupFixture(t, Config{GroupCooldown: time.Minute})
+	fx := guestFixture(t, Config{GroupCooldown: time.Minute})
 	fx.bot.handleUpdate(ctx, guest(7, "@EllieStudioBot one"))
 	fx.bot.handleUpdate(ctx, guest(7, "@EllieStudioBot two"))
 	calls := fx.tg.find("answerGuestQuery")
@@ -223,7 +236,7 @@ func TestGuestCooldownAndChatJobLimit(t *testing.T) {
 		t.Error("the cooldown did not stop the second reading")
 	}
 
-	fx = groupFixture(t, Config{GroupConcurrency: 1})
+	fx = guestFixture(t, Config{GroupConcurrency: 1})
 	fx.bot.groupJobs[guestChat] = 1 // someone else's reading is still running
 	fx.bot.handleUpdate(ctx, guest(7, "@EllieStudioBot hi"))
 	if res := guestAnswer(t, fx); !strings.Contains(noticeText(res), "already working") {
@@ -231,6 +244,60 @@ func TestGuestCooldownAndChatJobLimit(t *testing.T) {
 	}
 	if fx.bot.groupJobs[guestChat] != 1 {
 		t.Errorf("job count = %d, want it left at 1", fx.bot.groupJobs[guestChat])
+	}
+}
+
+func TestGuestModeServesOnlyJoinedUsers(t *testing.T) {
+	ctx := context.Background()
+	fx := groupFixture(t, Config{}) // user 42 has never opened the private chat
+	fx.bot.handleUpdate(ctx, guest(42, "@EllieStudioBot hello"))
+	res := guestAnswer(t, fx)
+	if !strings.Contains(noticeText(res), "Start Ellie first") || fx.ttsIn != nil {
+		t.Fatalf("a stranger got %v (tts %v), want the start notice", res, fx.ttsIn)
+	}
+	raw, _ := json.Marshal(res["reply_markup"])
+	if !strings.Contains(string(raw), "t.me/EllieStudioBot") {
+		t.Errorf("the notice should link to the private chat: %s", raw)
+	}
+
+	// Group use alone doesn't make someone a user.
+	fx.bot.handleUpdate(ctx, gmsg(42, testGroup, "/say@EllieStudioBot hi"))
+	if fx.bot.store.Get(42).Joined {
+		t.Fatal("using /say in a group marked the user as joined")
+	}
+
+	// Any private message does, and it survives /reset.
+	fx.bot.handleUpdate(ctx, telegram.Update{Message: &telegram.Message{
+		MessageID: 1, From: &telegram.User{ID: 42}, Chat: telegram.Chat{ID: 42, Type: "private"}, Text: "/start",
+	}})
+	if !fx.bot.store.Get(42).Joined {
+		t.Fatal("/start in the private chat didn't mark the user as joined")
+	}
+	if err := fx.bot.store.Reset(42); err != nil || !fx.bot.store.Get(42).Joined {
+		t.Fatalf("reset dropped the joined mark (err %v)", err)
+	}
+	fx.tg.mu.Lock()
+	fx.tg.calls = nil
+	fx.tg.mu.Unlock()
+	fx.bot.handleUpdate(ctx, guest(42, "@EllieStudioBot hello"))
+	if res := guestAnswer(t, fx); res["type"] != "voice" {
+		t.Errorf("a joined user got %v, want a voice", res)
+	}
+}
+
+func TestGuestAccessEveryone(t *testing.T) {
+	fx := groupFixture(t, Config{GuestAccess: GuestEveryone})
+	fx.bot.handleUpdate(context.Background(), guest(42, "@EllieStudioBot hello"))
+	if res := guestAnswer(t, fx); res["type"] != "voice" {
+		t.Errorf("GUEST_ACCESS=everyone should serve strangers, got %v", res)
+	}
+}
+
+func TestPrivateButtonsMarkJoined(t *testing.T) {
+	fx := groupFixture(t, Config{})
+	fx.bot.handleUpdate(context.Background(), press(42, "nav:home"))
+	if !fx.bot.store.Get(42).Joined {
+		t.Error("pressing a button in the private chat didn't mark the user as joined")
 	}
 }
 
@@ -242,7 +309,7 @@ func TestFirstLineIsPlainText(t *testing.T) {
 }
 
 func TestGuestUpdatesAreRequested(t *testing.T) {
-	fx := groupFixture(t, Config{})
+	fx := guestFixture(t, Config{})
 	_, _ = fx.bot.tg.GetUpdates(context.Background(), 0, 0)
 	calls := fx.tg.find("getUpdates")
 	raw, _ := json.Marshal(calls[len(calls)-1].JSON["allowed_updates"])

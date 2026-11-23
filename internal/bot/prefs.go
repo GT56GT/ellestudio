@@ -608,6 +608,7 @@ func (b *Bot) handleCallback(ctx context.Context, q *telegram.CallbackQuery) {
 		_ = b.tg.AnswerCallbackQuery(ctx, q.ID, "")
 		return
 	}
+	defer b.join(q.From.ID)
 	b.dispatchCallback(ctx, q)
 }
 
