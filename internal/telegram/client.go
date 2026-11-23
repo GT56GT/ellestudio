@@ -217,6 +217,11 @@ type Message struct {
 	// GuestQueryID is set when someone mentions the bot in a chat it is not
 	// a member of (guest mode). Answer it once with AnswerGuestQuery.
 	GuestQueryID string `json:"guest_query_id"`
+	// GuestBotCallerUser is set on a message a guest bot posted: the user
+	// whose mention it answered.
+	GuestBotCallerUser *User `json:"guest_bot_caller_user"`
+	// ViaBot is the bot an inline or guest message was sent through.
+	ViaBot *User `json:"via_bot"`
 }
 
 // Thread is the forum topic the message belongs to (0 outside topics).

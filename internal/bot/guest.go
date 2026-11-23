@@ -57,7 +57,20 @@ func (b *Bot) handleGuest(ctx context.Context, m *telegram.Message) {
 		return // a blocked chat gets no reply at all
 	}
 
-	text, _ := b.stripMention(orDefault(m.Text, m.Caption))
+	text, mentioned := b.stripMention(orDefault(m.Text, m.Caption))
+	// Without a mention, a guest query can only come from a reply to Ellie.
+	// Text there ("@friend", "nice voice") is chat, not a request, even if
+	// the replied message doesn't say who sent it.
+	if r := m.ReplyToMessage; !mentioned && r != nil && (text != "" || b.isOwnMessage(r)) {
+		// Telegram also sends a guest query when someone merely replies to
+		// one of Ellie's messages: people talking about a voice, or tagging
+		// a friend to listen. That isn't a request, so stay silent.
+		b.log.Info("guest reply to Ellie ignored, no mention", "chat", chat, "user", uid)
+		return
+	}
+	if onlyMentions(text) {
+		text = "" // "@EllieStudioBot @friend" in a reply: read the reply, not the names
+	}
 	if text == "" {
 		text, _ = b.stripMention(repliedText(m))
 	}
@@ -247,6 +260,31 @@ func (b *Bot) spendGuestChat(ctx context.Context, m *telegram.Message, chars int
 		b.log.Error("guest chat allowance unavailable", "chat", m.Chat.ID, "err", err)
 		return false, errorScreen(storageError{err}), false
 	}
+}
+
+// isOwnMessage reports whether r is a message Ellie posted (as a guest, via
+// inline, or as a member).
+func (b *Bot) isOwnMessage(r *telegram.Message) bool {
+	if r == nil {
+		return false
+	}
+	me := func(u *telegram.User) bool {
+		return u != nil && u.IsBot && b.username != "" && strings.EqualFold(u.Username, b.username)
+	}
+	// Only Ellie's own guest messages reach Ellie as replies, so any guest
+	// bot message here is Ellie's.
+	return r.GuestBotCallerUser != nil || me(r.From) || me(r.ViaBot)
+}
+
+// onlyMentions reports whether text is nothing but @usernames.
+func onlyMentions(text string) bool {
+	words := strings.Fields(text)
+	for _, w := range words {
+		if len(w) < 2 || w[0] != '@' {
+			return false
+		}
+	}
+	return len(words) > 0
 }
 
 // firstLine is a notice's title as plain text, for the logs.

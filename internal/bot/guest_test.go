@@ -301,6 +301,52 @@ func TestPrivateButtonsMarkJoined(t *testing.T) {
 	}
 }
 
+func TestGuestRepliesToEllieNeedAMention(t *testing.T) {
+	ctx := context.Background()
+	ellie := &telegram.User{ID: 999, IsBot: true, Username: "EllieStudioBot"}
+	for name, own := range map[string]*telegram.Message{
+		"from Ellie":     {MessageID: 4, From: ellie, Voice: &telegram.Voice{FileID: "x"}},
+		"guest message":  {MessageID: 4, GuestBotCallerUser: &telegram.User{ID: 7}},
+		"sent via Ellie": {MessageID: 4, From: &telegram.User{ID: 7}, ViaBot: ellie},
+	} {
+		t.Run(name, func(t *testing.T) {
+			// Tagging a friend under Ellie's voice, or a stranger chatting
+			// about it, must not trigger a reading or a notice.
+			for _, uid := range []int64{7, 42} {
+				fx := guestFixture(t, Config{})
+				u := guest(uid, "@WhereAirEnds")
+				u.GuestMessage.ReplyToMessage = own
+				fx.bot.handleUpdate(ctx, u)
+				if n := len(fx.tg.find("answerGuestQuery")); n != 0 || fx.ttsIn != nil {
+					t.Errorf("user %d: a reply without a mention got %d replies (tts %v)", uid, n, fx.ttsIn)
+				}
+			}
+		})
+	}
+
+	// Mentioning Ellie under its own voice still works.
+	fx := guestFixture(t, Config{})
+	u := guest(7, "@EllieStudioBot say it again please")
+	u.GuestMessage.ReplyToMessage = &telegram.Message{MessageID: 4, From: ellie}
+	fx.bot.handleUpdate(ctx, u)
+	if fx.ttsIn == nil || fx.ttsIn["transcript"] != "say it again please" {
+		t.Errorf("tts request = %v", fx.ttsIn)
+	}
+}
+
+func TestGuestMentionWithOnlyUsernamesReadsTheReply(t *testing.T) {
+	fx := guestFixture(t, Config{})
+	u := guest(7, "@EllieStudioBot @WhereAirEnds")
+	u.GuestMessage.ReplyToMessage = &telegram.Message{MessageID: 4, From: &telegram.User{ID: 3}, Text: "Read this one out"}
+	fx.bot.handleUpdate(context.Background(), u)
+	if fx.ttsIn == nil || fx.ttsIn["transcript"] != "Read this one out" {
+		t.Fatalf("tts request = %v, want the replied message, not the username", fx.ttsIn)
+	}
+	if onlyMentions("@a hi") || !onlyMentions(" @a  @b ") || onlyMentions("") || onlyMentions("@") {
+		t.Error("onlyMentions is wrong")
+	}
+}
+
 func TestFirstLineIsPlainText(t *testing.T) {
 	s := noticeScreen("🎟", "This chat's daily allowance is used up", "Everyone here shares <b>5</b>.")
 	if got := firstLine(s.text); got != "🎟 This chat's daily allowance is used up" {
