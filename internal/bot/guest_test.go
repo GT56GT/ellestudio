@@ -234,6 +234,13 @@ func TestGuestCooldownAndChatJobLimit(t *testing.T) {
 	}
 }
 
+func TestFirstLineIsPlainText(t *testing.T) {
+	s := noticeScreen("🎟", "This chat's daily allowance is used up", "Everyone here shares <b>5</b>.")
+	if got := firstLine(s.text); got != "🎟 This chat's daily allowance is used up" {
+		t.Errorf("firstLine = %q", got)
+	}
+}
+
 func TestGuestUpdatesAreRequested(t *testing.T) {
 	fx := groupFixture(t, Config{})
 	_, _ = fx.bot.tg.GetUpdates(context.Background(), 0, 0)

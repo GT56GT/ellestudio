@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"html"
+	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -38,6 +40,7 @@ func (b *Bot) handleGuest(ctx context.Context, m *telegram.Message) {
 		b.log.Warn("guest chat lookup", "chat", chat, "err", err)
 	}
 	if info.Blocked {
+		b.log.Info("guest mention ignored, chat blocked", "chat", chat, "user", uid)
 		return // a blocked chat gets no reply at all
 	}
 
@@ -123,6 +126,7 @@ func (b *Bot) handleGuest(ctx context.Context, m *telegram.Message) {
 		b.log.Error("guest reply", "user", uid, "chat", chat, "err", err)
 		return
 	}
+	b.log.Info("guest reply sent", "chat", chat, "chat_type", m.Chat.Type, "user", uid, "chars", chars)
 	b.remember(uid, func(r *recent) { r.spoken = text })
 }
 
@@ -228,6 +232,14 @@ func (b *Bot) spendGuestChat(ctx context.Context, m *telegram.Message, chars int
 	}
 }
 
+// firstLine is a notice's title as plain text, for the logs.
+func firstLine(s string) string {
+	s, _, _ = strings.Cut(strings.TrimSpace(s), "\n")
+	return html.UnescapeString(htmlTagRe.ReplaceAllString(s, ""))
+}
+
+var htmlTagRe = regexp.MustCompile(`<[^>]*>`)
+
 // guestKeys links to the private chat, the only button a guest reply carries.
 func (b *Bot) guestKeys() *telegram.InlineKeyboardMarkup {
 	link := b.startLink("")
@@ -248,7 +260,9 @@ func (b *Bot) answerGuestText(ctx context.Context, m *telegram.Message, s screen
 	}
 	if _, err := b.tg.AnswerGuestQuery(ctx, m.GuestQueryID, res); err != nil {
 		b.log.Warn("guest notice", "chat", m.Chat.ID, "err", err)
+		return
 	}
+	b.log.Info("guest notice sent", "chat", m.Chat.ID, "chat_type", m.Chat.Type, "user", m.From.ID, "notice", firstLine(s.text))
 }
 
 // answerGuestVoice uploads the reading to the storage chat to get a file id,
