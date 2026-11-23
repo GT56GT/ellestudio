@@ -45,7 +45,10 @@ func (b *Bot) handleGuest(ctx context.Context, m *telegram.Message) {
 	if text == "" {
 		text, _ = b.stripMention(repliedText(m))
 	}
-	if s, refused := b.guestRefusal(uid, text); refused {
+	// A group that once had Ellie keeps its own settings: guest mentions
+	// obey them just like /say would.
+	gs := info.Settings
+	if s, refused := b.guestRefusal(ctx, m, text, gs); refused {
 		b.answerGuestText(ctx, m, s)
 		return
 	}
@@ -62,6 +65,16 @@ func (b *Bot) handleGuest(ctx context.Context, m *telegram.Message) {
 		return
 	}
 	defer b.end(uid)
+	done, wait, ok := b.guestTurn(chat, uid)
+	if !ok {
+		body := "I'm already working on a few requests in this chat. Try again in a moment."
+		if wait > 0 {
+			body = fmt.Sprintf("You can send your next request in <b>%ds</b>.", int((wait+time.Second-1)/time.Second))
+		}
+		b.answerGuestText(ctx, m, noticeScreen(icWait, "One moment", body))
+		return
+	}
+	defer done()
 	chars := utf8.RuneCountInString(text)
 	if ok, _ := b.spendChars(uid, chars); !ok {
 		b.answerGuestText(ctx, m, noticeScreen("🎟", "Your daily allowance is used up",
@@ -73,7 +86,7 @@ func (b *Bot) handleGuest(ctx context.Context, m *telegram.Message) {
 			b.log.Warn("record guest chat", "chat", chat, "err", err)
 		}
 	}
-	charged, refusal, ok := b.spendGuestChat(ctx, m, chars)
+	charged, refusal, ok := b.spendGuestChat(ctx, m, chars, gs)
 	if !ok {
 		b.refund(uid, chars, 0)
 		b.answerGuestText(ctx, m, refusal)
@@ -114,10 +127,42 @@ func (b *Bot) handleGuest(ctx context.Context, m *telegram.Message) {
 }
 
 // guestLimit is the longest text a guest mention may ask for.
-func (b *Bot) guestLimit() int { return min(guestMaxChars, b.cfg.MaxTTSChars) }
+func (b *Bot) guestLimit(gs GroupSettings) int {
+	return effCap(min(guestMaxChars, b.cfg.MaxTTSChars), gs.MaxChars)
+}
+
+// guestTurn applies the group cooldown and per-chat job limit to a guest
+// mention. When refused, wait is the cooldown left (0 means the chat is
+// busy). On success the caller must call done when the job ends.
+func (b *Bot) guestTurn(chat, uid int64) (done func(), wait time.Duration, ok bool) {
+	if b.isOwner(uid) {
+		return func() {}, 0, true
+	}
+	key, now := chatUser{chat, uid}, time.Now()
+	b.groupMu.Lock()
+	defer b.groupMu.Unlock()
+	if cd := b.cfg.GroupCooldown; cd > 0 {
+		if since := now.Sub(b.lastUse[key]); since < cd {
+			return nil, cd - since, false
+		}
+	}
+	if n := b.cfg.GroupConcurrency; n > 0 && b.groupJobs[chat] >= n {
+		return nil, 0, false
+	}
+	b.groupJobs[chat]++
+	b.lastUse[key] = now
+	return func() {
+		b.groupMu.Lock()
+		defer b.groupMu.Unlock()
+		if b.groupJobs[chat]--; b.groupJobs[chat] <= 0 {
+			delete(b.groupJobs, chat)
+		}
+	}, 0, true
+}
 
 // guestRefusal is the notice for a mention Ellie won't read, if any.
-func (b *Bot) guestRefusal(uid int64, text string) (screen, bool) {
+func (b *Bot) guestRefusal(ctx context.Context, m *telegram.Message, text string, gs GroupSettings) (screen, bool) {
+	uid := m.From.ID
 	switch {
 	case !b.allowed(uid):
 		return noticeScreen(icWarn, "Ellie is private", "This studio is open to invited people only."), true
@@ -129,11 +174,29 @@ func (b *Bot) guestRefusal(uid int64, text string) (screen, bool) {
 		return noticeScreen(icStudio, "Ellie Studio",
 			"Mention me with something to read, like <code>@"+b.username+" good morning everyone</code>, "+
 				"or mention me in a reply to a message and I'll read that out."), true
+	case gs.Paused && !b.isOwner(uid):
+		return noticeScreen(icLock, "Ellie is paused here",
+			"A group admin paused Ellie in this group. You can still use it in our private chat."), true
+	case gs.NoSpeak && !b.isOwner(uid):
+		return noticeScreen(icLock, "Speaking is off here",
+			"This group's admins turned off reading aloud. You can still use it in our private chat."), true
 	}
-	if n := utf8.RuneCountInString(text); n > b.guestLimit() {
+	if gs.AdminsOnly {
+		// isGroupAdmin treats studio admins as admins. If the check fails
+		// (the bot may not be able to see members here), refuse.
+		admin, err := b.isGroupAdmin(ctx, m.Chat.ID, uid)
+		if err != nil {
+			b.log.Warn("guest admin check failed", "chat", m.Chat.ID, "err", err)
+		}
+		if !admin {
+			return noticeScreen(icLock, "Only admins can use Ellie here",
+				"This group's admins have kept Ellie to themselves. You can still use it in our private chat."), true
+		}
+	}
+	if n, limit := utf8.RuneCountInString(text), b.guestLimit(gs); n > limit {
 		return noticeScreen(icWarn, "That's a lot of text", fmt.Sprintf(
 			"It's <b>%d</b> characters. Here I can read up to <b>%d</b> at a time; our private chat takes longer texts.",
-			n, b.guestLimit())), true
+			n, limit)), true
 	}
 	return screen{}, false
 }
@@ -141,17 +204,19 @@ func (b *Bot) guestRefusal(uid int64, text string) (screen, bool) {
 // spendGuestChat charges the chat's shared allowance and the all-groups
 // total, the same caps a group that added Ellie has. charged reports whether
 // anything was taken (admins are exempt).
-func (b *Bot) spendGuestChat(ctx context.Context, m *telegram.Message, chars int) (charged bool, refusal screen, ok bool) {
+func (b *Bot) spendGuestChat(ctx context.Context, m *telegram.Message, chars int, gs GroupSettings) (charged bool, refusal screen, ok bool) {
 	if b.isOwner(m.From.ID) {
 		return false, screen{}, true
 	}
-	err := b.chats.Spend(ctx, m.Chat.ID, today(), chars, 0, b.cfg.GroupLimits)
+	l := b.cfg.GroupLimits
+	l.Chars = effCap(l.Chars, gs.DailyChars)
+	err := b.chats.Spend(ctx, m.Chat.ID, today(), chars, 0, l)
 	switch {
 	case err == nil:
 		return true, screen{}, true
 	case errors.Is(err, errGroupLimit):
 		return false, noticeScreen("🎟", "This chat's daily allowance is used up",
-			"Everyone here shares <b>"+fmtInt(b.cfg.GroupLimits.Chars)+" spoken characters</b> a day. "+
+			"Everyone here shares <b>"+fmtInt(l.Chars)+" spoken characters</b> a day. "+
 				"It refreshes in <b>"+fmtWait(untilReset())+"</b> (midnight UTC)."), false
 	case errors.Is(err, errGroupsLimit):
 		return false, noticeScreen("🎟", "Ellie is fully booked today",

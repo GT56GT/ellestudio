@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"ellestudio/internal/telegram"
 )
@@ -167,6 +168,69 @@ func TestGuestStorageDefaultsToLowestAdmin(t *testing.T) {
 	fx.bot.handleUpdate(context.Background(), guest(7, "@EllieStudioBot hello"))
 	if res := guestAnswer(t, fx); !strings.Contains(noticeText(res), "Not set up") {
 		t.Errorf("with no storage chat, reply = %v", res)
+	}
+}
+
+func TestGuestObeysTheGroupsOwnSettings(t *testing.T) {
+	ctx := context.Background()
+	for name, tc := range map[string]struct {
+		gs   GroupSettings
+		uid  int64
+		text string
+		want string // "" means the voice is sent
+	}{
+		"paused":             {GroupSettings{Paused: true}, 7, "@EllieStudioBot hi", "paused"},
+		"no speaking":        {GroupSettings{NoSpeak: true}, 7, "@EllieStudioBot hi", "Speaking is off"},
+		"admins only":        {GroupSettings{AdminsOnly: true}, 7, "@EllieStudioBot hi", "Only admins"},
+		"admins only, admin": {GroupSettings{AdminsOnly: true}, groupAdmin, "@EllieStudioBot hi", ""},
+		"shorter texts":      {GroupSettings{MaxChars: 3}, 7, "@EllieStudioBot hello", "lot of text"},
+		"smaller allowance":  {GroupSettings{DailyChars: 3}, 7, "@EllieStudioBot hello", "3 spoken characters"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fx := groupFixture(t, Config{})
+			if err := fx.bot.chats.SetSettings(ctx, guestChat, tc.gs); err != nil {
+				t.Fatal(err)
+			}
+			fx.bot.handleUpdate(ctx, guest(tc.uid, tc.text))
+			res := guestAnswer(t, fx)
+			if tc.want == "" {
+				if res["type"] != "voice" {
+					t.Errorf("reply = %v, want a voice", res)
+				}
+				return
+			}
+			if !strings.Contains(noticeText(res), tc.want) || fx.ttsIn != nil {
+				t.Errorf("reply = %v (tts %v), want a refusal containing %q", res, fx.ttsIn, tc.want)
+			}
+		})
+	}
+}
+
+func TestGuestCooldownAndChatJobLimit(t *testing.T) {
+	ctx := context.Background()
+	fx := groupFixture(t, Config{GroupCooldown: time.Minute})
+	fx.bot.handleUpdate(ctx, guest(7, "@EllieStudioBot one"))
+	fx.bot.handleUpdate(ctx, guest(7, "@EllieStudioBot two"))
+	calls := fx.tg.find("answerGuestQuery")
+	if len(calls) != 2 {
+		t.Fatalf("want two replies, got %d", len(calls))
+	}
+	second, _ := calls[1].JSON["result"].(map[string]any)
+	if !strings.Contains(noticeText(second), "next request in") {
+		t.Errorf("second mention inside the cooldown = %v", second)
+	}
+	if len(fx.tg.find("sendVoice")) != 1 {
+		t.Error("the cooldown did not stop the second reading")
+	}
+
+	fx = groupFixture(t, Config{GroupConcurrency: 1})
+	fx.bot.groupJobs[guestChat] = 1 // someone else's reading is still running
+	fx.bot.handleUpdate(ctx, guest(7, "@EllieStudioBot hi"))
+	if res := guestAnswer(t, fx); !strings.Contains(noticeText(res), "already working") {
+		t.Errorf("a busy chat should be refused, got %v", res)
+	}
+	if fx.bot.groupJobs[guestChat] != 1 {
+		t.Errorf("job count = %d, want it left at 1", fx.bot.groupJobs[guestChat])
 	}
 }
 
