@@ -1,0 +1,211 @@
+package bot
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"ellestudio/internal/telegram"
+)
+
+// Guest mode: someone mentions @bot in a chat the bot was never added to.
+// Telegram shows the bot only that message (and the one it replies to), and
+// the bot gets exactly one reply, sent with answerGuestQuery. Everything the
+// bot says there, voice or notice, is that one reply, so there are no
+// buttons that call back into the bot: only a link to the private chat.
+
+// guestMaxChars bounds one guest reading. The reply must arrive while the
+// query is still open, so long texts are refused rather than risked.
+const guestMaxChars = 500
+
+// guestDeadline bounds the whole reading: waiting for Cartesia, synthesis,
+// upload and reply.
+const guestDeadline = 30 * time.Second
+
+// guestStatus marks chats known only from guest mentions.
+const guestStatus = "guest"
+
+func (b *Bot) handleGuest(ctx context.Context, m *telegram.Message) {
+	if m.GuestQueryID == "" || m.From == nil || m.From.IsBot {
+		return
+	}
+	uid, chat := m.From.ID, m.Chat.ID
+	info, known, err := b.chats.Get(ctx, chat)
+	if err != nil {
+		b.log.Warn("guest chat lookup", "chat", chat, "err", err)
+	}
+	if info.Blocked {
+		return // a blocked chat gets no reply at all
+	}
+
+	text, _ := b.stripMention(orDefault(m.Text, m.Caption))
+	if text == "" {
+		text, _ = b.stripMention(repliedText(m))
+	}
+	if s, refused := b.guestRefusal(uid, text); refused {
+		b.answerGuestText(ctx, m, s)
+		return
+	}
+	s := b.store.Get(uid)
+	if s.VoiceID == "" {
+		b.answerGuestText(ctx, m, noticeScreen(icVoices, "Pick a voice first",
+			"Open our private chat, choose who should speak, then mention me again."))
+		return
+	}
+
+	if !b.begin(uid) {
+		b.answerGuestText(ctx, m, noticeScreen(icWait, "One moment",
+			"I'm still working on your last request. Mention me again once it arrives."))
+		return
+	}
+	defer b.end(uid)
+	chars := utf8.RuneCountInString(text)
+	if ok, _ := b.spendChars(uid, chars); !ok {
+		b.answerGuestText(ctx, m, noticeScreen("🎟", "Your daily allowance is used up",
+			"You can read more in <b>"+fmtWait(untilReset())+"</b> (midnight UTC)."))
+		return
+	}
+	if !known {
+		if err := b.chats.Upsert(ctx, ChatInfo{ID: chat, Type: m.Chat.Type, Title: m.Chat.Title, Status: guestStatus}); err != nil {
+			b.log.Warn("record guest chat", "chat", chat, "err", err)
+		}
+	}
+	charged, refusal, ok := b.spendGuestChat(ctx, m, chars)
+	if !ok {
+		b.refund(uid, chars, 0)
+		b.answerGuestText(ctx, m, refusal)
+		return
+	}
+	undo := func() {
+		b.refund(uid, chars, 0)
+		if charged {
+			if err := b.chats.Refund(context.WithoutCancel(ctx), chat, today(), chars, 0); err != nil {
+				b.log.Warn("refund guest chat", "chat", chat, "err", err)
+			}
+		}
+	}
+
+	// A guest query does not wait forever: give up (and refund) rather than
+	// queue behind long jobs and answer after it has expired.
+	ctx, cancel := context.WithTimeout(ctx, guestDeadline)
+	defer cancel()
+	if !b.acquire(ctx) {
+		undo()
+		b.log.Warn("guest reply timed out waiting for Cartesia", "user", uid)
+		return
+	}
+	audio, err := b.ttsWithRetry(ctx, ttsRequest(s, text))
+	b.release()
+	if err != nil {
+		undo()
+		b.log.Error("guest tts", "user", uid, "err", err)
+		b.answerGuestText(ctx, m, errorScreen(err))
+		return
+	}
+	if err := b.answerGuestVoice(ctx, m, s, text, audio); err != nil {
+		undo()
+		b.log.Error("guest reply", "user", uid, "chat", chat, "err", err)
+		return
+	}
+	b.remember(uid, func(r *recent) { r.spoken = text })
+}
+
+// guestLimit is the longest text a guest mention may ask for.
+func (b *Bot) guestLimit() int { return min(guestMaxChars, b.cfg.MaxTTSChars) }
+
+// guestRefusal is the notice for a mention Ellie won't read, if any.
+func (b *Bot) guestRefusal(uid int64, text string) (screen, bool) {
+	switch {
+	case !b.allowed(uid):
+		return noticeScreen(icWarn, "Ellie is private", "This studio is open to invited people only."), true
+	case b.cfg.GroupMode == GroupsOff, b.cfg.GroupMode == GroupsAdmins && !b.isOwner(uid):
+		return noticeScreen(icWarn, "Not available here", "Ellie only works in our private chat right now."), true
+	case b.cfg.GuestStorageChat == 0:
+		return noticeScreen(icWarn, "Not set up yet", "Ellie can't reply in other chats yet. Try our private chat."), true
+	case text == "":
+		return noticeScreen(icStudio, "Ellie Studio",
+			"Mention me with something to read, like <code>@"+b.username+" good morning everyone</code>, "+
+				"or mention me in a reply to a message and I'll read that out."), true
+	}
+	if n := utf8.RuneCountInString(text); n > b.guestLimit() {
+		return noticeScreen(icWarn, "That's a lot of text", fmt.Sprintf(
+			"It's <b>%d</b> characters. Here I can read up to <b>%d</b> at a time; our private chat takes longer texts.",
+			n, b.guestLimit())), true
+	}
+	return screen{}, false
+}
+
+// spendGuestChat charges the chat's shared allowance and the all-groups
+// total, the same caps a group that added Ellie has. charged reports whether
+// anything was taken (admins are exempt).
+func (b *Bot) spendGuestChat(ctx context.Context, m *telegram.Message, chars int) (charged bool, refusal screen, ok bool) {
+	if b.isOwner(m.From.ID) {
+		return false, screen{}, true
+	}
+	err := b.chats.Spend(ctx, m.Chat.ID, today(), chars, 0, b.cfg.GroupLimits)
+	switch {
+	case err == nil:
+		return true, screen{}, true
+	case errors.Is(err, errGroupLimit):
+		return false, noticeScreen("🎟", "This chat's daily allowance is used up",
+			"Everyone here shares <b>"+fmtInt(b.cfg.GroupLimits.Chars)+" spoken characters</b> a day. "+
+				"It refreshes in <b>"+fmtWait(untilReset())+"</b> (midnight UTC)."), false
+	case errors.Is(err, errGroupsLimit):
+		return false, noticeScreen("🎟", "Ellie is fully booked today",
+			"Shared chats have used today's allowance. It refreshes in <b>"+fmtWait(untilReset())+
+				"</b> (midnight UTC). You can still use Ellie in our private chat."), false
+	default:
+		b.log.Error("guest chat allowance unavailable", "chat", m.Chat.ID, "err", err)
+		return false, errorScreen(storageError{err}), false
+	}
+}
+
+// guestKeys links to the private chat, the only button a guest reply carries.
+func (b *Bot) guestKeys() *telegram.InlineKeyboardMarkup {
+	link := b.startLink("")
+	if link == "" {
+		return nil
+	}
+	return &telegram.InlineKeyboardMarkup{InlineKeyboard: [][]telegram.InlineKeyboardButton{
+		{{Text: "🎙 Open Ellie Studio", URL: link}},
+	}}
+}
+
+// answerGuestText replies to a guest mention with a notice.
+func (b *Bot) answerGuestText(ctx context.Context, m *telegram.Message, s screen) {
+	res := telegram.InlineQueryResultArticle{
+		Type: "article", ID: "ellie-notice", Title: "Ellie Studio",
+		InputMessageContent: telegram.InputTextMessageContent{MessageText: strings.TrimSpace(s.text), ParseMode: "HTML"},
+		ReplyMarkup:         b.guestKeys(),
+	}
+	if _, err := b.tg.AnswerGuestQuery(ctx, m.GuestQueryID, res); err != nil {
+		b.log.Warn("guest notice", "chat", m.Chat.ID, "err", err)
+	}
+}
+
+// answerGuestVoice uploads the reading to the storage chat to get a file id,
+// replies with it, and deletes the upload again.
+func (b *Bot) answerGuestVoice(ctx context.Context, m *telegram.Message, s Settings, text string, audio []byte) error {
+	up, err := b.tg.SendVoice(ctx, telegram.MediaParams{
+		ChatID: b.cfg.GuestStorageChat, Filename: "ellie-studio.mp3", Data: audio, Silent: true,
+	})
+	if err != nil {
+		return fmt.Errorf("upload to storage chat: %w", err)
+	}
+	defer func() {
+		if err := b.tg.DeleteMessage(context.WithoutCancel(ctx), b.cfg.GuestStorageChat, up.MessageID); err != nil {
+			b.log.Warn("delete guest upload", "err", err)
+		}
+	}()
+	if up.Voice == nil || up.Voice.FileID == "" {
+		return errors.New("upload to storage chat: no voice file in reply")
+	}
+	_, err = b.tg.AnswerGuestQuery(ctx, m.GuestQueryID, telegram.InlineQueryResultCachedVoice{
+		Type: "voice", ID: "ellie-voice", VoiceFileID: up.Voice.FileID,
+		Title: truncate(text, 60), Caption: speechCaption(s),
+	})
+	return err
+}

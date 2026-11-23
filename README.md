@@ -92,6 +92,16 @@ Add the bot to any group or supergroup. Keep **privacy mode on** in @BotFather (
 - **Your controls (admins, in the private chat):** `/admin` gathers them in one screen (and appears only in admins' own command menus). `/groups` shows today's busiest groups, their own settings, and the totals, `/blockgroup <id>` makes the bot leave a group for good, `/unblockgroup <id>` lets it back. `/blockgroup` sent inside a group blocks that group.
 - When the bot joins it posts a short how-to. When a group is upgraded to a supergroup (its ID changes), its record, block and today's usage move with it.
 
+### Guest mode (no need to add the bot)
+
+With Telegram's guest mode (Bot API 10.0), anyone can type `@EllieStudioBot good morning everyone` in a group or private chat the bot was never added to, and Ellie posts the reading there in that person's own voice. Mentioning the bot in a reply to a message reads that message out.
+
+- **Turn it on** in @BotFather's Mini App (open @BotFather → *Open*, pick the bot → *Bot Settings* → **Guest Mode**). The code needs nothing else.
+- **What Ellie sees:** only the message that mentions it and the message it replies to. Not the chat's history or members.
+- **One reply per mention:** the voice, or a short notice (limit reached, text too long, pick a voice first) with a link to the private chat. Texts are capped at 500 characters (or `MAX_TTS_CHARS` if lower) so the reply arrives in time.
+- **Same limits as groups:** the caller's own daily allowance, plus the chat's shared `GROUP_DAILY_CHAR_LIMIT` and the all-groups total. `GROUP_MODE=off` turns guest replies off too, and `admins` limits them to `ADMIN_USER_IDS`. `/blockgroup <id>` silences a chat; guest chats appear in `/groups`.
+- **How the voice gets there:** a guest reply can only point at a file already on Telegram, so each reading is uploaded silently to a storage chat, used, and deleted again. That chat is `GUEST_STORAGE_CHAT_ID`, or by default the lowest ID in `ADMIN_USER_IDS` (your own chat with the bot; you may glimpse the upload for a moment). A private channel with the bot as admin keeps it out of sight.
+
 ## What it does
 
 | You do | Ellie does | Cartesia endpoint |

@@ -121,6 +121,12 @@ func run(log *slog.Logger) error {
 	if groupMode == bot.GroupsAdmins && len(admins) == 0 {
 		return errors.New("GROUP_MODE=admins needs ADMIN_USER_IDS: with no admins nobody could add the bot to a group")
 	}
+	var guestStorage int64
+	if v := strings.TrimSpace(os.Getenv("GUEST_STORAGE_CHAT_ID")); v != "" {
+		if guestStorage, err = strconv.ParseInt(v, 10, 64); err != nil || guestStorage == 0 {
+			return fmt.Errorf("GUEST_STORAGE_CHAT_ID must be a chat ID, not %q", v)
+		}
+	}
 
 	b := bot.New(tg, ct, store, owners, chats, bot.Config{
 		AllowedUsers:   allowed,
@@ -142,6 +148,7 @@ func run(log *slog.Logger) error {
 		GroupCooldown:    time.Duration(envLimit("GROUP_COOLDOWN_SECONDS", 10)) * time.Second,
 		GroupConcurrency: envInt("GROUP_CONCURRENCY", 2),
 		GroupNoticeTTL:   time.Duration(envLimit("GROUP_NOTICE_SECONDS", 45)) * time.Second,
+		GuestStorageChat: guestStorage,
 	}, log)
 	log.Info("Ellie Studio starting", "cartesia_version", cartesia.APIVersion, "default_voice", store.Defaults().VoiceName)
 	return b.Run(ctx)

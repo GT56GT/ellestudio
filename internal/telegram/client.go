@@ -214,6 +214,9 @@ type Message struct {
 	SenderChat         *Chat `json:"sender_chat"`
 	MigrateToChatID    int64 `json:"migrate_to_chat_id"`
 	MigrateFromChatID  int64 `json:"migrate_from_chat_id"`
+	// GuestQueryID is set when someone mentions the bot in a chat it is not
+	// a member of (guest mode). Answer it once with AnswerGuestQuery.
+	GuestQueryID string `json:"guest_query_id"`
 }
 
 // Thread is the forum topic the message belongs to (0 outside topics).
@@ -263,6 +266,8 @@ type Update struct {
 	Message       *Message           `json:"message"`
 	CallbackQuery *CallbackQuery     `json:"callback_query"`
 	MyChatMember  *ChatMemberUpdated `json:"my_chat_member"`
+	// GuestMessage is a mention of the bot in a chat it is not a member of.
+	GuestMessage *Message `json:"guest_message"`
 }
 
 type InlineKeyboardButton struct {
@@ -454,7 +459,7 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64, timeout time.Dura
 	params := map[string]any{
 		"offset":          offset,
 		"timeout":         int(timeout.Seconds()),
-		"allowed_updates": []string{"message", "callback_query", "my_chat_member"},
+		"allowed_updates": []string{"message", "callback_query", "my_chat_member", "guest_message"},
 	}
 	var ups []Update
 	return ups, c.call(ctx, "getUpdates", params, &ups)
@@ -641,6 +646,8 @@ type MediaParams struct {
 	Title            string // sendAudio only
 	// ReplyMarkup is an optional keyboard attached under the media.
 	ReplyMarkup any
+	// Silent sends without a notification sound.
+	Silent bool
 }
 
 // SendVoice uploads a voice note (OGG/Opus, MP3, or M4A).
@@ -675,6 +682,9 @@ func (c *Client) sendMedia(ctx context.Context, method, field string, p MediaPar
 	}
 	if p.Title != "" {
 		_ = w.WriteField("title", p.Title)
+	}
+	if p.Silent {
+		_ = w.WriteField("disable_notification", "true")
 	}
 	if rp := replyParams(p.ReplyTo, p.ReplyToEphemeral); rp != nil {
 		raw, _ := json.Marshal(rp)
@@ -741,4 +751,41 @@ func (c *Client) Download(ctx context.Context, fileID string, maxBytes int64) ([
 		return nil, "", fmt.Errorf("telegram: file exceeds %d bytes", maxBytes)
 	}
 	return data, f.FilePath, nil
+}
+
+// ---------------------------------------------------------------- guest mode
+
+// InlineQueryResultCachedVoice is a voice note already on Telegram's servers.
+type InlineQueryResultCachedVoice struct {
+	Type        string                `json:"type"` // "voice"
+	ID          string                `json:"id"`
+	VoiceFileID string                `json:"voice_file_id"`
+	Title       string                `json:"title"`
+	Caption     string                `json:"caption,omitempty"`
+	ReplyMarkup *InlineKeyboardMarkup `json:"reply_markup,omitempty"`
+}
+
+// InputTextMessageContent is the text an article result posts.
+type InputTextMessageContent struct {
+	MessageText string `json:"message_text"`
+	ParseMode   string `json:"parse_mode,omitempty"`
+}
+
+// InlineQueryResultArticle posts a text message.
+type InlineQueryResultArticle struct {
+	Type                string                  `json:"type"` // "article"
+	ID                  string                  `json:"id"`
+	Title               string                  `json:"title"`
+	InputMessageContent InputTextMessageContent `json:"input_message_content"`
+	ReplyMarkup         *InlineKeyboardMarkup   `json:"reply_markup,omitempty"`
+}
+
+// AnswerGuestQuery posts the bot's one reply to a guest mention and returns
+// the sent message's inline_message_id.
+func (c *Client) AnswerGuestQuery(ctx context.Context, queryID string, result any) (string, error) {
+	var sent struct {
+		InlineMessageID string `json:"inline_message_id"`
+	}
+	err := c.call(ctx, "answerGuestQuery", map[string]any{"guest_query_id": queryID, "result": result}, &sent)
+	return sent.InlineMessageID, err
 }

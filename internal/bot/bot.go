@@ -54,6 +54,11 @@ type Config struct {
 	// day, on top of each member's own allowance. Only the named AdminUsers
 	// are exempt (when AdminUsers is empty, nobody is).
 	GroupLimits GroupLimits
+	// GuestStorageChat is where guest-mode recordings are uploaded (and
+	// deleted again) to get a Telegram file id, since a guest reply can only
+	// point at a file already on Telegram. Zero means the lowest admin ID;
+	// with no admins, guest mode replies that it isn't set up.
+	GuestStorageChat int64
 	// GroupCooldown is how long one person waits between requests in a group.
 	GroupCooldown time.Duration
 	// GroupConcurrency caps the jobs running at once in one group.
@@ -109,6 +114,13 @@ func New(tg *telegram.Client, ct *cartesia.Client, store *Store, owners Owners, 
 	}
 	if cfg.GroupMode == "" {
 		cfg.GroupMode = GroupsOpen
+	}
+	if cfg.GuestStorageChat == 0 {
+		for uid, ok := range cfg.AdminUsers {
+			if ok && (cfg.GuestStorageChat == 0 || uid < cfg.GuestStorageChat) {
+				cfg.GuestStorageChat = uid
+			}
+		}
 	}
 	if cfg.MaxTTSChars <= 0 {
 		cfg.MaxTTSChars = 1500
@@ -278,6 +290,8 @@ func (b *Bot) handleUpdate(ctx context.Context, u telegram.Update) {
 		b.handleCallback(ctx, u.CallbackQuery)
 	case u.MyChatMember != nil:
 		b.onMembership(ctx, u.MyChatMember)
+	case u.GuestMessage != nil:
+		b.handleGuest(ctx, u.GuestMessage)
 	}
 }
 

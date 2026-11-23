@@ -308,23 +308,7 @@ func (b *Bot) speak(ctx context.Context, m *telegram.Message, text string) {
 		return
 	}
 
-	req := cartesia.TTSRequest{
-		ModelID:             s.Model,
-		Transcript:          text,
-		Voice:               cartesia.VoiceRef{ID: s.VoiceID},
-		Language:            s.Language,
-		OutputFormat:        cartesia.MP3(44100, 128000),
-		PronunciationDictID: s.DictID,
-	}
-	if s.Emotion != "" || s.Speed != 1 || s.Volume != 1 {
-		req.GenerationConfig = &cartesia.GenerationConfig{Emotion: s.Emotion}
-		if s.Speed != 1 {
-			req.GenerationConfig.Speed = s.Speed
-		}
-		if s.Volume != 1 {
-			req.GenerationConfig.Volume = s.Volume
-		}
-	}
+	req := ttsRequest(s, text)
 
 	if !b.begin(uid) {
 		b.busyNotice(ctx, m)
@@ -360,6 +344,28 @@ func (b *Bot) speak(ctx context.Context, m *telegram.Message, text string) {
 	}
 	b.remember(uid, func(r *recent) { r.spoken = text })
 	b.sendSpeech(ctx, m, s, text, audio)
+}
+
+// ttsRequest reads text in the user's chosen voice and style.
+func ttsRequest(s Settings, text string) cartesia.TTSRequest {
+	req := cartesia.TTSRequest{
+		ModelID:             s.Model,
+		Transcript:          text,
+		Voice:               cartesia.VoiceRef{ID: s.VoiceID},
+		Language:            s.Language,
+		OutputFormat:        cartesia.MP3(44100, 128000),
+		PronunciationDictID: s.DictID,
+	}
+	if s.Emotion != "" || s.Speed != 1 || s.Volume != 1 {
+		req.GenerationConfig = &cartesia.GenerationConfig{Emotion: s.Emotion}
+		if s.Speed != 1 {
+			req.GenerationConfig.Speed = s.Speed
+		}
+		if s.Volume != 1 {
+			req.GenerationConfig.Volume = s.Volume
+		}
+	}
+	return req
 }
 
 // ttsWithRetry retries briefly when Cartesia reports concurrency limits.

@@ -63,6 +63,10 @@ func (f *fakeTelegram) handler(t *testing.T) http.HandlerFunc {
 		switch method {
 		case "getFile":
 			result = `{"file_id":"f1","file_size":16,"file_path":"voice/file_1.oga"}`
+		case "sendVoice":
+			result = `{"message_id":99,"chat":{"id":1},"voice":{"file_id":"vf1","duration":1}}`
+		case "answerGuestQuery":
+			result = `{"inline_message_id":"im1"}`
 		case "sendChatAction", "answerCallbackQuery", "editMessageText", "setMyCommands",
 			"editEphemeralMessageText", "deleteEphemeralMessage", "deleteMessage", "leaveChat":
 			result = `true`
