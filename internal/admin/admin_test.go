@@ -411,3 +411,32 @@ func TestSecurityHeadersAndUI(t *testing.T) {
 		t.Errorf("asset = %q", body)
 	}
 }
+
+func TestClientIPIgnoresSpoofableHeaders(t *testing.T) {
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "10.0.0.5:1234"
+	r.Header.Set("CF-Connecting-IP", "1.2.3.4")
+	if got := clientIP(r); got != "10.0.0.5" {
+		t.Errorf("without a proxy header: %q", got)
+	}
+	r.Header.Set("X-Forwarded-For", "6.6.6.6, 203.0.113.9")
+	if got := clientIP(r); got != "203.0.113.9" {
+		t.Errorf("should use the hop the proxy added: %q", got)
+	}
+}
+
+func TestLimiterMemoryIsBounded(t *testing.T) {
+	l := newLimiter(10, time.Minute)
+	for i := range limiterKeys + 50 {
+		l.allow(strconv.Itoa(i), testNow)
+	}
+	if len(l.seen) > limiterKeys {
+		t.Fatalf("limiter holds %d keys", len(l.seen))
+	}
+	if l.allow("new-address", testNow) {
+		t.Fatal("a full limiter admitted a new address")
+	}
+	if !l.allow("new-address", testNow.Add(2*time.Minute)) {
+		t.Fatal("old entries never aged out")
+	}
+}

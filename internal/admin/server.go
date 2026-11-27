@@ -569,12 +569,11 @@ func truncate(s string, n int) string {
 	return s[:n]
 }
 
-// clientIP is the caller's address. Behind Render's proxy it comes from the
-// proxy's headers; it is used only for rate limiting and the audit log.
+// clientIP is the caller's address, used only for rate limiting and the
+// audit log. Behind Render's proxy it is the last X-Forwarded-For entry,
+// the one the proxy itself appended; earlier entries (and headers like
+// CF-Connecting-IP) can be set by the caller, so they are never trusted.
 func clientIP(r *http.Request) string {
-	if ip := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); ip != "" {
-		return ip
-	}
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		parts := strings.Split(xff, ",")
 		return strings.TrimSpace(parts[len(parts)-1]) // the hop our proxy added
@@ -602,6 +601,9 @@ func (r *statusRecorder) Header() http.Header {
 func (r *statusRecorder) WriteHeader(code int)        { r.status = code }
 func (r *statusRecorder) Write(b []byte) (int, error) { return len(b), nil }
 
+// limiterKeys caps how many addresses the sign-in limiter remembers.
+const limiterKeys = 10_000
+
 // limiter allows n attempts per key in each window.
 type limiter struct {
 	mu     sync.Mutex
@@ -617,10 +619,17 @@ func newLimiter(n int, window time.Duration) *limiter {
 func (l *limiter) allow(key string, now time.Time) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if len(l.seen) > 10_000 { // forget old keys
+	if len(l.seen) >= limiterKeys { // forget old keys
 		for k, ts := range l.seen {
-			if now.Sub(ts[len(ts)-1]) > l.window {
+			if len(ts) == 0 || now.Sub(ts[len(ts)-1]) > l.window {
 				delete(l.seen, k)
+			}
+		}
+		if len(l.seen) >= limiterKeys {
+			// Still full: someone is cycling addresses. Refuse new ones
+			// until old entries age out, so memory stays bounded.
+			if _, known := l.seen[key]; !known {
+				return false
 			}
 		}
 	}
