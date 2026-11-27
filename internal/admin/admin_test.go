@@ -427,16 +427,27 @@ func TestClientIPIgnoresSpoofableHeaders(t *testing.T) {
 
 func TestLimiterMemoryIsBounded(t *testing.T) {
 	l := newLimiter(10, time.Minute)
+	l.allow("admin", testNow.Add(-time.Second)) // the real admin, earlier
 	for i := range limiterKeys + 50 {
 		l.allow(strconv.Itoa(i), testNow)
 	}
 	if len(l.seen) > limiterKeys {
 		t.Fatalf("limiter holds %d keys", len(l.seen))
 	}
-	if l.allow("new-address", testNow) {
-		t.Fatal("a full limiter admitted a new address")
+	// A flood of new addresses must not lock anyone else out.
+	if !l.allow("new-address", testNow) {
+		t.Fatal("a full limiter refused a new address")
 	}
-	if !l.allow("new-address", testNow.Add(2*time.Minute)) {
-		t.Fatal("old entries never aged out")
+}
+
+func TestRateKeyGroupsIPv6(t *testing.T) {
+	if rateKey("2001:db8:1:2:aaaa::1") != rateKey("2001:db8:1:2:bbbb::9") {
+		t.Error("addresses in one /64 should share a key")
+	}
+	if rateKey("2001:db8:1:3::1") == rateKey("2001:db8:1:2::1") {
+		t.Error("different /64s should differ")
+	}
+	if rateKey("203.0.113.9") != "203.0.113.9" {
+		t.Error("IPv4 addresses are their own key")
 	}
 }

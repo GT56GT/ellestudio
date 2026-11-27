@@ -274,7 +274,7 @@ func (s *Server) authConfig(w http.ResponseWriter, _ *http.Request) {
 // then the admin list. It writes the failure response itself.
 func (s *Server) admit(w http.ResponseWriter, r *http.Request, verify func() (TelegramUser, error)) (TelegramUser, bool) {
 	ip := clientIP(r)
-	if !s.login.allow(ip, s.now()) {
+	if !s.login.allow(rateKey(ip), s.now()) {
 		writeError(w, http.StatusTooManyRequests, "Too many sign-in attempts. Wait a few minutes and try again.")
 		return TelegramUser{}, false
 	}
@@ -601,6 +601,17 @@ func (r *statusRecorder) Header() http.Header {
 func (r *statusRecorder) WriteHeader(code int)        { r.status = code }
 func (r *statusRecorder) Write(b []byte) (int, error) { return len(b), nil }
 
+// rateKey is the limiter's key for an address: IPv6 addresses are grouped
+// by /64, the block one subscriber usually holds, so a single network can't
+// pose as thousands of callers.
+func rateKey(ip string) string {
+	a := net.ParseIP(ip)
+	if a == nil || a.To4() != nil {
+		return ip
+	}
+	return a.Mask(net.CIDRMask(64, 128)).String() + "/64"
+}
+
 // limiterKeys caps how many addresses the sign-in limiter remembers.
 const limiterKeys = 10_000
 
@@ -625,12 +636,17 @@ func (l *limiter) allow(key string, now time.Time) bool {
 				delete(l.seen, k)
 			}
 		}
-		if len(l.seen) >= limiterKeys {
-			// Still full: someone is cycling addresses. Refuse new ones
-			// until old entries age out, so memory stays bounded.
-			if _, known := l.seen[key]; !known {
-				return false
+		// Still full (someone cycling addresses): make room by forgetting the
+		// address idle longest, so memory stays bounded without locking
+		// anyone else out.
+		for len(l.seen) >= limiterKeys {
+			oldest, at := "", now
+			for k, ts := range l.seen {
+				if last := ts[len(ts)-1]; last.Before(at) || oldest == "" {
+					oldest, at = k, last
+				}
 			}
+			delete(l.seen, oldest)
 		}
 	}
 	recent := l.seen[key][:0]
