@@ -225,6 +225,11 @@ func (b *Bot) refuseLimit(ctx context.Context, m *telegram.Message, speech bool,
 	if !speech {
 		kind = "transcription"
 	}
+	if u.Studio {
+		b.track(ctx, m.From.ID, evLimit, "studio", need)
+		b.replyNotice(ctx, m, studioFullScreen())
+		return
+	}
 	b.track(ctx, m.From.ID, evLimit, kind, need)
 	if !isGroupChat(m.Chat.ID) {
 		ls := b.limitScreen(speech, u, need)

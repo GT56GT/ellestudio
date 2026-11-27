@@ -43,7 +43,22 @@ type Client struct {
 	maxWait    time.Duration
 	paceMu     sync.Mutex
 	buckets    map[int64]*bucket
+
+	// Every outgoing message, in any chat, is also spaced to stay under
+	// Telegram's overall limit for a bot (about 30 messages a second): at
+	// most globalBurst at once, then one every globalGap. These sends wait
+	// their turn rather than fail.
+	globalMu    sync.Mutex
+	globalGap   time.Duration
+	globalBurst int
+	globalNext  time.Time // when the bucket is next empty (GCRA)
 }
+
+// Default overall pace: 25 messages a second, a little under Telegram's limit.
+const (
+	defaultGlobalGap   = time.Second / 25
+	defaultGlobalBurst = 25
+)
 
 // ErrFlood means a group already has as many sends queued as it may.
 var ErrFlood = errors.New("telegram: too many messages queued for this group")
@@ -72,7 +87,52 @@ func New(token, apiURL string) *Client {
 		groupBurst: 5,
 		maxWait:    10 * time.Second,
 		buckets:    map[int64]*bucket{},
+
+		globalGap:   defaultGlobalGap,
+		globalBurst: defaultGlobalBurst,
 	}
+}
+
+// SetGlobalPacing changes the overall send pace (gap 0 turns it off).
+func (c *Client) SetGlobalPacing(gap time.Duration, burst int) {
+	c.globalMu.Lock()
+	defer c.globalMu.Unlock()
+	c.globalGap, c.globalBurst, c.globalNext = gap, max(burst, 1), time.Time{}
+}
+
+// paced reports whether method sends a message and so counts toward
+// Telegram's overall limit. Reads, polling, callback answers and chat
+// actions don't, and are never delayed.
+func paced(method string) bool {
+	switch {
+	case method == "sendChatAction":
+		return false
+	case strings.HasPrefix(method, "send"), strings.HasPrefix(method, "edit"),
+		method == "copyMessage", method == "forwardMessage",
+		method == "answerGuestQuery", method == "answerInlineQuery":
+		return true
+	}
+	return false
+}
+
+// throttle waits for an overall send slot. It is a GCRA limiter: each send
+// moves globalNext on by one gap, and a send may go as soon as globalNext is
+// less than a burst ahead of now.
+func (c *Client) throttle(ctx context.Context) error {
+	c.globalMu.Lock()
+	if c.globalGap <= 0 {
+		c.globalMu.Unlock()
+		return nil
+	}
+	now := time.Now()
+	next := c.globalNext
+	if next.Before(now) {
+		next = now
+	}
+	wait := next.Sub(now) - time.Duration(c.globalBurst-1)*c.globalGap
+	c.globalNext = next.Add(c.globalGap)
+	c.globalMu.Unlock()
+	return sleepCtx(ctx, wait)
 }
 
 // SetGroupPacing changes how sends to groups are spaced and how long one
@@ -399,6 +459,11 @@ func (c *Client) scrub(err error) error {
 // post sends body, sitting out short flood waits (HTTP 429 with a
 // retry_after of up to maxRetryAfter) and trying again, at most twice.
 func (c *Client) post(ctx context.Context, method string, body []byte, contentType string, out any) error {
+	if paced(method) {
+		if err := c.throttle(ctx); err != nil {
+			return err
+		}
+	}
 	for attempt := 0; ; attempt++ {
 		err := c.postOnce(ctx, method, bytes.NewReader(body), contentType, out)
 		var te *Error

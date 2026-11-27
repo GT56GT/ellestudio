@@ -249,6 +249,19 @@ func (b *Bot) startProgress(ctx context.Context, m *telegram.Message, text strin
 	return &progress{b, msg, m.Thread()}
 }
 
+// update rewrites the progress message in place (best effort).
+func (p *progress) update(ctx context.Context, chatID int64, s screen) {
+	if p.msg == nil {
+		return
+	}
+	if err := p.b.tg.EditMessageText(ctx, telegram.SendMessageParams{
+		ChatID: chatID, MessageID: p.msg.MessageID, Text: s.text, ParseMode: "HTML",
+		ReplyMarkup: p.b.inlineFor(chatID, s.kb), NoPreview: true,
+	}); err != nil {
+		p.b.log.Debug("progress update failed", "err", err)
+	}
+}
+
 // finish replaces the progress message with s (or posts s if that fails).
 func (p *progress) finish(ctx context.Context, chatID int64, s screen) {
 	if p.msg != nil {
@@ -273,6 +286,7 @@ func (b *Bot) remember(uid int64, fn func(*recent)) {
 		r = &recent{}
 		b.recent[uid] = r
 	}
+	r.at = time.Now()
 	fn(r)
 }
 
@@ -339,12 +353,12 @@ func (b *Bot) speak(ctx context.Context, m *telegram.Message, raw string) {
 	}
 	_ = b.tg.SendChatAction(ctx, m.Chat.ID, m.Thread(), action)
 
-	if !b.acquire(ctx) {
+	if !b.waitTurn(ctx, m, nil) {
 		b.refundAll(m, chars, 0)
 		return
 	}
 	audio, err := b.ttsWithRetry(ctx, req)
-	b.release()
+	b.release(err)
 	if err != nil {
 		b.refundAll(m, chars, 0)
 		b.fail(ctx, m, "tts", err)
@@ -492,8 +506,16 @@ func (b *Bot) settleAudio(m *telegram.Message, claimed int, actual float64) {
 		if _, _, err := b.store.Spend(uid, today(), 0, diff, 0, 0); err != nil {
 			b.log.Warn("save usage", "err", err)
 		}
+		if b.studioCapped() {
+			// Already done, so record it without refusing.
+			ctx, cancel := context.WithTimeout(context.Background(), pgTimeout)
+			if _, err := b.budget.Spend(ctx, today(), 0, diff, 0, 0); err != nil {
+				b.log.Warn("save studio usage", "err", err)
+			}
+			cancel()
+		}
 	case diff < 0:
-		b.store.Refund(uid, today(), 0, -diff, b.cfg.DailyChars)
+		b.refund(uid, 0, -diff)
 	}
 }
 
@@ -509,17 +531,20 @@ func (b *Bot) transcribe(ctx context.Context, m *telegram.Message, a audioRef) {
 		return
 	}
 	pr := b.startProgress(ctx, m, "Listening…")
+	// Take the turn before downloading, so jobs waiting in line hold no audio.
+	if !b.waitTurn(ctx, m, pr) {
+		b.refundAll(m, 0, claimed)
+		return
+	}
+	pr.update(ctx, m.Chat.ID, screen{icWait + " Listening…", nil})
 	data, name, err := b.fetchAudio(ctx, a, telegram.MaxDownloadBytes)
 	if err != nil {
+		b.jobs.release()
 		b.refundAll(m, 0, claimed)
 		pr.finish(ctx, m.Chat.ID, errorScreen(err))
 		return
 	}
 	s := b.store.Get(uid)
-	if !b.acquire(ctx) {
-		b.refundAll(m, 0, claimed)
-		return
-	}
 	tctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	tr, err := b.ct.Transcribe(tctx, cartesia.STTRequest{
 		Audio:    bytes.NewReader(data),
@@ -527,7 +552,7 @@ func (b *Bot) transcribe(ctx context.Context, m *telegram.Message, a audioRef) {
 		Language: baseLang(s.Language),
 	})
 	cancel()
-	b.release()
+	b.release(err)
 	if err != nil {
 		b.refundAll(m, 0, claimed)
 		pr.finish(ctx, m.Chat.ID, errorScreen(err))
@@ -582,18 +607,21 @@ func (b *Bot) runClone(ctx context.Context, m *telegram.Message, a audioRef, nam
 		return
 	}
 	name = orDefault(stripTags(name), "My voice")
-	pr := b.startProgress(ctx, m, "Cloning <b>"+html.EscapeString(name)+"</b>… this takes a few seconds.")
+	working := screen{icWait + " Cloning <b>" + html.EscapeString(name) + "</b>… this takes a few seconds.", nil}
+	pr := b.startProgress(ctx, m, strings.TrimPrefix(working.text, icWait+" "))
+	if !b.waitTurn(ctx, m, pr) {
+		b.refundMake(uid)
+		return
+	}
+	pr.update(ctx, m.Chat.ID, working)
 	data, filename, err := b.fetchAudio(ctx, a, cartesia.MaxCloneClipBytes)
 	if err != nil {
+		b.jobs.release()
 		b.refundMake(uid)
 		pr.finish(ctx, m.Chat.ID, errorScreen(err))
 		return
 	}
 	lang := orDefault(baseLang(b.store.Get(uid).Language), "en")
-	if !b.acquire(ctx) {
-		b.refundMake(uid)
-		return
-	}
 	tctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	v, err := b.ct.CloneVoice(tctx, cartesia.CloneVoiceRequest{
 		Clip:        bytes.NewReader(data),
@@ -603,7 +631,7 @@ func (b *Bot) runClone(ctx context.Context, m *telegram.Message, a audioRef, nam
 		Language:    lang,
 	})
 	cancel()
-	b.release()
+	b.release(err)
 	if err == nil {
 		err = b.keepCreatedVoice(ctx, uid, v.ID)
 	}
@@ -638,20 +666,22 @@ func (b *Bot) detect(ctx context.Context, m *telegram.Message, a audioRef) {
 		return
 	}
 	pr := b.startProgress(ctx, m, "Checking for a watermark…")
-	data, name, err := b.fetchAudio(ctx, a, cartesia.MaxWatermarkBytes)
-	if err != nil {
+	if !b.waitTurn(ctx, m, pr) {
 		b.refundAll(m, 0, claimed)
-		pr.finish(ctx, m.Chat.ID, errorScreen(err))
 		return
 	}
-	if !b.acquire(ctx) {
+	pr.update(ctx, m.Chat.ID, screen{icWait + " Checking for a watermark…", nil})
+	data, name, err := b.fetchAudio(ctx, a, cartesia.MaxWatermarkBytes)
+	if err != nil {
+		b.jobs.release()
 		b.refundAll(m, 0, claimed)
+		pr.finish(ctx, m.Chat.ID, errorScreen(err))
 		return
 	}
 	tctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	found, err := b.ct.DetectWatermark(tctx, bytes.NewReader(data), name)
 	cancel()
-	b.release()
+	b.release(err)
 	if err != nil {
 		b.refundAll(m, 0, claimed)
 		pr.finish(ctx, m.Chat.ID, errorScreen(err))

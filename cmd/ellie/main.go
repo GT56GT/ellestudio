@@ -79,6 +79,7 @@ func run(log *slog.Logger) error {
 		owners  bot.Owners
 		chats   bot.Chats
 		metrics bot.Metrics // nil keeps stats in memory
+		budget  bot.Budget  // nil keeps the studio-wide count in memory
 	)
 	if dbURL := os.Getenv("DATABASE_URL"); dbURL != "" {
 		db, err := bot.OpenDatabase(ctx, dbURL)
@@ -92,6 +93,7 @@ func run(log *slog.Logger) error {
 		owners = db.Owners()
 		chats = db.Chats()
 		metrics = db.Metrics()
+		budget = db.Budget()
 		log.Info("settings stored in Postgres")
 	} else {
 		dir := envOr("DATA_DIR", "data")
@@ -135,14 +137,18 @@ func run(log *slog.Logger) error {
 	}
 
 	b := bot.New(tg, ct, store, owners, chats, bot.Config{
-		AllowedUsers:   allowed,
-		AdminUsers:     admins,
-		MaxTTSChars:    envInt("MAX_TTS_CHARS", 1500),
-		Concurrency:    envInt("CARTESIA_CONCURRENCY", 2),
-		DailyChars:     envLimit("DAILY_CHAR_LIMIT", 2000),
-		DailyAudioSecs: envLimit("DAILY_TRANSCRIBE_MINUTES", 10) * 60,
-		DailyCreations: envLimit("DAILY_VOICE_CREATIONS", 3),
-		DailyDicts:     envLimit("DAILY_DICTIONARIES", 5),
+		AllowedUsers: allowed,
+		AdminUsers:   admins,
+		MaxTTSChars:  envInt("MAX_TTS_CHARS", 1500),
+		Concurrency:  envInt("CARTESIA_CONCURRENCY", 2),
+		QueueLimit:   queueLimit(),
+		// Studio-wide caps across everyone (0 = none).
+		StudioDailyChars:     envLimit("STUDIO_DAILY_CHAR_LIMIT", 0),
+		StudioDailyAudioSecs: envLimit("STUDIO_DAILY_TRANSCRIBE_MINUTES", 0) * 60,
+		DailyChars:           envLimit("DAILY_CHAR_LIMIT", 2000),
+		DailyAudioSecs:       envLimit("DAILY_TRANSCRIBE_MINUTES", 10) * 60,
+		DailyCreations:       envLimit("DAILY_VOICE_CREATIONS", 3),
+		DailyDicts:           envLimit("DAILY_DICTIONARIES", 5),
 
 		GroupMode: groupMode,
 		GroupLimits: bot.GroupLimits{
@@ -162,6 +168,7 @@ func run(log *slog.Logger) error {
 	if metrics != nil {
 		b.SetMetrics(metrics)
 	}
+	b.SetBudget(budget)
 	log.Info("Ellie Studio starting", "cartesia_version", cartesia.APIVersion, "default_voice", store.Defaults().VoiceName)
 	return b.Run(ctx)
 }
@@ -271,6 +278,19 @@ func envLimit(k string, d int) int {
 		return v
 	}
 	return d
+}
+
+// queueLimit reads JOB_QUEUE_LIMIT for bot.Config.QueueLimit: unset keeps
+// the bot's default (50), 0 means no cap.
+func queueLimit() int {
+	switch n := envLimit("JOB_QUEUE_LIMIT", -1); {
+	case n < 0:
+		return 0
+	case n == 0:
+		return -1
+	default:
+		return n
+	}
 }
 
 func envInt(k string, d int) int {

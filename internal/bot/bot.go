@@ -33,6 +33,15 @@ type Config struct {
 	MaxTTSChars int
 	// Concurrency caps simultaneous Cartesia calls (Free plan TTS limit is 2).
 	Concurrency int
+	// QueueLimit is how many Cartesia jobs may wait for a slot before new
+	// ones are turned away. 0 = defaultQueueLimit; negative = no cap.
+	QueueLimit int
+	// StudioDailyChars and StudioDailyAudioSecs cap what everyone together
+	// may use per UTC day (private chats, groups and guest replies), so a
+	// rush can't run through the Cartesia credits. Admins are exempt. 0 =
+	// no cap.
+	StudioDailyChars     int
+	StudioDailyAudioSecs int
 	// PollTimeout is the getUpdates long-poll duration.
 	PollTimeout time.Duration
 	// DailyChars caps characters spoken per user per UTC day (0 = unlimited).
@@ -85,12 +94,18 @@ type Bot struct {
 	chats  Chats  // groups the bot is in, and their shared allowance
 	// metrics records usage events for the admin Stats screen.
 	metrics Metrics
-	cfg     Config
-	log     *slog.Logger
+	// budget is what the whole studio used today (StudioDaily* caps).
+	budget Budget
+	cfg    Config
+	log    *slog.Logger
 
-	cartesiaSlots chan struct{} // bounds concurrent Cartesia work
-	inflight      chan struct{} // bounds concurrent update handlers
-	wg            sync.WaitGroup
+	jobs     *jobLine      // Cartesia slots, handed out in arrival order
+	breaker  breaker       // pauses Cartesia work while it keeps failing
+	inflight chan struct{} // bounds concurrent update handlers
+	wg       sync.WaitGroup
+
+	alertMu sync.Mutex
+	alerted map[string]time.Time // last admin alert of each kind
 
 	sessMu   sync.Mutex
 	sessions map[int64]*browseSession
@@ -111,6 +126,49 @@ type Bot struct {
 type recent struct {
 	spoken     string
 	transcript string
+	at         time.Time
+}
+
+// Per-user state idle for longer than these is dropped by sweep, so memory
+// stays flat however many people have ever used the bot.
+const (
+	sessionIdle = time.Hour      // voice browsing pages
+	recentIdle  = 12 * time.Hour // last reading, for Again and Read aloud
+	sweepEvery  = 10 * time.Minute
+)
+
+// sweep drops idle sessions, old remembered text and expired flows.
+func (b *Bot) sweep(now time.Time) {
+	b.sessMu.Lock()
+	defer b.sessMu.Unlock()
+	for uid, s := range b.sessions {
+		if now.Sub(s.at) > sessionIdle {
+			delete(b.sessions, uid)
+		}
+	}
+	for uid, r := range b.recent {
+		if now.Sub(r.at) > recentIdle {
+			delete(b.recent, uid)
+		}
+	}
+	for uid, f := range b.flows {
+		if now.After(f.expires) {
+			delete(b.flows, uid)
+		}
+	}
+}
+
+func (b *Bot) sweepLoop(ctx context.Context) {
+	t := time.NewTicker(sweepEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			b.sweep(now)
+		}
+	}
 }
 
 // New wires a bot together. A nil owners or chats keeps that registry in
@@ -148,25 +206,27 @@ func New(tg *telegram.Client, ct *cartesia.Client, store *Store, owners Owners, 
 		log = slog.Default()
 	}
 	return &Bot{
-		tg:            tg,
-		ct:            ct,
-		store:         store,
-		owners:        owners,
-		chats:         chats,
-		metrics:       newMemMetrics(),
-		cfg:           cfg,
-		log:           log,
-		cartesiaSlots: make(chan struct{}, cfg.Concurrency),
-		inflight:      make(chan struct{}, 32),
-		sessions:      map[int64]*browseSession{},
-		flows:         map[int64]*flow{},
-		recent:        map[int64]*recent{},
-		busy:          map[int64]bool{},
-		lastUse:       map[chatUser]time.Time{},
-		lastNotice:    map[chatUser]time.Time{},
-		groupJobs:     map[int64]int{},
-		adminCache:    map[chatUser]adminEntry{},
-		noticeAt:      map[noticeKey]time.Time{},
+		tg:         tg,
+		ct:         ct,
+		store:      store,
+		owners:     owners,
+		chats:      chats,
+		metrics:    newMemMetrics(),
+		budget:     newMemBudget(),
+		cfg:        cfg,
+		log:        log,
+		jobs:       newJobLine(cfg.Concurrency, queueLimit(cfg.QueueLimit)),
+		inflight:   make(chan struct{}, maxHandlers),
+		alerted:    map[string]time.Time{},
+		sessions:   map[int64]*browseSession{},
+		flows:      map[int64]*flow{},
+		recent:     map[int64]*recent{},
+		busy:       map[int64]bool{},
+		lastUse:    map[chatUser]time.Time{},
+		lastNotice: map[chatUser]time.Time{},
+		groupJobs:  map[int64]int{},
+		adminCache: map[chatUser]adminEntry{},
+		noticeAt:   map[noticeKey]time.Time{},
 	}
 }
 
@@ -238,6 +298,8 @@ func (b *Bot) Run(ctx context.Context) error {
 	b.importLegacyOwners(ctx)
 	b.wg.Add(1)
 	go func() { defer b.wg.Done(); b.pruneMetrics(ctx) }()
+	b.wg.Add(1)
+	go func() { defer b.wg.Done(); b.sweepLoop(ctx) }()
 
 	var offset int64
 	backoff := time.Second
@@ -313,6 +375,17 @@ func (b *Bot) handleUpdate(ctx context.Context, u telegram.Update) {
 	}
 }
 
+// queueLimit turns Config.QueueLimit into a jobLine cap (0 = no cap).
+func queueLimit(n int) int {
+	switch {
+	case n == 0:
+		return defaultQueueLimit
+	case n < 0:
+		return 0
+	}
+	return n
+}
+
 // ---------------------------------------------------------------- access
 
 func (b *Bot) allowed(uid int64) bool {
@@ -325,18 +398,6 @@ func (b *Bot) isAdmin(uid int64) bool {
 	}
 	return b.cfg.AdminUsers[uid]
 }
-
-// acquire takes a Cartesia slot, or returns false if ctx ends first.
-func (b *Bot) acquire(ctx context.Context) bool {
-	select {
-	case b.cartesiaSlots <- struct{}{}:
-		return true
-	case <-ctx.Done():
-		return false
-	}
-}
-
-func (b *Bot) release() { <-b.cartesiaSlots }
 
 // ---------------------------------------------------------------- replies
 

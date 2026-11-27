@@ -83,6 +83,10 @@ func (b *Bot) spendChars(uid int64, n int) (bool, Usage) {
 	if err != nil {
 		b.log.Warn("save usage", "err", err)
 	}
+	if ok && !b.spendStudio(n, 0) {
+		b.store.Refund(uid, today(), n, 0, b.cfg.DailyChars)
+		return false, Usage{Studio: true}
+	}
 	return ok, u
 }
 
@@ -95,12 +99,18 @@ func (b *Bot) spendSecs(uid int64, n int) (bool, Usage) {
 	if err != nil {
 		b.log.Warn("save usage", "err", err)
 	}
+	if ok && !b.spendStudio(0, n) {
+		b.store.Refund(uid, today(), 0, n, b.cfg.DailyChars)
+		return false, Usage{Studio: true}
+	}
 	return ok, u
 }
 
+// refund gives back a user's spend and the studio-wide share of it.
 func (b *Bot) refund(uid int64, chars, secs int) {
 	if !b.isAdmin(uid) {
 		b.store.Refund(uid, today(), chars, secs, b.cfg.DailyChars)
+		b.refundStudio(chars, secs)
 	}
 }
 

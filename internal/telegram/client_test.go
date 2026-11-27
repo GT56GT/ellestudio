@@ -184,3 +184,42 @@ func TestEphemeralSendsAreNotPaced(t *testing.T) {
 		t.Errorf("private replies waited behind the group's public queue: %v", d)
 	}
 }
+
+func TestOverallSendPace(t *testing.T) {
+	c := New("TOKEN", "http://unused")
+	c.SetGlobalPacing(20*time.Millisecond, 3)
+	ctx := context.Background()
+	start := time.Now()
+	for range 3 { // the burst goes at once
+		if err := c.throttle(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if d := time.Since(start); d > 15*time.Millisecond {
+		t.Fatalf("burst took %v", d)
+	}
+	for range 3 { // then one every gap
+		if err := c.throttle(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if d := time.Since(start); d < 50*time.Millisecond {
+		t.Fatalf("6 sends with burst 3 and gap 20ms took only %v", d)
+	}
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := c.throttle(cctx); err == nil {
+		t.Fatal("a cancelled send should not wait for its turn")
+	}
+}
+
+func TestOnlyMessagesArePaced(t *testing.T) {
+	for m, want := range map[string]bool{
+		"sendMessage": true, "sendVoice": true, "editMessageText": true, "copyMessage": true, "answerGuestQuery": true,
+		"getUpdates": false, "getFile": false, "answerCallbackQuery": false, "sendChatAction": false, "deleteMessage": false,
+	} {
+		if paced(m) != want {
+			t.Errorf("paced(%q) = %v, want %v", m, !want, want)
+		}
+	}
+}

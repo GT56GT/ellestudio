@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -69,6 +70,13 @@ var migrations = []string{
 		n       INT         NOT NULL DEFAULT 0
 	);
 	CREATE INDEX ellie_events_by_time ON ellie_events (at)`,
+	// 6: what the whole studio used each UTC day (see budget.go).
+	`CREATE TABLE ellie_studio_usage (
+		day        TEXT        PRIMARY KEY,
+		chars      INT         NOT NULL DEFAULT 0 CHECK (chars >= 0),
+		secs       INT         NOT NULL DEFAULT 0 CHECK (secs >= 0),
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+	)`,
 }
 
 // migrationLock is the advisory lock key ("ellie") that serialises
@@ -82,7 +90,7 @@ func OpenDatabase(ctx context.Context, databaseURL string) (*DB, error) {
 		// pgx parse errors can echo the URL; never let the password reach logs.
 		return nil, errors.New("database: DATABASE_URL is not a valid Postgres URL")
 	}
-	cfg.MaxConns = 8
+	cfg.MaxConns = 16 // each change holds one for a few milliseconds
 	cfg.MaxConnIdleTime = 5 * time.Minute
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -136,29 +144,17 @@ func migrate(ctx context.Context, pool *pgxpool.Pool) error {
 
 // ---------------------------------------------------------------- settings
 
-// SettingsStore loads every user's settings. Reads are served from memory;
-// each change is written through to the changed user's row.
+// SettingsStore opens the settings store. The database is the source of
+// truth: reads query it, and each change is a transaction that locks only
+// the users it touches. ctx is only used to check the connection.
 func (d *DB) SettingsStore(ctx context.Context, defaults Settings) (*Store, error) {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, pgTimeout)
 	defer cancel()
-	rows, err := d.pool.Query(ctx, `SELECT user_id, settings FROM ellie_user_settings`)
-	if err != nil {
-		return nil, fmt.Errorf("database: load settings: %w", err)
+	if err := d.pool.Ping(ctx); err != nil {
+		return nil, fmt.Errorf("database: settings: %w", err)
 	}
-	data := map[int64]Settings{}
-	var uid int64
-	var raw []byte
-	if _, err := pgx.ForEachRow(rows, []any{&uid, &raw}, func() error {
-		var v Settings
-		if err := json.Unmarshal(raw, &v); err != nil {
-			return fmt.Errorf("user %d: %w", uid, err)
-		}
-		data[uid] = v
-		return nil
-	}); err != nil {
-		return nil, fmt.Errorf("database: load settings: %w", err)
-	}
-	return &Store{backend: pgSettings{d.pool}, defaults: defaults, data: data}, nil
+	p := pgSettings{d.pool}
+	return &Store{backend: p, shared: p, defaults: defaults, data: map[int64]Settings{}}, nil
 }
 
 type pgSettings struct{ pool *pgxpool.Pool }
@@ -188,6 +184,114 @@ func (p pgSettings) save(all map[int64]Settings, changed []int64) error {
 
 // The pool belongs to DB, which closes it.
 func (pgSettings) close() error { return nil }
+
+// userLockSQL takes a transaction-scoped lock on one user. It is an advisory
+// lock (rather than a row lock) so users without a row yet are covered too:
+// two referrals for the same newcomer can't both apply.
+const userLockSQL = `SELECT pg_advisory_xact_lock(hashtextextended('ellie-user:' || $1::bigint, 0))`
+
+// mutate locks uids (in id order, so two changes can never deadlock), reads
+// their rows, runs fn and writes back what it changed, all in one
+// transaction of three round trips.
+func (p pgSettings) mutate(uids []int64, fn func(*userTx)) (map[int64]Settings, error) {
+	ids := slices.Clone(uids)
+	slices.Sort(ids)
+	ids = slices.Compact(ids)
+	ctx, cancel := context.WithTimeout(context.Background(), pgTimeout)
+	defer cancel()
+	var saved map[int64]Settings
+	err := pgx.BeginFunc(ctx, p.pool, func(tx pgx.Tx) error {
+		read := &pgx.Batch{}
+		for _, id := range ids {
+			read.Queue(userLockSQL, id)
+		}
+		read.Queue(`SELECT user_id, settings FROM ellie_user_settings WHERE user_id = ANY($1) FOR UPDATE`, ids)
+		br := tx.SendBatch(ctx, read)
+		for range ids {
+			if _, err := br.Exec(); err != nil {
+				br.Close()
+				return fmt.Errorf("lock user: %w", err)
+			}
+		}
+		t := newUserTx()
+		rows, err := br.Query()
+		if err == nil {
+			var uid int64
+			var raw []byte
+			_, err = pgx.ForEachRow(rows, []any{&uid, &raw}, func() error {
+				var v Settings
+				if err := json.Unmarshal(raw, &v); err != nil {
+					return fmt.Errorf("user %d: %w", uid, err)
+				}
+				t.cur[uid], t.known[uid] = v, true
+				return nil
+			})
+		}
+		if cerr := br.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return fmt.Errorf("read users: %w", err)
+		}
+
+		fn(t)
+		if len(t.dirty) == 0 {
+			return nil
+		}
+		saved = make(map[int64]Settings, len(t.dirty))
+		write := &pgx.Batch{}
+		for uid := range t.dirty {
+			raw, err := json.Marshal(t.cur[uid])
+			if err != nil {
+				return err
+			}
+			saved[uid] = t.cur[uid]
+			write.Queue(`INSERT INTO ellie_user_settings (user_id, settings, updated_at)
+				VALUES ($1, $2, now())
+				ON CONFLICT (user_id) DO UPDATE SET settings = EXCLUDED.settings, updated_at = now()`, uid, raw)
+		}
+		return tx.SendBatch(ctx, write).Close()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("database: save settings: %w", err)
+	}
+	return saved, nil
+}
+
+func (p pgSettings) load(uid int64) (Settings, bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), pgTimeout)
+	defer cancel()
+	var raw []byte
+	err := p.pool.QueryRow(ctx, `SELECT settings FROM ellie_user_settings WHERE user_id = $1`, uid).Scan(&raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Settings{}, false, nil
+	}
+	if err != nil {
+		return Settings{}, false, fmt.Errorf("database: load settings: %w", err)
+	}
+	var v Settings
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return Settings{}, false, fmt.Errorf("database: user %d: %w", uid, err)
+	}
+	return v, true, nil
+}
+
+// forgetVoice is one UPDATE; it waits for any change holding those rows.
+func (p pgSettings) forgetVoice(id string) ([]int64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), pgTimeout)
+	defer cancel()
+	rows, err := p.pool.Query(ctx, `UPDATE ellie_user_settings
+		SET settings = settings || '{"voice_id": "", "voice_name": ""}'::jsonb, updated_at = now()
+		WHERE settings->>'voice_id' = $1 RETURNING user_id`, id)
+	if err != nil {
+		return nil, fmt.Errorf("database: forget voice: %w", err)
+	}
+	uids, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		return nil, fmt.Errorf("database: forget voice: %w", err)
+	}
+	return uids, nil
+}
 
 // ---------------------------------------------------------------- ownership
 

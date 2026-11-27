@@ -305,6 +305,7 @@ func (b *Bot) statsScreen(ctx context.Context) screen {
 		fmtInt(tot.New), fmtInt(tot.FromGroups), fmtInt(tot.FromInvites))))
 	sb.WriteString(field("📣", "Group invites shown", fmtInt(tot.GuestInvites)))
 	sb.WriteString(field("🎟", "Hit the daily limit", fmtInt(tot.LimitUsers)+" user-days"))
+	sb.WriteString(b.studioLines(ctx))
 	if len(days) > 0 {
 		sb.WriteString("\n<b>By day</b>\n")
 		for _, d := range days {

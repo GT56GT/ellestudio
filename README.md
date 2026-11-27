@@ -39,10 +39,11 @@ Don't know your Telegram ID? Start the bot with `ALLOWED_USER_IDS` set to anythi
 | Who created each voice and dictionary | The bot's database (`ellie_ownership`) |
 | Each user's choices (voice, style, output) and today's usage | The bot's database (`ellie_user_settings`) |
 | Groups the bot is in, blocked groups, and each group's usage today | The bot's database (`ellie_chats`) |
+| What the whole studio used each day | The bot's database (`ellie_studio_usage`) |
 
 The bot's database is one of:
 
-- **Postgres** (production): set `DATABASE_URL`. On Render, use the database's **Internal** connection string. Tables are created and upgraded on startup by versioned migrations (`ellie_schema_migrations`), which are safe when two instances start at once during a deploy.
+- **Postgres** (production): set `DATABASE_URL`. On Render, use the database's **Internal** connection string. Tables are created and upgraded on startup by versioned migrations (`ellie_schema_migrations`), which are safe when two instances start at once during a deploy. The database is the source of truth for user settings: each change is one short transaction that locks only that user (an advisory lock, so it covers users with no row yet), so users never wait on each other and two instances running side by side can't overwrite each other's changes. If the database is briefly unreachable, the bot carries on from a memory copy and logs the error.
 - **Files** (local runs): without `DATABASE_URL`, the bot writes `DATA_DIR/settings.json`, `DATA_DIR/owners.json` and `DATA_DIR/chats.json`. Hosts without a persistent disk, such as Render, wipe these on every deploy.
 
 ### Ownership
@@ -61,6 +62,14 @@ Leave `ALLOWED_USER_IDS` empty and keep your own ID in `ADMIN_USER_IDS`. Then:
 
 - Each user gets a **daily allowance**: `DAILY_CHAR_LIMIT` characters of speech (default 2,000) and `DAILY_TRANSCRIBE_MINUTES` minutes of transcription and watermark checks (default 10). It resets at midnight UTC. Users see what's left in ⚙️ Studio, and a friendly screen tells them when it refreshes. Failed requests are refunded. Resetting settings doesn't refill it. Admins are unlimited.
 - Each user runs **one request at a time**, so nobody can tie up the shared Cartesia slots.
+- **A cap for everyone together** (optional, off by default): `STUDIO_DAILY_CHAR_LIMIT` characters and `STUDIO_DAILY_TRANSCRIBE_MINUTES` minutes a day across private chats, groups and guest replies. When it's reached, people see "Ellie is resting for today" (and aren't charged), and admins get one Telegram alert that day. Set it from your Cartesia plan's credits so a sudden rush can't run them out. Admins are exempt.
+
+### Busy times
+
+- **A fair waiting line.** Cartesia work (readings, transcriptions, clones, watermark checks) waits in one first-come, first-served line for the `CARTESIA_CONCURRENCY` slots. After two seconds in line, people see "You're #3 in line", and the note disappears when their turn starts. Menus, buttons and `/start` never wait behind it. At most `JOB_QUEUE_LIMIT` jobs wait (default 50, `0` = no cap); past that, new requests get "Ellie is very busy, try again in a minute" and aren't charged. Audio is downloaded only when its turn comes, so a long line holds no files in memory.
+- **Automatic pause when Cartesia fails.** After 5 Cartesia failures in a row (server errors or timeouts, not bad requests), voice work pauses for a minute, then one request tries again. If Cartesia says the credits ran out, it pauses for 10 minutes. While paused, people see a short "try again in a few minutes" message and aren't charged, and admins get a Telegram alert (at most one per kind every 30 minutes).
+- **Telegram's limits.** Besides the per-group pacing, every outgoing message is spaced to 25 a second overall, under Telegram's limit of about 30. Polling, button answers and typing indicators aren't delayed.
+- **Flat memory.** Browsing state, remembered text (for Again and Read aloud) and unfinished steps are dropped once idle, so memory doesn't grow with the number of people who have ever used the bot.
 - **Everyone can clone** (and localize their own voices), up to `DAILY_VOICE_CREATIONS` new voices a day (default 3). Anyone can create pronunciation dictionaries.
 - **Voices are unlisted, and the ID is the key.** Your library shows Cartesia's public voices plus voices *you* made, never anyone else's. To share one, open it and tap 🔗 **Share**. You get a link (`t.me/EllieStudioBot?start=v_<id>`) and the voice ID. Whoever has either can use the voice: tapping the link, pasting it, or pasting the ID opens the voice right away.
 - **Only the creator** (or an admin) can rename, delete, localize or share a voice. Ownership is recorded in the bot's database (see [Ownership](#ownership)).
@@ -131,6 +140,7 @@ With Telegram's guest mode (Bot API 10.0), anyone can type `@EllieStudioBot good
 - new users, and how many came from groups (guest mode or a group's "private chat" link) or from a friend's invite
 - "Start Ellie" invites shown in other chats
 - how many users hit the daily limit
+- the studio-wide cap used today, how many jobs are waiting, and whether voice work is paused
 - a line per day
 
 Stats come from small events (`ellie_events`: user ID, kind, source, a count, a time), never message text, and are pruned after 90 days. Without Postgres they live in memory and start over on restart.

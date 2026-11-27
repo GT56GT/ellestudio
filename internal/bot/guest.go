@@ -106,7 +106,11 @@ func (b *Bot) handleGuest(ctx context.Context, m *telegram.Message) {
 	}
 	defer done()
 	chars := utf8.RuneCountInString(text)
-	if ok, _ := b.spendChars(uid, chars); !ok {
+	if ok, u := b.spendChars(uid, chars); !ok {
+		if u.Studio {
+			b.answerGuestText(ctx, m, studioFullScreen())
+			return
+		}
 		b.answerGuestText(ctx, m, noticeScreen("🎟", "Your daily allowance is used up",
 			"You can read more in <b>"+fmtWait(untilReset())+"</b> (midnight UTC)."))
 		return
@@ -135,13 +139,16 @@ func (b *Bot) handleGuest(ctx context.Context, m *telegram.Message) {
 	// queue behind long jobs and answer after it has expired.
 	ctx, cancel := context.WithTimeout(ctx, guestDeadline)
 	defer cancel()
-	if !b.acquire(ctx) {
+	if err := b.acquire(ctx, nil); err != nil {
 		undo()
-		b.log.Warn("guest reply timed out waiting for Cartesia", "user", uid)
+		b.log.Warn("guest reply could not start", "user", uid, "reason", err, "queued", b.jobs.queued())
+		if ctx.Err() == nil {
+			b.answerGuestText(ctx, m, busyScreen(err))
+		}
 		return
 	}
 	audio, err := b.ttsWithRetry(ctx, ttsRequest(s, text))
-	b.release()
+	b.release(err)
 	if err != nil {
 		undo()
 		b.log.Error("guest tts", "user", uid, "err", err)

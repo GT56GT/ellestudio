@@ -24,19 +24,24 @@ type browseSession struct {
 	owned   bool
 	cursors []string // starting_after per visited page; [0] == ""
 	next    string
+	at      time.Time // last used, so idle sessions can be dropped
 }
 
 func (b *Bot) session(uid int64) *browseSession {
 	b.sessMu.Lock()
 	defer b.sessMu.Unlock()
-	return b.sessions[uid]
+	s := b.sessions[uid]
+	if s != nil {
+		s.at = time.Now()
+	}
+	return s
 }
 
 // resetSession starts a fresh browse, keeping the user's filters.
 func (b *Bot) resetSession(uid int64, query string, owned *bool) *browseSession {
 	b.sessMu.Lock()
 	defer b.sessMu.Unlock()
-	s := &browseSession{query: query, cursors: []string{""}}
+	s := &browseSession{query: query, cursors: []string{""}, at: time.Now()}
 	if old := b.sessions[uid]; old != nil {
 		s.gender, s.owned = old.gender, old.owned
 	}
@@ -566,8 +571,11 @@ func (b *Bot) runLocalize(ctx context.Context, uid int64, target *telegram.Messa
 		return
 	}
 	draw(screen{header(icWait, "Localizing "+orDefault(s.VoiceName, "your voice"), "") + "This usually takes 10–30 seconds.", nil})
-	if !b.acquire(ctx) {
+	if err := b.acquire(ctx, func(pos int) { draw(lineScreen(pos)) }); err != nil {
 		b.refundMake(uid)
+		if ctx.Err() == nil {
+			draw(busyScreen(err))
+		}
 		return
 	}
 	tctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
@@ -576,7 +584,7 @@ func (b *Bot) runLocalize(ctx context.Context, uid int64, target *telegram.Messa
 		Description: "Localized in Ellie Studio",
 	})
 	cancel()
-	b.release()
+	b.release(err)
 	if err == nil {
 		err = b.keepCreatedVoice(ctx, uid, v.ID)
 	}
