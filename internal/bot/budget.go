@@ -132,13 +132,106 @@ func (p pgBudget) Used(ctx context.Context, day string) (int, int, error) {
 	return chars, secs, nil
 }
 
+// ---------------------------------------------------------------- outages
+
+// guardedBudget keeps enforcing the cap while the database can't be
+// reached, so an outage can't reopen the day's budget. A local count
+// follows every spend this instance makes and is seeded from the database
+// once a day. If today's total was never learned, spends are refused.
+type guardedBudget struct {
+	primary Budget
+
+	mu    sync.Mutex
+	day   string
+	known bool // the local count includes the database's total for day
+	chars int
+	secs  int
+}
+
+// errBudgetUnknown means the cap couldn't be checked at all.
+var errBudgetUnknown = errors.New("bot: studio budget unknown while the database is unreachable")
+
+func (g *guardedBudget) roll(day string) {
+	if g.day != day {
+		g.day, g.known, g.chars, g.secs = day, false, 0, 0
+	}
+}
+
+// seed learns day's total from the database the first time it's needed.
+func (g *guardedBudget) seed(ctx context.Context, day string) {
+	g.mu.Lock()
+	g.roll(day)
+	known := g.known
+	g.mu.Unlock()
+	if known {
+		return
+	}
+	chars, secs, err := g.primary.Used(ctx, day)
+	if err != nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.day == day && !g.known {
+		g.known, g.chars, g.secs = true, g.chars+chars, g.secs+secs
+	}
+}
+
+func (g *guardedBudget) Spend(ctx context.Context, day string, chars, secs, charLimit, secLimit int) (bool, error) {
+	g.seed(ctx, day)
+	ok, err := g.primary.Spend(ctx, day, chars, secs, charLimit, secLimit)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.roll(day)
+	if err == nil {
+		if ok {
+			g.chars += chars
+			g.secs += secs
+		}
+		return ok, nil
+	}
+	if !g.known {
+		return false, errors.Join(errBudgetUnknown, err)
+	}
+	if !fits(g.chars, g.secs, chars, secs, charLimit, secLimit) {
+		return false, err
+	}
+	g.chars += chars
+	g.secs += secs
+	return true, err
+}
+
+func (g *guardedBudget) Refund(ctx context.Context, day string, chars, secs int) error {
+	err := g.primary.Refund(ctx, day, chars, secs)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.day == day {
+		g.chars, g.secs = max(0, g.chars-chars), max(0, g.secs-secs)
+	}
+	return err
+}
+
+func (g *guardedBudget) Used(ctx context.Context, day string) (int, int, error) {
+	chars, secs, err := g.primary.Used(ctx, day)
+	if err == nil {
+		return chars, secs, nil
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.day == day && g.known {
+		return g.chars, g.secs, nil
+	}
+	return 0, 0, err
+}
+
 // ---------------------------------------------------------------- the bot side
 
 // SetBudget replaces the in-memory studio counter (use the database's so
-// every instance shares one).
+// every instance shares one). It is guarded so the cap still holds while
+// the database is unreachable.
 func (b *Bot) SetBudget(bu Budget) {
 	if bu != nil {
-		b.budget = bu
+		b.budget = &guardedBudget{primary: bu}
 	}
 }
 
@@ -146,20 +239,23 @@ func (b *Bot) studioCapped() bool {
 	return b.cfg.StudioDailyChars > 0 || b.cfg.StudioDailyAudioSecs > 0
 }
 
-// spendStudio takes chars and secs from today's studio-wide budget. A
-// database error lets the request through: the budget guards cost, and a
-// blip shouldn't stop the bot.
-func (b *Bot) spendStudio(chars, secs int) bool {
+// spendStudio takes chars and secs from today's studio-wide budget. While
+// the database is unreachable the cap is enforced from a local count;
+// unknown reports that it couldn't be checked at all (the request is
+// refused, failing closed).
+func (b *Bot) spendStudio(chars, secs int) (ok, unknown bool) {
 	if !b.studioCapped() {
-		return true
+		return true, false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), pgTimeout)
 	defer cancel()
 	day := today()
 	ok, err := b.budget.Spend(ctx, day, chars, secs, b.cfg.StudioDailyChars, b.cfg.StudioDailyAudioSecs)
 	if err != nil {
-		b.log.Warn("studio budget unavailable; allowing", "err", err)
-		return true
+		b.log.Warn("studio budget database unreachable; using the local count", "allowed", ok, "err", err)
+	}
+	if errors.Is(err, errBudgetUnknown) {
+		return false, true
 	}
 	if !ok {
 		b.log.Warn("studio daily cap reached", "chars", chars, "secs", secs)
@@ -167,7 +263,7 @@ func (b *Bot) spendStudio(chars, secs int) bool {
 			"Everyone together has used today's studio-wide allowance, so new readings and transcriptions are refused until midnight UTC.\n\n"+
 			"Raise <code>STUDIO_DAILY_CHAR_LIMIT</code> or <code>STUDIO_DAILY_TRANSCRIBE_MINUTES</code> on the server if you want more.")
 	}
-	return ok
+	return ok, false
 }
 
 func (b *Bot) refundStudio(chars, secs int) {
@@ -179,6 +275,14 @@ func (b *Bot) refundStudio(chars, secs int) {
 	if err := b.budget.Refund(ctx, today(), chars, secs); err != nil {
 		b.log.Warn("refund studio budget", "err", err)
 	}
+}
+
+// studioRefusal explains a refusal by the studio-wide cap.
+func studioRefusal(u Usage) screen {
+	if u.StudioUnknown {
+		return busyScreen(errServiceDown)
+	}
+	return studioFullScreen()
 }
 
 // studioFullScreen explains that the whole studio hit today's cap.

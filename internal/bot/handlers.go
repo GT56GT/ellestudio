@@ -358,7 +358,7 @@ func (b *Bot) speak(ctx context.Context, m *telegram.Message, raw string) {
 		return
 	}
 	audio, err := b.ttsWithRetry(ctx, req)
-	b.release(err)
+	b.release(uid, err)
 	if err != nil {
 		b.refundAll(m, chars, 0)
 		b.fail(ctx, m, "tts", err)
@@ -552,7 +552,7 @@ func (b *Bot) transcribe(ctx context.Context, m *telegram.Message, a audioRef) {
 		Language: baseLang(s.Language),
 	})
 	cancel()
-	b.release(err)
+	b.release(uid, err)
 	if err != nil {
 		b.refundAll(m, 0, claimed)
 		pr.finish(ctx, m.Chat.ID, errorScreen(err))
@@ -631,7 +631,7 @@ func (b *Bot) runClone(ctx context.Context, m *telegram.Message, a audioRef, nam
 		Language:    lang,
 	})
 	cancel()
-	b.release(err)
+	b.release(uid, err)
 	if err == nil {
 		err = b.keepCreatedVoice(ctx, uid, v.ID)
 	}
@@ -681,7 +681,7 @@ func (b *Bot) detect(ctx context.Context, m *telegram.Message, a audioRef) {
 	tctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	found, err := b.ct.DetectWatermark(tctx, bytes.NewReader(data), name)
 	cancel()
-	b.release(err)
+	b.release(uid, err)
 	if err != nil {
 		b.refundAll(m, 0, claimed)
 		pr.finish(ctx, m.Chat.ID, errorScreen(err))

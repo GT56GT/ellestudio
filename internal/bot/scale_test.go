@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -179,5 +180,53 @@ func TestPostgresStoreSharedByTwoInstances(t *testing.T) {
 	wg.Wait()
 	if applied != 1 || a.Get(inviter).Bonus != 100 {
 		t.Fatalf("referral applied %d times, inviter bonus %d", applied, a.Get(inviter).Bonus)
+	}
+}
+
+// flakyBudget is a database-backed budget whose database can go away.
+type flakyBudget struct {
+	Budget
+	down bool
+}
+
+var errBudgetDBDown = errors.New("database unreachable")
+
+func (f *flakyBudget) Spend(ctx context.Context, day string, c, s, cl, sl int) (bool, error) {
+	if f.down {
+		return false, errBudgetDBDown
+	}
+	return f.Budget.Spend(ctx, day, c, s, cl, sl)
+}
+
+func (f *flakyBudget) Used(ctx context.Context, day string) (int, int, error) {
+	if f.down {
+		return 0, 0, errBudgetDBDown
+	}
+	return f.Budget.Used(ctx, day)
+}
+
+func TestStudioCapHoldsDuringDatabaseOutage(t *testing.T) {
+	ctx := context.Background()
+	const day = "2026-11-27"
+	db := &flakyBudget{Budget: newMemBudget()}
+	_, _ = db.Budget.Spend(ctx, day, 60, 0, 0, 0) // another instance spent 60 earlier
+	g := &guardedBudget{primary: db}
+	if ok, err := g.Spend(ctx, day, 10, 0, 100, 0); !ok || err != nil {
+		t.Fatalf("spend while up: %v %v", ok, err)
+	}
+	db.down = true
+	if ok, _ := g.Spend(ctx, day, 30, 0, 100, 0); !ok {
+		t.Fatal("a spend within the cap was refused during the outage")
+	}
+	if ok, _ := g.Spend(ctx, day, 1, 0, 100, 0); ok {
+		t.Fatal("the outage reopened the budget: 60+10+30 is already the cap")
+	}
+	if c, _, err := g.Used(ctx, day); err != nil || c != 100 {
+		t.Fatalf("local count = %d (%v), want 100", c, err)
+	}
+
+	// A day never seen while the database was up can't be checked: refuse.
+	if ok, err := g.Spend(ctx, "2026-11-28", 1, 0, 100, 0); ok || !errors.Is(err, errBudgetUnknown) {
+		t.Fatalf("unknown day: ok=%v err=%v, want a refusal", ok, err)
 	}
 }

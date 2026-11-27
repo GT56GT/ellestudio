@@ -83,9 +83,11 @@ func (b *Bot) spendChars(uid int64, n int) (bool, Usage) {
 	if err != nil {
 		b.log.Warn("save usage", "err", err)
 	}
-	if ok && !b.spendStudio(n, 0) {
-		b.store.Refund(uid, today(), n, 0, b.cfg.DailyChars)
-		return false, Usage{Studio: true}
+	if ok {
+		if sok, unknown := b.spendStudio(n, 0); !sok {
+			b.store.Refund(uid, today(), n, 0, b.cfg.DailyChars)
+			return false, Usage{Studio: true, StudioUnknown: unknown}
+		}
 	}
 	return ok, u
 }
@@ -99,9 +101,11 @@ func (b *Bot) spendSecs(uid int64, n int) (bool, Usage) {
 	if err != nil {
 		b.log.Warn("save usage", "err", err)
 	}
-	if ok && !b.spendStudio(0, n) {
-		b.store.Refund(uid, today(), 0, n, b.cfg.DailyChars)
-		return false, Usage{Studio: true}
+	if ok {
+		if sok, unknown := b.spendStudio(0, n); !sok {
+			b.store.Refund(uid, today(), 0, n, b.cfg.DailyChars)
+			return false, Usage{Studio: true, StudioUnknown: unknown}
+		}
 	}
 	return ok, u
 }

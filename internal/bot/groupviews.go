@@ -227,7 +227,7 @@ func (b *Bot) refuseLimit(ctx context.Context, m *telegram.Message, speech bool,
 	}
 	if u.Studio {
 		b.track(ctx, m.From.ID, evLimit, "studio", need)
-		b.replyNotice(ctx, m, studioFullScreen())
+		b.replyNotice(ctx, m, studioRefusal(u))
 		return
 	}
 	b.track(ctx, m.From.ID, evLimit, kind, need)

@@ -108,17 +108,17 @@ func TestBreakerOpensAfterRepeatedFailures(t *testing.T) {
 	br := &breaker{now: func() time.Time { return now }}
 	boom := &cartesia.APIError{StatusCode: http.StatusInternalServerError}
 	for i := 1; i < breakerFails; i++ {
-		if br.record(boom) != "" {
+		if br.record(int64(i), boom) != "" {
 			t.Fatalf("opened after %d failures", i)
 		}
 	}
-	if br.record(nil) != "" || br.fails != 0 {
+	if br.record(1, nil) != "" || br.fails != 0 {
 		t.Fatal("a success should reset the count")
 	}
 	for i := 1; i < breakerFails; i++ {
-		br.record(boom)
+		br.record(int64(i), boom)
 	}
-	if got := br.record(boom); got != tripErrors {
+	if got := br.record(9, boom); got != tripErrors {
 		t.Fatalf("trip = %q, want errors", got)
 	}
 	if open, left := br.isOpen(); !open || left != breakerPause {
@@ -129,14 +129,28 @@ func TestBreakerOpensAfterRepeatedFailures(t *testing.T) {
 		t.Fatal("still open after the pause")
 	}
 	// The probe after a pause fails: reopen at once.
-	if br.record(boom) != tripErrors {
+	if br.record(1, boom) != tripErrors {
 		t.Fatal("a failed probe should reopen the breaker")
+	}
+}
+
+func TestOnePersonCantPauseTheStudio(t *testing.T) {
+	br := &breaker{}
+	boom := &cartesia.APIError{StatusCode: http.StatusInternalServerError}
+	for range 3 * breakerFails {
+		if br.record(7, boom) != "" {
+			t.Fatal("one user's failures paused the studio")
+		}
+	}
+	br.record(8, boom)
+	if br.record(9, boom) != tripErrors {
+		t.Fatal("failures from three people should pause it")
 	}
 }
 
 func TestBreakerReadsErrorsCorrectly(t *testing.T) {
 	br := &breaker{}
-	if got := br.record(&cartesia.APIError{StatusCode: http.StatusPaymentRequired, ErrorCode: cartesia.ErrQuotaExceeded}); got != tripCredits {
+	if got := br.record(7, &cartesia.APIError{StatusCode: http.StatusPaymentRequired, ErrorCode: cartesia.ErrQuotaExceeded}); got != tripCredits {
 		t.Fatalf("credits: trip = %q", got)
 	}
 	for _, err := range []error{
@@ -159,8 +173,8 @@ func TestCartesiaOutagePausesReadingsAndAlertsAdmins(t *testing.T) {
 	fx := newFixture(t, Config{AdminUsers: map[int64]bool{1: true}, DailyChars: 2000})
 	fx.ttsFail = true
 	ctx := context.Background()
-	for range breakerFails {
-		fx.bot.handleUpdate(ctx, msg(7, "hello there"))
+	for i := range breakerFails {
+		fx.bot.handleUpdate(ctx, msg(int64(7+i%breakerUsers), "hello there"))
 	}
 	fx.ttsFail = false
 	fx.bot.handleUpdate(ctx, msg(7, "hello there"))

@@ -149,8 +149,12 @@ func (l *jobLine) queued() int {
 // ---------------------------------------------------------------- the breaker
 
 const (
-	// breakerFails failures in a row pause Cartesia work for breakerPause.
+	// breakerFails failures in a row, from at least breakerUsers different
+	// people, pause Cartesia work for breakerPause. Needing several people
+	// means one person sending audio that Cartesia chokes on can't pause
+	// the studio for everyone.
 	breakerFails = 5
+	breakerUsers = 3
 	breakerPause = time.Minute
 	// creditsPause is the pause when Cartesia says the credits ran out.
 	creditsPause = 10 * time.Minute
@@ -170,6 +174,7 @@ const (
 type breaker struct {
 	mu        sync.Mutex
 	fails     int
+	users     map[int64]bool // who the current run of failures came from
 	openUntil time.Time
 	now       func() time.Time // tests replace it
 }
@@ -189,25 +194,29 @@ func (br *breaker) isOpen() (bool, time.Duration) {
 	return left > 0, left
 }
 
-// record notes how a Cartesia call went. It returns why the breaker just
-// opened (tripErrors or tripCredits), or "" if it didn't.
-func (br *breaker) record(err error) string {
+// record notes how uid's Cartesia call went. It returns why the breaker
+// just opened (tripErrors or tripCredits), or "" if it didn't.
+func (br *breaker) record(uid int64, err error) string {
 	fault, credits := cartesiaFault(err)
 	br.mu.Lock()
 	defer br.mu.Unlock()
 	switch {
 	case credits:
-		br.fails = breakerFails
+		// Only the account's state causes this, never a user's input.
 		br.openUntil = br.clock().Add(creditsPause)
 		return tripCredits
 	case fault:
 		br.fails++
-		if br.fails >= breakerFails {
+		if br.users == nil {
+			br.users = map[int64]bool{}
+		}
+		br.users[uid] = true
+		if br.fails >= breakerFails && len(br.users) >= breakerUsers {
 			br.openUntil = br.clock().Add(breakerPause)
 			return tripErrors
 		}
 	case err == nil:
-		br.fails = 0
+		br.fails, br.users = 0, nil
 	}
 	return ""
 }
@@ -244,10 +253,10 @@ func (b *Bot) acquire(ctx context.Context, waiting func(pos int)) error {
 	return b.jobs.wait(ctx, lineNoticeAfter, waiting)
 }
 
-// release frees the slot and records how the Cartesia call went.
-func (b *Bot) release(err error) {
+// release frees the slot and records how uid's Cartesia call went.
+func (b *Bot) release(uid int64, err error) {
 	b.jobs.release()
-	switch b.breaker.record(err) {
+	switch b.breaker.record(uid, err) {
 	case tripCredits:
 		b.log.Error("Cartesia is out of credits; pausing voice work", "pause", creditsPause, "err", err)
 		b.alertAdmins(tripCredits, header("⚠️", "Cartesia credits ran out", "")+
@@ -257,7 +266,7 @@ func (b *Bot) release(err error) {
 	case tripErrors:
 		b.log.Error("Cartesia keeps failing; pausing voice work", "pause", breakerPause, "err", err)
 		b.alertAdmins(tripErrors, header("⚠️", "Cartesia keeps failing", "")+
-			fmt.Sprintf("%d Cartesia calls failed in a row, so Ellie paused voice work for %s and will then try again. Users aren't charged.\n\nLast error: <code>%s</code>",
+			fmt.Sprintf("%d Cartesia calls from different people failed in a row, so Ellie paused voice work for %s and will then try again. Users aren't charged.\n\nLast error: <code>%s</code>",
 				breakerFails, fmtWait(breakerPause), html.EscapeString(truncate(err.Error(), 300))))
 	}
 }

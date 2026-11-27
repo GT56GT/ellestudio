@@ -108,7 +108,7 @@ func (b *Bot) handleGuest(ctx context.Context, m *telegram.Message) {
 	chars := utf8.RuneCountInString(text)
 	if ok, u := b.spendChars(uid, chars); !ok {
 		if u.Studio {
-			b.answerGuestText(ctx, m, studioFullScreen())
+			b.answerGuestText(ctx, m, studioRefusal(u))
 			return
 		}
 		b.answerGuestText(ctx, m, noticeScreen("🎟", "Your daily allowance is used up",
@@ -148,7 +148,11 @@ func (b *Bot) handleGuest(ctx context.Context, m *telegram.Message) {
 		return
 	}
 	audio, err := b.ttsWithRetry(ctx, ttsRequest(s, text))
-	b.release(err)
+	if ctx.Err() != nil {
+		b.release(uid, context.Canceled) // our own deadline ran out: not Cartesia's fault, nor a success
+	} else {
+		b.release(uid, err)
+	}
 	if err != nil {
 		undo()
 		b.log.Error("guest tts", "user", uid, "err", err)

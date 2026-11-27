@@ -68,8 +68,9 @@ type Usage struct {
 	Chars, Secs, Makes int
 	Bonus              int
 	// Studio is set on a refusal caused by the studio-wide daily cap
-	// rather than the user's own allowance.
-	Studio bool
+	// rather than the user's own allowance; StudioUnknown when that cap
+	// couldn't be checked at all (the database is unreachable).
+	Studio, StudioUnknown bool
 }
 
 // usageToday returns v's usage for day, treating an older day as zero.

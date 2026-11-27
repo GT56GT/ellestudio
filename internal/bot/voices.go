@@ -584,7 +584,7 @@ func (b *Bot) runLocalize(ctx context.Context, uid int64, target *telegram.Messa
 		Description: "Localized in Ellie Studio",
 	})
 	cancel()
-	b.release(err)
+	b.release(uid, err)
 	if err == nil {
 		err = b.keepCreatedVoice(ctx, uid, v.ID)
 	}
