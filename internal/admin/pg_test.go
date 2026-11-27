@@ -22,7 +22,11 @@ func testStore(t *testing.T) (*PGStore, *bot.DB) {
 		t.Fatal(err)
 	}
 	t.Cleanup(db.Close)
-	return NewPGStore(db), db
+	settings, err := db.SettingsStore(context.Background(), bot.Settings{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return NewPGStore(db, settings), db
 }
 
 func TestPGSessionsAndAudit(t *testing.T) {
@@ -135,5 +139,103 @@ func TestPGReadViews(t *testing.T) {
 	o, err := s.Overview(ctx, time.Now().UTC())
 	if err != nil || len(o.Days) != 30 || o.Users < 1 {
 		t.Fatalf("overview: days=%d users=%d err=%v", len(o.Days), o.Users, err)
+	}
+}
+
+func TestPGActionsEndToEnd(t *testing.T) {
+	s, db := testStore(t)
+	ctx := context.Background()
+	const uid, gid, voice = -7201, -7202, "test-voice-7201"
+	today := time.Now().UTC().Format("2006-01-02")
+	cleanup := func() {
+		p := db.Pool()
+		_, _ = p.Exec(ctx, `DELETE FROM ellie_user_settings WHERE user_id = $1`, uid)
+		_, _ = p.Exec(ctx, `DELETE FROM ellie_chats WHERE chat_id = $1`, gid)
+		_, _ = p.Exec(ctx, `DELETE FROM ellie_ownership WHERE resource_id = $1`, voice)
+		_, _ = p.Exec(ctx, `DELETE FROM ellie_admin_jobs WHERE target = $1`, voice)
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	if _, _, err := s.GiveBonus(ctx, uid, 10); err != ErrNotFound {
+		t.Fatalf("bonus for a stranger: %v", err)
+	}
+	if _, _, err := s.settings.Spend(uid, today, 300, 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if before, after, err := s.GiveBonus(ctx, uid, 250); err != nil || before != 0 || after != 250 {
+		t.Fatalf("bonus: %d %d %v", before, after, err)
+	}
+	if was, err := s.ResetToday(ctx, uid, today); err != nil || was.Chars != 300 {
+		t.Fatalf("reset: %+v %v", was, err)
+	}
+	until := time.Now().Add(time.Hour)
+	if _, err := s.SetBan(ctx, uid, &bot.Ban{Until: &until, Reason: "test", By: 1, At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	rows, _, err := s.Users(ctx, UserQuery{Banned: true, Limit: 500}, today)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, r := range rows {
+		found = found || (r.ID == uid && r.Banned)
+	}
+	if !found {
+		t.Fatal("banned user missing from the banned filter")
+	}
+	if bans, err := s.settings.Banned(); err != nil || bans[uid].Reason != "test" {
+		t.Fatalf("the bot doesn't see the ban: %v %v", bans[uid], err)
+	}
+
+	if err := db.Chats().Upsert(ctx, bot.ChatInfo{ID: gid, Title: "Test group", Status: "member"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetGroupBlocked(ctx, gid, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetGroupSettings(ctx, gid, bot.GroupSettings{Paused: true}); err != nil {
+		t.Fatal(err)
+	}
+	if g, err := s.Group(ctx, gid); err != nil || !g.Blocked || !g.Settings.Paused {
+		t.Fatalf("group: %+v %v", g, err)
+	}
+
+	// The panel queues a delete; the bot claims, does and finishes it.
+	if err := db.Owners().Claim(ctx, "voice", voice, uid); err != nil {
+		t.Fatal(err)
+	}
+	q := db.AdminQueue()
+	if err := q.SetNames(ctx, "voice", map[string]string{voice: "Test Voice"}); err != nil {
+		t.Fatal(err)
+	}
+	job, row, created, err := s.QueueDelete(ctx, "voice", voice, 1)
+	if err != nil || !created || row.Name != "Test Voice" || row.OwnerID != uid {
+		t.Fatalf("queue: %d %+v %v %v", job, row, created, err)
+	}
+	if again, _, created, _ := s.QueueDelete(ctx, "voice", voice, 1); created || again != job {
+		t.Fatal("a second request opened a second job")
+	}
+	claimed, ok, err := q.Claim(ctx)
+	if err != nil || !ok || claimed.ID != job || claimed.Kind != bot.JobDeleteVoice {
+		t.Fatalf("claim: %+v %v %v", claimed, ok, err)
+	}
+	if err := db.Owners().Release(ctx, "voice", voice); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Finish(ctx, job, nil); err != nil {
+		t.Fatal(err)
+	}
+	if vs, _, err := s.Voices(ctx, VoiceQuery{OwnerID: uid, Limit: 10}); err != nil || len(vs) != 0 {
+		t.Fatalf("deleted voice still listed: %v %v", vs, err)
+	}
+	jobs, err := s.Jobs(ctx, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, j := range jobs {
+		if j.ID == job && j.Status != "done" {
+			t.Fatalf("job status %q", j.Status)
+		}
 	}
 }

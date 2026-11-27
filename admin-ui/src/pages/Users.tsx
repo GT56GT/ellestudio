@@ -21,13 +21,14 @@ const sorts = [
 export function Users({ route }: { route: Route }) {
   const q = route.params.get("q") ?? "";
   const sort = route.params.get("sort") ?? "recent";
+  const filter = route.params.get("filter") ?? "";
   const pageNo = Number(route.params.get("page") ?? "1") || 1;
   const [draft, setDraft] = useState(q);
-  const qs = new URLSearchParams({ sort, page: String(pageNo), ...(q ? { q } : {}) });
+  const qs = new URLSearchParams({ sort, page: String(pageNo), ...(q ? { q } : {}), ...(filter ? { filter } : {}) });
   const { data, error, reload } = useLoad<UsersPage>(`/api/users?${qs}`);
 
   const nav = (next: Record<string, string>) => {
-    const p = new URLSearchParams({ sort, ...(q ? { q } : {}), ...next });
+    const p = new URLSearchParams({ sort, ...(q ? { q } : {}), ...(filter ? { filter } : {}), ...next });
     go(`/users?${p}`);
   };
   const search = (e: FormEvent) => {
@@ -58,10 +59,17 @@ export function Users({ route }: { route: Route }) {
             Show everyone
           </button>
         )}
+        <label className="visually-hidden" htmlFor="user-filter">
+          Show
+        </label>
+        <select id="user-filter" className="select" value={filter} onChange={(e) => nav({ filter: e.target.value, page: "1" })} style={{ marginLeft: "auto" }}>
+          <option value="">Everyone</option>
+          <option value="banned">Banned now</option>
+        </select>
         <label className="visually-hidden" htmlFor="user-sort">
           Sort by
         </label>
-        <select id="user-sort" className="select" value={sort} onChange={(e) => nav({ sort: e.target.value, page: "1" })} style={{ marginLeft: "auto" }}>
+        <select id="user-sort" className="select" value={sort} onChange={(e) => nav({ sort: e.target.value, page: "1" })}>
           {sorts.map((s) => (
             <option key={s.value} value={s.value}>
               {s.label}
@@ -78,7 +86,7 @@ export function Users({ route }: { route: Route }) {
           <Loading />
         </div>
       ) : data.users.length === 0 ? (
-        <p className="empty">{q ? `Nobody with ID ${q} has used Ellie.` : "Nobody has used Ellie yet."}</p>
+        <p className="empty">{q ? `Nobody with ID ${q} has used Ellie.` : filter === "banned" ? "Nobody is banned." : "Nobody has used Ellie yet."}</p>
       ) : (
         <>
           <div className="table-wrap">
@@ -101,6 +109,7 @@ export function Users({ route }: { route: Route }) {
                       <a href={`#/users/${u.id}`} onClick={(e) => e.stopPropagation()}>
                         {u.id}
                       </a>
+                      {u.banned && <span className="pill" data-tone="hot" style={{ marginLeft: 8 }}>Banned</span>}
                       {!u.joined && <span className="pill" style={{ marginLeft: 8 }}>Groups only</span>}
                     </td>
                     <td>{u.voice || <span className="muted">Default</span>}</td>

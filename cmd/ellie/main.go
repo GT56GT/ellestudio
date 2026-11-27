@@ -81,6 +81,7 @@ func run(log *slog.Logger) error {
 		metrics  bot.Metrics        // nil keeps stats in memory
 		budget   bot.Budget         // nil keeps the studio-wide count in memory
 		reporter bot.StatusReporter // nil: no heartbeat for the admin panel
+		queue    bot.AdminQueue     // nil: no admin panel jobs
 	)
 	if dbURL := os.Getenv("DATABASE_URL"); dbURL != "" {
 		db, err := bot.OpenDatabase(ctx, dbURL)
@@ -96,6 +97,7 @@ func run(log *slog.Logger) error {
 		metrics = db.Metrics()
 		budget = db.Budget()
 		reporter = db
+		queue = db.AdminQueue()
 		log.Info("settings stored in Postgres")
 	} else {
 		dir := envOr("DATA_DIR", "data")
@@ -172,6 +174,9 @@ func run(log *slog.Logger) error {
 		b.SetMetrics(metrics)
 	}
 	b.SetBudget(budget)
+	if queue != nil {
+		b.SetAdminQueue(queue)
+	}
 	if reporter != nil {
 		host, _ := os.Hostname()
 		b.SetStatusReporter(reporter, envOr("RENDER_INSTANCE_ID", host), shortCommit(os.Getenv("RENDER_GIT_COMMIT")))

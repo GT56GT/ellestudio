@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -88,9 +89,151 @@ type memStore struct {
 	mu       sync.Mutex
 	sessions map[string]Session // by token hash
 	audit    []AuditEntry
+
+	users  map[int64]*bot.Settings
+	groups map[int64]bot.ChatInfo
+	voices map[string]VoiceRow // by kind:id
+	jobs   []JobRow
 }
 
-func newMemStore() *memStore { return &memStore{sessions: map[string]Session{}} }
+func newMemStore() *memStore {
+	return &memStore{
+		sessions: map[string]Session{},
+		users:    map[int64]*bot.Settings{7: {Bonus: 100, UsageDay: testNow.Format("2006-01-02"), UsedChars: 1500}},
+		groups:   map[int64]bot.ChatInfo{-100: {ID: -100, Title: "Book Club", Status: "member"}},
+		voices:   map[string]VoiceRow{"voice:v1": {Kind: "voice", ID: "v1", Name: "Nova", OwnerID: 7}},
+	}
+}
+
+func (m *memStore) GiveBonus(_ context.Context, uid int64, amount int) (int, int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	u, ok := m.users[uid]
+	if !ok {
+		return 0, 0, ErrNotFound
+	}
+	before := u.Bonus
+	u.Bonus += amount
+	return before, u.Bonus, nil
+}
+
+func (m *memStore) ResetToday(_ context.Context, uid int64, today string) (Allowance, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	u, ok := m.users[uid]
+	if !ok {
+		return Allowance{}, ErrNotFound
+	}
+	was := Allowance{Chars: u.UsedChars}
+	u.UsedChars = 0
+	return was, nil
+}
+
+func (m *memStore) SetBan(_ context.Context, uid int64, b *bot.Ban) (*bot.Ban, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	u, ok := m.users[uid]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	was := u.Ban
+	u.Ban = b
+	return was, nil
+}
+
+func (m *memStore) Group(_ context.Context, id int64) (bot.ChatInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	g, ok := m.groups[id]
+	if !ok {
+		return bot.ChatInfo{}, ErrNotFound
+	}
+	return g, nil
+}
+
+func (m *memStore) SetGroupBlocked(_ context.Context, id int64, blocked bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	g := m.groups[id]
+	g.Blocked = blocked
+	m.groups[id] = g
+	return nil
+}
+
+func (m *memStore) MarkGroupLeft(_ context.Context, id int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	g := m.groups[id]
+	g.Status = "left"
+	m.groups[id] = g
+	return nil
+}
+
+func (m *memStore) SetGroupSettings(_ context.Context, id int64, gs bot.GroupSettings) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	g := m.groups[id]
+	g.Settings = gs
+	m.groups[id] = g
+	return nil
+}
+
+func (m *memStore) Voices(context.Context, VoiceQuery) ([]VoiceRow, int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []VoiceRow
+	for _, v := range m.voices {
+		out = append(out, v)
+	}
+	return out, len(out), nil
+}
+
+func (m *memStore) QueueDelete(_ context.Context, kind, id string, by int64) (int64, VoiceRow, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v, ok := m.voices[kind+":"+id]
+	if !ok {
+		return 0, VoiceRow{}, false, ErrNotFound
+	}
+	for _, j := range m.jobs {
+		if j.Target == id && (j.Status == "pending" || j.Status == "running") {
+			return j.ID, v, false, nil
+		}
+	}
+	j := JobRow{ID: int64(len(m.jobs) + 1), Kind: "delete_" + kind, Target: id, RequestedBy: by, Status: "pending"}
+	m.jobs = append(m.jobs, j)
+	return j.ID, v, true, nil
+}
+
+func (m *memStore) Jobs(context.Context, int) ([]JobRow, error) { return m.jobs, nil }
+
+// fakeMessenger records what the panel sent to Telegram.
+type fakeMessenger struct {
+	mu     sync.Mutex
+	sent   map[int64]string
+	left   []int64
+	failTo int64
+}
+
+func (f *fakeMessenger) Notify(_ context.Context, chat int64, text string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if chat == f.failTo {
+		return errors.New("Forbidden: bot was blocked by the user")
+	}
+	if f.sent == nil {
+		f.sent = map[int64]string{}
+	}
+	f.sent[chat] = text
+	return nil
+}
+
+func (f *fakeMessenger) Leave(_ context.Context, chat int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.left = append(f.left, chat)
+	return nil
+}
 
 func (m *memStore) CreateSession(_ context.Context, h []byte, s Session) error {
 	m.mu.Lock()
@@ -199,6 +342,7 @@ func (m *memStore) Groups(context.Context, int, int, string) ([]GroupRow, int, e
 type harness struct {
 	srv   *Server
 	store *memStore
+	tg    *fakeMessenger
 	h     http.Handler
 	now   time.Time
 }
@@ -206,12 +350,14 @@ type harness struct {
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 	store := newMemStore()
+	tg := &fakeMessenger{}
 	srv := New(Config{
-		BotToken: testToken, BotUsername: "EllieStudioBot", Admins: map[int64]bool{42: true},
+		Messenger: tg,
+		BotToken:  testToken, BotUsername: "EllieStudioBot", Admins: map[int64]bool{42: true},
 		PublicURL: "https://panel.example", Secure: true,
 		UI: fstest.MapFS{"index.html": {Data: []byte("<!doctype html>panel")}, "assets/app.js": {Data: []byte("js")}},
 	}, store, nil)
-	hs := &harness{srv: srv, store: store, now: testNow}
+	hs := &harness{srv: srv, store: store, tg: tg, now: testNow}
 	srv.now = func() time.Time { return hs.now }
 	hs.h = srv.Handler()
 	return hs

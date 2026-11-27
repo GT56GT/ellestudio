@@ -66,7 +66,8 @@ func run(log *slog.Logger) error {
 	defer db.Close()
 
 	tctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	me, err := telegram.New(token, "").GetMe(tctx)
+	tg := telegram.New(token, "")
+	me, err := tg.GetMe(tctx)
 	cancel()
 	if err != nil {
 		return fmt.Errorf("telegram getMe (check TELEGRAM_BOT_TOKEN): %w", err)
@@ -76,10 +77,14 @@ func run(log *slog.Logger) error {
 	if dir := os.Getenv("ADMIN_UI_DIR"); dir != "" {
 		ui = os.DirFS(dir)
 	}
-	store := admin.NewPGStore(db)
+	settings, err := db.SettingsStore(ctx, bot.Settings{})
+	if err != nil {
+		return err
+	}
+	store := admin.NewPGStore(db, settings)
 	srv := admin.New(admin.Config{
 		BotToken: token, BotUsername: me.Username, Admins: admins,
-		PublicURL: public, Secure: secure, UI: ui,
+		PublicURL: public, Secure: secure, UI: ui, Messenger: messenger{tg},
 	}, store, log)
 
 	go prune(ctx, log, store)
@@ -122,6 +127,16 @@ func prune(ctx context.Context, log *slog.Logger, store admin.Store) {
 		}
 	}
 }
+
+// messenger sends the panel's Telegram messages as the bot.
+type messenger struct{ tg *telegram.Client }
+
+func (m messenger) Notify(ctx context.Context, chatID int64, html string) error {
+	_, err := m.tg.SendMessage(ctx, telegram.SendMessageParams{ChatID: chatID, Text: html, ParseMode: "HTML", NoPreview: true})
+	return err
+}
+
+func (m messenger) Leave(ctx context.Context, chatID int64) error { return m.tg.LeaveChat(ctx, chatID) }
 
 func parseIDs(s string) (map[int64]bool, error) {
 	out := map[int64]bool{}

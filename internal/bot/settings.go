@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 // persister is where a Store keeps its data between restarts: a JSON file
@@ -61,6 +62,24 @@ type Settings struct {
 
 	// TipDay is the last UTC day a language tip was shown (one a day at most).
 	TipDay string `json:"tip_day,omitempty"`
+
+	// Ban, set from the admin panel, keeps the user out of Ellie. Kept
+	// across /reset.
+	Ban *Ban `json:"ban,omitempty"`
+}
+
+// Ban is an admin's decision to keep a user out.
+type Ban struct {
+	Until    *time.Time `json:"until,omitempty"` // nil: until an admin lifts it
+	Reason   string     `json:"reason,omitempty"`
+	By       int64      `json:"by,omitempty"` // the admin
+	At       time.Time  `json:"at"`
+	Notified bool       `json:"notified,omitempty"` // the user was told once
+}
+
+// Active reports whether the ban is in force at now.
+func (b *Ban) Active(now time.Time) bool {
+	return b != nil && (b.Until == nil || now.Before(*b.Until))
 }
 
 // Usage is what a user has spent today, and their bonus characters left.
@@ -117,8 +136,11 @@ type sharedStore interface {
 	mutate(uids []int64, fn func(*userTx)) (map[int64]Settings, error)
 	// load returns uid's settings, and false if they were never stored.
 	load(uid int64) (Settings, bool, error)
-	// forgetVoice clears voice id from every user who chose it, returning them.
-	forgetVoice(id string) ([]int64, error)
+	// forget clears the field pair idKey/nameKey from every user whose idKey
+	// is id, returning them.
+	forget(idKey, nameKey, id string) ([]int64, error)
+	// banned returns every user with a ban on record.
+	banned() (map[int64]Ban, error)
 }
 
 // cacheLimit bounds the memory copy kept next to a shared store; past it
@@ -508,38 +530,72 @@ func (s *Store) Join(uid int64, day string) error {
 }
 
 // ForgetVoice clears a voice from every user who selected it (after delete).
-func (s *Store) ForgetVoice(id string) error {
+func (s *Store) ForgetVoice(id string) error { return s.forget(voiceRef, id) }
+
+// ForgetDict clears a pronunciation dictionary from every user who chose it.
+func (s *Store) ForgetDict(id string) error { return s.forget(dictRef, id) }
+
+// ref names a settings field pair (an ID and its display name) that points
+// at a Cartesia resource.
+type ref struct {
+	idKey, nameKey string // JSON keys, for the database
+	id             func(*Settings) *string
+	name           func(*Settings) *string
+}
+
+var (
+	voiceRef = ref{"voice_id", "voice_name", func(v *Settings) *string { return &v.VoiceID }, func(v *Settings) *string { return &v.VoiceName }}
+	dictRef  = ref{"dict_id", "dict_name", func(v *Settings) *string { return &v.DictID }, func(v *Settings) *string { return &v.DictName }}
+)
+
+func (s *Store) forget(r ref, id string) error {
 	if s.shared != nil {
-		uids, err := s.shared.forgetVoice(id)
+		uids, err := s.shared.forget(r.idKey, r.nameKey, id)
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		for _, uid := range uids {
 			delete(s.data, uid) // reloaded on next read
 		}
 		if err != nil {
-			s.forgetVoiceLocked(id)
+			s.forgetLocked(r, id)
 		}
 		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	changed := s.forgetVoiceLocked(id)
+	changed := s.forgetLocked(r, id)
 	if len(changed) == 0 || s.backend == nil {
 		return nil
 	}
 	return s.backend.save(s.data, changed)
 }
 
-func (s *Store) forgetVoiceLocked(id string) []int64 {
+func (s *Store) forgetLocked(r ref, id string) []int64 {
 	var changed []int64
 	for uid, v := range s.data {
-		if v.VoiceID == id {
-			v.VoiceID, v.VoiceName = "", ""
+		if *r.id(&v) == id {
+			*r.id(&v), *r.name(&v) = "", ""
 			s.data[uid] = v
 			changed = append(changed, uid)
 		}
 	}
 	return changed
+}
+
+// Banned returns every user with a ban on record (active or expired).
+func (s *Store) Banned() (map[int64]Ban, error) {
+	if s.shared != nil {
+		return s.shared.banned()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[int64]Ban{}
+	for uid, v := range s.data {
+		if v.Ban != nil {
+			out[uid] = *v.Ban
+		}
+	}
+	return out, nil
 }
 
 // fileStore keeps every user in one JSON file.

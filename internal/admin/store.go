@@ -82,6 +82,7 @@ type UserRow struct {
 	Referrals   int       `json:"referrals"`
 	TodayChars  int       `json:"today_chars"`
 	TodaySecs   int       `json:"today_secs"`
+	Banned      bool      `json:"banned"`
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
@@ -89,6 +90,7 @@ type UserRow struct {
 type UserDetail struct {
 	UserRow
 	ReferredBy int64         `json:"referred_by"`
+	Ban        *bot.Ban      `json:"ban,omitempty"`
 	Language   string        `json:"language"`
 	Model      string        `json:"model"`
 	Emotion    string        `json:"emotion"`
@@ -122,6 +124,7 @@ type GroupRow struct {
 type UserQuery struct {
 	ID     int64  // 0 = everyone
 	Sort   string // "recent" (default), "readings" or "bonus"
+	Banned bool   // only users banned now
 	Offset int
 	Limit  int
 }
@@ -147,6 +150,8 @@ type Store interface {
 	Users(ctx context.Context, q UserQuery, today string) ([]UserRow, int, error)
 	User(ctx context.Context, id int64, today string) (UserDetail, bool, error)
 	Groups(ctx context.Context, offset, limit int, today string) ([]GroupRow, int, error)
+
+	Actions
 }
 
 // botOnlineWithin is how recent a heartbeat must be to call the bot online.
@@ -155,10 +160,15 @@ const botOnlineWithin = time.Minute
 // ---------------------------------------------------------------- Postgres
 
 // PGStore is the Store on the bot's Postgres database.
-type PGStore struct{ db *bot.DB }
+type PGStore struct {
+	db       *bot.DB
+	settings *bot.Store // the bot's own settings store, for user changes
+}
 
-// NewPGStore uses db (opened, and migrated, with bot.OpenDatabase).
-func NewPGStore(db *bot.DB) *PGStore { return &PGStore{db} }
+// NewPGStore uses db (opened, and migrated, with bot.OpenDatabase) and
+// settings (db.SettingsStore), so user changes take the same per-user locks
+// as the bot.
+func NewPGStore(db *bot.DB, settings *bot.Store) *PGStore { return &PGStore{db, settings} }
 
 func (p *PGStore) CreateSession(ctx context.Context, hash []byte, s Session) error {
 	_, err := p.db.Pool().Exec(ctx, `INSERT INTO ellie_admin_sessions
@@ -330,6 +340,7 @@ func userRow(id int64, v bot.Settings, updated time.Time, today string) UserRow 
 	r := UserRow{
 		ID: id, Joined: v.Joined, JoinedAt: v.JoinedAt, Voice: v.VoiceName, Readings: v.Readings,
 		SpokenChars: v.SpokenChars, Bonus: v.Bonus, Referrals: v.Referrals, UpdatedAt: updated,
+		Banned: v.Ban.Active(time.Now()),
 	}
 	if v.UsageDay == today {
 		r.TodayChars, r.TodaySecs = v.UsedChars, v.UsedSecs
@@ -344,7 +355,9 @@ func (p *PGStore) Users(ctx context.Context, q UserQuery, today string) ([]UserR
 	}
 	rows, err := p.db.Pool().Query(ctx, `SELECT user_id, settings, updated_at, count(*) OVER ()
 		FROM ellie_user_settings WHERE ($1 = 0 OR user_id = $1)
-		ORDER BY `+order+` LIMIT $2 OFFSET $3`, q.ID, q.Limit, q.Offset)
+		  AND (NOT $4 OR (jsonb_typeof(settings->'ban') = 'object'
+		       AND (settings->'ban'->'until' IS NULL OR (settings->'ban'->>'until')::timestamptz > now())))
+		ORDER BY `+order+` LIMIT $2 OFFSET $3`, q.ID, q.Limit, q.Offset, q.Banned)
 	if err != nil {
 		return nil, 0, fmt.Errorf("admin: users: %w", err)
 	}
@@ -383,7 +396,7 @@ func (p *PGStore) User(ctx context.Context, id int64, today string) (UserDetail,
 		return UserDetail{}, false, fmt.Errorf("admin: user %d: %w", id, err)
 	}
 	d := UserDetail{
-		UserRow: userRow(id, v, updated, today), ReferredBy: v.ReferredBy,
+		UserRow: userRow(id, v, updated, today), ReferredBy: v.ReferredBy, Ban: v.Ban,
 		Language: v.Language, Model: v.Model, Emotion: v.Emotion,
 	}
 	if err := pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE kind = 'voice'), count(*) FILTER (WHERE kind = 'dict')

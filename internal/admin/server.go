@@ -31,6 +31,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -53,6 +54,9 @@ type Config struct {
 	AuthMaxAge time.Duration
 	// UI is the built single-page app (nil: the API alone).
 	UI fs.FS
+	// Messenger tells users about changes and leaves blocked groups (nil:
+	// the panel can't).
+	Messenger Messenger
 }
 
 // Server is the admin panel.
@@ -111,6 +115,15 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/groups", s.authed(s.groups))
 	mux.Handle("GET /api/audit", s.authed(s.auditLog))
 	mux.Handle("GET /api/sessions", s.authed(s.sessions))
+	mux.Handle("POST /api/users/{id}/bonus", s.authed(s.giveBonus))
+	mux.Handle("POST /api/users/{id}/reset-today", s.authed(s.resetToday))
+	mux.Handle("POST /api/users/{id}/ban", s.authed(s.banUser))
+	mux.Handle("POST /api/users/{id}/unban", s.authed(s.unbanUser))
+	mux.Handle("POST /api/groups/{id}/block", s.authed(s.blockGroup))
+	mux.Handle("POST /api/groups/{id}/unblock", s.authed(s.unblockGroup))
+	mux.Handle("POST /api/groups/{id}/settings", s.authed(s.groupSettings))
+	mux.Handle("GET /api/voices", s.authed(s.voices))
+	mux.Handle("POST /api/voices/{kind}/{id}/delete", s.authed(s.deleteVoice))
 	mux.Handle("POST /api/sessions/{id}/revoke", s.authed(s.revokeSession))
 	mux.Handle("POST /api/sessions/revoke-others", s.authed(s.revokeOthers))
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, _ *http.Request) { writeError(w, http.StatusNotFound, "No such endpoint.") })
@@ -359,8 +372,16 @@ func adminJSON(id int64, name string) map[string]any {
 }
 
 func (s *Server) me(w http.ResponseWriter, _ *http.Request, a authCtx) {
+	ids := make([]int64, 0, len(s.cfg.Admins))
+	for id, ok := range s.cfg.Admins {
+		if ok {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
 	writeJSON(w, map[string]any{
 		"admin":      adminJSON(a.session.AdminID, a.session.Name),
+		"admin_ids":  ids,
 		"expires_at": a.session.ExpiresAt,
 	})
 }
@@ -398,7 +419,7 @@ func page(r *http.Request, n int) (offset, number int) {
 const pageSize = 50
 
 func (s *Server) users(w http.ResponseWriter, r *http.Request, _ authCtx) {
-	q := UserQuery{Sort: r.URL.Query().Get("sort"), Limit: pageSize}
+	q := UserQuery{Sort: r.URL.Query().Get("sort"), Banned: r.URL.Query().Get("filter") == "banned", Limit: pageSize}
 	if raw := strings.TrimSpace(r.URL.Query().Get("q")); raw != "" {
 		id, err := strconv.ParseInt(strings.TrimPrefix(raw, "#"), 10, 64)
 		if err != nil {

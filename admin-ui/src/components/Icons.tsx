@@ -25,6 +25,12 @@ export const IconGroups = () => (
     <path d="M4 6.5A2.5 2.5 0 0 1 6.5 4h11A2.5 2.5 0 0 1 20 6.5v7a2.5 2.5 0 0 1-2.5 2.5H10l-4 4v-4h0A2 2 0 0 1 4 14z" />
   </svg>
 );
+export const IconVoices = () => (
+  <svg {...base}>
+    <rect x="9" y="3.5" width="6" height="10.5" rx="3" />
+    <path d="M6 11.5a6 6 0 0 0 12 0M12 17.5V20.5" />
+  </svg>
+);
 export const IconAudit = () => (
   <svg {...base}>
     <path d="M7 4h8l3 3v13H7z" />

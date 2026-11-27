@@ -3,12 +3,13 @@ import { ApiError, get, signInWithTelegramApp, signOut, whenSignedOut } from "./
 import type { Me } from "./types";
 import { go, useRoute } from "./router";
 import { Tally } from "./components/Tally";
-import { IconAudit, IconGroups, IconOverview, IconSessions, IconUsers, Logo } from "./components/Icons";
+import { IconAudit, IconGroups, IconOverview, IconSessions, IconUsers, IconVoices, Logo } from "./components/Icons";
 import { Failed, Loading } from "./components/States";
 import { Overview } from "./pages/Overview";
 import { Users } from "./pages/Users";
 import { UserDetail } from "./pages/UserDetail";
 import { Groups } from "./pages/Groups";
+import { Voices } from "./pages/Voices";
 import { Audit } from "./pages/Audit";
 import { Sessions } from "./pages/Sessions";
 import { SignIn } from "./pages/SignIn";
@@ -19,6 +20,7 @@ const pages = [
   { path: "/", label: "Overview", title: "Overview", lede: "How Ellie is doing right now and over the last month.", icon: IconOverview },
   { path: "/users", label: "Users", title: "Users", lede: "Everyone who has used Ellie, newest activity first.", icon: IconUsers },
   { path: "/groups", label: "Groups", title: "Groups", lede: "Chats Ellie reads in, busiest today first.", icon: IconGroups },
+  { path: "/voices", label: "Voices", title: "Voices", lede: "Voices and dictionaries people made through Ellie, newest first.", icon: IconVoices },
   { path: "/audit", label: "Audit log", title: "Audit log", lede: "Every sign-in and admin action, newest first.", icon: IconAudit },
   { path: "/sessions", label: "Sessions", title: "Sessions", lede: "Where you're signed in to this panel.", icon: IconSessions },
 ];
@@ -117,11 +119,13 @@ export function App() {
           </header>
         )}
         {userMatch ? (
-          <UserDetail id={userMatch[1]} />
+          <UserDetail id={userMatch[1]} adminIds={auth.me.admin_ids ?? []} />
         ) : section === "/users" ? (
           <Users route={route} />
         ) : section === "/groups" ? (
           <Groups route={route} />
+        ) : section === "/voices" ? (
+          <Voices route={route} />
         ) : section === "/audit" ? (
           <Audit />
         ) : section === "/sessions" ? (

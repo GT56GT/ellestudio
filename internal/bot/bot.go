@@ -110,6 +110,10 @@ type Bot struct {
 	alertMu sync.Mutex
 	alerted map[string]time.Time // last admin alert of each kind
 
+	// Admin panel work (see adminwork.go).
+	adminQueue AdminQueue
+	bans       banList
+
 	// Heartbeat for the admin panel (see status.go).
 	reporter StatusReporter
 	instance string
@@ -306,12 +310,17 @@ func (b *Bot) Run(ctx context.Context) error {
 		b.log.Warn("setMyShortDescription failed", "err", err)
 	}
 	b.importLegacyOwners(ctx)
+	b.refreshBans()
 	b.wg.Add(1)
 	go func() { defer b.wg.Done(); b.pruneMetrics(ctx) }()
 	b.wg.Add(1)
 	go func() { defer b.wg.Done(); b.sweepLoop(ctx) }()
 	b.wg.Add(1)
 	go func() { defer b.wg.Done(); b.heartbeat(ctx) }()
+	b.wg.Add(1)
+	go func() { defer b.wg.Done(); b.banLoop(ctx) }()
+	b.wg.Add(1)
+	go func() { defer b.wg.Done(); b.adminJobs(ctx) }()
 
 	var offset int64
 	backoff := time.Second
@@ -375,6 +384,12 @@ func (b *Bot) handleUpdate(ctx context.Context, u telegram.Update) {
 			b.log.Error("handler panic", "panic", r, "stack", string(debug.Stack()))
 		}
 	}()
+	if uid, ok := updateUser(u); ok {
+		if ban, banned := b.banned(uid); banned {
+			b.turnAway(ctx, u, uid, ban)
+			return
+		}
+	}
 	switch {
 	case u.Message != nil:
 		b.handleMessage(ctx, u.Message)

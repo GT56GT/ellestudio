@@ -106,6 +106,22 @@ var migrations = []string{
 		ip       TEXT        NOT NULL DEFAULT ''
 	);
 	CREATE INDEX ellie_admin_audit_by_time ON ellie_admin_audit (at DESC)`,
+	// 8: voice and dictionary names (filled in by the bot from Cartesia),
+	// and work the admin panel asks the bot to do (it holds the Cartesia
+	// key). At most one open job per resource.
+	`ALTER TABLE ellie_ownership ADD COLUMN name TEXT NOT NULL DEFAULT '';
+	CREATE TABLE ellie_admin_jobs (
+		id           BIGSERIAL   PRIMARY KEY,
+		kind         TEXT        NOT NULL CHECK (kind IN ('delete_voice', 'delete_dict')),
+		target       TEXT        NOT NULL CHECK (target <> ''),
+		requested_by BIGINT      NOT NULL,
+		status       TEXT        NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'done', 'failed')),
+		error        TEXT        NOT NULL DEFAULT '',
+		created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+		updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+	);
+	CREATE UNIQUE INDEX ellie_admin_jobs_one_open ON ellie_admin_jobs (kind, target) WHERE status IN ('pending', 'running');
+	CREATE INDEX ellie_admin_jobs_open ON ellie_admin_jobs (id) WHERE status IN ('pending', 'running')`,
 }
 
 // migrationLock is the advisory lock key ("ellie") that serialises
@@ -305,21 +321,46 @@ func (p pgSettings) load(uid int64) (Settings, bool, error) {
 	return v, true, nil
 }
 
-// forgetVoice is one UPDATE; it waits for any change holding those rows.
-func (p pgSettings) forgetVoice(id string) ([]int64, error) {
+// forget is one UPDATE; it waits for any change holding those rows. The keys
+// come from the fixed refs in settings.go and are passed as parameters.
+func (p pgSettings) forget(idKey, nameKey, id string) ([]int64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), pgTimeout)
 	defer cancel()
 	rows, err := p.pool.Query(ctx, `UPDATE ellie_user_settings
-		SET settings = settings || '{"voice_id": "", "voice_name": ""}'::jsonb, updated_at = now()
-		WHERE settings->>'voice_id' = $1 RETURNING user_id`, id)
+		SET settings = settings || jsonb_build_object($2::text, '', $3::text, ''), updated_at = now()
+		WHERE settings->>$2::text = $1 RETURNING user_id`, id, idKey, nameKey)
 	if err != nil {
-		return nil, fmt.Errorf("database: forget voice: %w", err)
+		return nil, fmt.Errorf("database: forget %s: %w", idKey, err)
 	}
 	uids, err := pgx.CollectRows(rows, pgx.RowTo[int64])
 	if err != nil {
-		return nil, fmt.Errorf("database: forget voice: %w", err)
+		return nil, fmt.Errorf("database: forget %s: %w", idKey, err)
 	}
 	return uids, nil
+}
+
+func (p pgSettings) banned() (map[int64]Ban, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), pgTimeout)
+	defer cancel()
+	rows, err := p.pool.Query(ctx, `SELECT user_id, settings->'ban' FROM ellie_user_settings
+		WHERE jsonb_typeof(settings->'ban') = 'object'`)
+	if err != nil {
+		return nil, fmt.Errorf("database: bans: %w", err)
+	}
+	out := map[int64]Ban{}
+	var uid int64
+	var raw []byte
+	if _, err := pgx.ForEachRow(rows, []any{&uid, &raw}, func() error {
+		var b Ban
+		if err := json.Unmarshal(raw, &b); err != nil {
+			return fmt.Errorf("user %d: %w", uid, err)
+		}
+		out[uid] = b
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("database: bans: %w", err)
+	}
+	return out, nil
 }
 
 // ---------------------------------------------------------------- ownership

@@ -56,11 +56,20 @@ export interface UserRow {
   referrals: number;
   today_chars: number;
   today_secs: number;
+  banned: boolean;
   updated_at: string;
+}
+
+export interface Ban {
+  until?: string;
+  reason?: string;
+  by?: number;
+  at: string;
 }
 
 export interface UserDetail extends UserRow {
   referred_by: number;
+  ban?: Ban;
   language: string;
   model: string;
   emotion: string;
@@ -104,5 +113,36 @@ export interface Session {
 
 export interface Me {
   admin: { id: number; name: string };
+  admin_ids: number[];
   expires_at: string;
+}
+
+export interface GroupSettings {
+  paused?: boolean;
+  admins_only?: boolean;
+  no_speak?: boolean;
+  no_transcribe?: boolean;
+  daily_chars?: number;
+  max_chars?: number;
+}
+
+export interface VoiceRow {
+  kind: "voice" | "dict";
+  id: string;
+  name: string;
+  owner_id: number;
+  created_at: string;
+  job_status?: "pending" | "running" | "failed";
+  job_error?: string;
+}
+
+export interface JobRow {
+  id: number;
+  kind: string;
+  target: string;
+  requested_by: number;
+  status: "pending" | "running" | "done" | "failed";
+  error: string;
+  created_at: string;
+  updated_at: string;
 }

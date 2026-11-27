@@ -207,7 +207,14 @@ A web panel for studio admins, deployed as its own Render web service next to th
 - **Overview:** whether Ellie is live, today's studio-wide usage as a level meter, voice jobs running and waiting, the last 30 days of readings and active people, where new people came from, and the daily limits in force.
 - **Users:** everyone who has used Ellie, searchable by Telegram user ID and sortable, with a page per user (allowance, lifetime totals, referrals, voices made, 30 days of activity).
 - **Groups:** every chat Ellie reads in, with today's usage and status.
+- **Voices:** every voice and dictionary made through Ellie, with who made it, filterable by person.
 - **Audit log** and **Sessions** (see below).
+
+**Changes admins can make.** Each one opens a dialog that says exactly what will happen and needs a reason, and each goes in the audit log with what it was before and after.
+
+- **Users:** give bonus characters (optionally telling them in Telegram), reset today's allowance, ban for 1, 7 or 30 days or until lifted, and lift a ban. Banned people get one short "access paused" message, then Ellie ignores them in the private chat, groups, guest replies and buttons. The bot refreshes its ban list every 30 seconds. Admins can't be banned. User changes take the same per-user database lock as the bot, so nothing the bot writes at that moment is lost.
+- **Groups:** block (Ellie leaves and can't be added back), unblock, and the group's own settings (pause, admins only, reading or transcription off, lower limits).
+- **Voices and dictionaries:** delete. The Cartesia key stays only on the bot: the panel queues the request (`ellie_admin_jobs`, one open request per resource), and the bot claims it within 5 seconds, deletes it from Cartesia, forgets its owner and moves anyone using it back to the default. If the bot is offline, the request waits. Deleting from Telegram works as before. The bot also copies voice and dictionary names from Cartesia into the registry every 10 minutes so the panel can show them.
 
 Message text is never shown; the panel only sees the counts Ellie already stores. The bot reports its live state (the waiting line, a pause, its limits) every 15 seconds to `ellie_status`, which is how the panel knows whether Ellie is up.
 
