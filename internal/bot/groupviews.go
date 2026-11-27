@@ -221,6 +221,11 @@ func (b *Bot) replyNotice(ctx context.Context, m *telegram.Message, s screen) {
 // refuseLimit explains a refused request. In a group it doesn't show anyone's
 // usage to everyone; the numbers are one tap away, privately.
 func (b *Bot) refuseLimit(ctx context.Context, m *telegram.Message, speech bool, u Usage, need int) {
+	kind := "speech"
+	if !speech {
+		kind = "transcription"
+	}
+	b.track(ctx, m.From.ID, evLimit, kind, need)
 	if !isGroupChat(m.Chat.ID) {
 		ls := b.limitScreen(speech, u, need)
 		b.replyHTML(ctx, m, ls.text, ls.kb)

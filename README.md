@@ -1,5 +1,7 @@
 # Ellie Studio
 
+[![CI](https://github.com/GT56GT/ellestudio/actions/workflows/ci.yml/badge.svg)](https://github.com/GT56GT/ellestudio/actions/workflows/ci.yml)
+
 A Telegram voice studio powered by [Cartesia](https://cartesia.ai). Send text and get it back as speech. Send a voice note and get a transcript. Browse, clone, and localize voices, all from chat.
 
 Written in Go. The Cartesia and Telegram clients use only the standard library; the one dependency is [pgx](https://github.com/jackc/pgx), for the optional Postgres store.
@@ -103,6 +105,36 @@ With Telegram's guest mode (Bot API 10.0), anyone can type `@EllieStudioBot good
 - **Same limits as groups:** the caller's own daily allowance, plus the chat's shared `GROUP_DAILY_CHAR_LIMIT` and the all-groups total. `GROUP_MODE=off` turns guest replies off too, and `admins` limits them to `ADMIN_USER_IDS`. `/blockgroup <id>` silences a chat; guest chats appear in `/groups`.
 - **How the voice gets there:** a guest reply can only point at a file already on Telegram, so each reading is uploaded silently to a storage chat, used, and deleted again. That chat is `GUEST_STORAGE_CHAT_ID`, or by default the lowest ID in `ADMIN_USER_IDS` (your own chat with the bot; you may glimpse the upload for a moment). A private channel with the bot as admin keeps it out of sight.
 
+## Profiles, invites and stats
+
+### Not wasting anyone's allowance
+
+- **Only words are read and charged.** Links, @usernames and emoji are dropped before reading (otherwise Ellie would spell them out), and only the characters actually spoken count. A message that is only links or emoji gets a short "Nothing to read" instead of a reading.
+- **Characters left, after every private reading:** the voice's caption ends with "🎟 1,450 of 2,000 characters left today" (and bonus characters, if any). Group captions never show anyone's allowance.
+- **Language tips, never changes:** when a message looks like Hindi typed in English letters ("abhi to bhut time hai"), Ellie suggests, at most once a day and only in the private chat, writing it in Hindi script or setting the language to English. It always reads with the language and style saved in the user's settings.
+
+### Profile and referrals
+
+- **`/profile`** (and 👤 Profile on Home): member since, voice and style, today's allowance with a bar, bonus characters, lifetime readings, and friends invited.
+- **`/invite`** gives a personal link (`t.me/<bot>?start=r_<id>`) and a "Send to a friend" button. When someone new starts Ellie through it, both get `REFERRAL_BONUS_CHARS` bonus characters (default 1,000; `0` turns referrals off), and the inviter gets a thank-you message.
+- **Bonus characters** are spent only after the daily allowance is used up and never expire. Failed readings give back exactly what they took, bonus included.
+- **Abuse limits:** only brand-new users count (someone who has used Ellie before can't be "invited"), nobody can invite themselves, the inviter must have used Ellie's private chat, and an inviter earns at most `REFERRAL_DAILY_LIMIT` rewards a day (default 5; their friends still get theirs).
+- **First visit:** a new user sees what Ellie does, what's free each day, one message to try right away, and how to use Ellie in groups. When someone hits the daily limit, the screen offers invites.
+- **Guest mode spreads the word:** every guest voice carries a "🎙 Make your own voice notes" button, and strangers who mention Ellie get a short pitch with "🎁 Start Ellie, it's free". Both links are tagged so the stats can count who joins from groups.
+
+### Stats (admins)
+
+`/stats` (or 📊 Stats in `/admin`) shows the last 7 days in UTC:
+
+- active users this week and today
+- readings, and readings per active user
+- new users, and how many came from groups (guest mode or a group's "private chat" link) or from a friend's invite
+- "Start Ellie" invites shown in other chats
+- how many users hit the daily limit
+- a line per day
+
+Stats come from small events (`ellie_events`: user ID, kind, source, a count, a time), never message text, and are pruned after 90 days. Without Postgres they live in memory and start over on restart.
+
 ## What it does
 
 | You do | Ellie does | Cartesia endpoint |
@@ -181,3 +213,7 @@ To also test the Postgres backend, point it at a database. The tests apply the m
 ```bash
 TEST_DATABASE_URL=postgres://user:pass@host:5432/db go test ./internal/bot -run 'Postgres|Migrations' 
 ```
+
+### Continuous integration
+
+Every push and pull request runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml): a gofmt check, `go vet`, and the whole test suite with the race detector, including the Postgres tests against a throwaway Postgres container.

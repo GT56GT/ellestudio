@@ -40,33 +40,67 @@ type Settings struct {
 
 	// Joined is set the first time the user talks to the bot in its private
 	// chat. Only joined users get guest-mode replies (GUEST_ACCESS=members).
-	// Kept across /reset.
-	Joined bool `json:"joined,omitempty"`
+	// Kept across /reset, like everything below.
+	Joined   bool   `json:"joined,omitempty"`
+	JoinedAt string `json:"joined_at,omitempty"` // UTC day of the first private-chat visit
+
+	// Bonus characters (from referrals) are spent only once the daily
+	// character allowance is used up, and never expire.
+	Bonus int `json:"bonus,omitempty"`
+
+	// Referrals: who invited this user, how many friends they invited, and
+	// how many invite rewards they earned on RefDay (capped per day).
+	ReferredBy int64  `json:"referred_by,omitempty"`
+	Referrals  int    `json:"referrals,omitempty"`
+	RefDay     string `json:"ref_day,omitempty"`
+	RefToday   int    `json:"ref_today,omitempty"`
+
+	// Lifetime totals for the profile.
+	Readings    int `json:"readings,omitempty"`
+	SpokenChars int `json:"spoken_chars,omitempty"`
+
+	// TipDay is the last UTC day a language tip was shown (one a day at most).
+	TipDay string `json:"tip_day,omitempty"`
 }
 
-// Usage is what a user has spent today.
+// Usage is what a user has spent today, and their bonus characters left.
 type Usage struct {
 	Chars, Secs, Makes int
+	Bonus              int
 }
 
 // usageToday returns v's usage for day, treating an older day as zero.
 func usageToday(v Settings, day string) Usage {
 	if v.UsageDay != day {
-		return Usage{}
+		return Usage{Bonus: v.Bonus}
 	}
-	return Usage{v.UsedChars, v.UsedSecs, v.UsedMakes}
+	return Usage{v.UsedChars, v.UsedSecs, v.UsedMakes, v.Bonus}
+}
+
+// overLimit is how many of used characters lie past the daily limit: the
+// part paid from bonus characters. A limit of 0 means unlimited.
+func overLimit(used, limit int) int {
+	if limit <= 0 {
+		return 0
+	}
+	return max(0, used-limit)
 }
 
 // Spend atomically adds chars and secs to a user's usage for day, unless that
-// would pass a limit (a limit of 0 means unlimited). It returns whether the
-// spend happened and the usage afterwards (or as it stands, if refused).
+// would pass a limit (a limit of 0 means unlimited). Characters past the
+// daily limit are paid from bonus characters while they last. It returns
+// whether the spend happened and the usage afterwards (or as it stands, if
+// refused).
 func (s *Store) Spend(uid int64, day string, chars, secs, charLimit, secLimit int) (bool, Usage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	v := s.data[uid]
 	u := usageToday(v, day)
-	if (charLimit > 0 && chars > 0 && u.Chars+chars > charLimit) ||
-		(secLimit > 0 && secs > 0 && u.Secs+secs > secLimit) {
+	fromBonus := 0
+	if chars > 0 {
+		fromBonus = overLimit(u.Chars+chars, charLimit) - overLimit(u.Chars, charLimit)
+	}
+	if fromBonus > v.Bonus || (secLimit > 0 && secs > 0 && u.Secs+secs > secLimit) {
 		return false, u, nil
 	}
 	u.Chars += chars
@@ -74,23 +108,80 @@ func (s *Store) Spend(uid int64, day string, chars, secs, charLimit, secLimit in
 	if v.UsageDay != day {
 		v.UsedMakes, v.UsedDicts = 0, 0
 	}
+	v.Bonus -= fromBonus
+	u.Bonus = v.Bonus
 	v.UsageDay, v.UsedChars, v.UsedSecs = day, u.Chars, u.Secs
 	s.data[uid] = v
 	return true, u, s.saveLocked(uid)
 }
 
-// Refund gives back an earlier Spend (for example when generation failed).
-func (s *Store) Refund(uid int64, day string, chars, secs int) {
+// Refund gives back an earlier Spend (for example when generation failed),
+// returning bonus characters that Spend took. charLimit must be the limit
+// the Spend used.
+func (s *Store) Refund(uid int64, day string, chars, secs, charLimit int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	v, ok := s.data[uid]
 	if !ok || v.UsageDay != day {
 		return
 	}
-	v.UsedChars = max(0, v.UsedChars-chars)
+	after := max(0, v.UsedChars-chars)
+	v.Bonus += overLimit(v.UsedChars, charLimit) - overLimit(after, charLimit)
+	v.UsedChars = after
 	v.UsedSecs = max(0, v.UsedSecs-secs)
 	s.data[uid] = v
 	_ = s.saveLocked(uid)
+}
+
+// Spoke adds a finished reading to the user's lifetime totals.
+func (s *Store) Spoke(uid int64, chars int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v := s.data[uid]
+	v.Readings++
+	v.SpokenChars += chars
+	s.data[uid] = v
+	_ = s.saveLocked(uid)
+}
+
+// MarkTip records that a tip was shown on day; false means one already was.
+func (s *Store) MarkTip(uid int64, day string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v := s.data[uid]
+	if v.TipDay == day {
+		return false
+	}
+	v.TipDay = day
+	s.data[uid] = v
+	_ = s.saveLocked(uid)
+	return true
+}
+
+// Referral records that invitee joined through inviter's link, giving the
+// invitee bonus characters and the inviter the same, up to dailyCap rewards
+// per UTC day. It does nothing (false, false) unless invitee is new to the
+// studio, inviter has joined it, and they differ. rewarded reports whether
+// the inviter got the bonus.
+func (s *Store) Referral(inviter, invitee int64, day string, bonus, dailyCap int) (applied, rewarded bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	from, ok := s.data[inviter]
+	if _, seen := s.data[invitee]; seen || !ok || !from.Joined || inviter == invitee || bonus <= 0 {
+		return false, false, nil
+	}
+	to := Settings{ReferredBy: inviter, Bonus: bonus}
+	if from.RefDay != day {
+		from.RefDay, from.RefToday = day, 0
+	}
+	from.Referrals++
+	if dailyCap <= 0 || from.RefToday < dailyCap {
+		from.RefToday++
+		from.Bonus += bonus
+		rewarded = true
+	}
+	s.data[inviter], s.data[invitee] = from, to
+	return true, rewarded, s.saveLocked(inviter, invitee)
 }
 
 // SpendMake records one new voice for day unless that would pass limit
@@ -258,20 +349,26 @@ func (s *Store) Reset(uid int64) error {
 	if !ok {
 		return nil
 	}
-	s.data[uid] = Settings{UsageDay: old.UsageDay, UsedChars: old.UsedChars, UsedSecs: old.UsedSecs,
-		UsedMakes: old.UsedMakes, UsedDicts: old.UsedDicts, Joined: old.Joined}
+	// Only the voice and style preferences go; allowance, bonus, referral
+	// and lifetime bookkeeping stay.
+	kept := old
+	kept.VoiceID, kept.VoiceName, kept.Model, kept.Language = "", "", "", ""
+	kept.Emotion, kept.Speed, kept.Volume = "", 0, 0
+	kept.DictID, kept.DictName, kept.AsFile = "", "", false
+	s.data[uid] = kept
 	return s.saveLocked(uid)
 }
 
-// Join marks uid as a user of the private chat. It writes only the first time.
-func (s *Store) Join(uid int64) error {
+// Join marks uid as a user of the private chat as of day. It writes only the
+// first time.
+func (s *Store) Join(uid int64, day string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	v := s.data[uid]
 	if v.Joined {
 		return nil
 	}
-	v.Joined = true
+	v.Joined, v.JoinedAt = true, day
 	s.data[uid] = v
 	return s.saveLocked(uid)
 }

@@ -26,11 +26,9 @@ func (b *Bot) welcome(ctx context.Context, m *telegram.Message, startArg string)
 	name := html.EscapeString(orDefault(m.From.FirstName, "there"))
 	var text string
 	if !b.store.Known(uid) {
-		text = "👋 <b>Hi " + name + ", I'm Ellie!</b>\nYour pocket voice studio.\n\n" +
-			"1️⃣ <b>Send me text</b> and I'll say it out loud\n" +
-			"2️⃣ <b>Send a voice note</b> and I'll write it down\n" +
-			"3️⃣ <b>Use the menu below</b> to change voice and style anytime\n\n" +
-			"Start with ▶️ <b>Hear a sample</b> on the card below."
+		b.track(ctx, uid, evStart, startSource(startArg), 0)
+		bonus := b.applyReferral(ctx, m, startArg) // before the user is first saved
+		text = b.firstVisitText(name, bonus)
 		if shared {
 			text = "👋 <b>Hi " + name + ", I'm Ellie!</b>\nSomeone shared a voice with you. It's on the card below: " +
 				"tap <b>✅ Use this voice</b>, then send me any text to hear it."
@@ -212,9 +210,17 @@ func (b *Bot) command(ctx context.Context, m *telegram.Message, cmd, args string
 		send(b.statusScreen(ctx))
 	case "usage":
 		send(b.usageScreen(ctx, uid))
-	case "admin":
+	case "profile", "me":
+		send(b.profileScreen(uid))
+	case "invite":
+		send(b.inviteScreen(uid))
+	case "admin", "stats":
 		if !b.isOwner(uid) {
 			b.command(ctx, m, "unknown", "")
+			return
+		}
+		if cmd == "stats" {
+			send(b.statsScreen(ctx))
 			return
 		}
 		send(b.adminScreen(ctx))
@@ -535,10 +541,11 @@ func (b *Bot) adminScreen(ctx context.Context) screen {
 		"/groups · today's busiest groups and their settings\n" +
 		"/blockgroup <code>id</code> · make Ellie leave a group for good\n" +
 		"/unblockgroup <code>id</code> · let a group add Ellie again\n" +
+		"/stats · active users, readings, growth\n" +
 		"/status · service status")
 	k := (&keys{}).
-		row(btn("📈 Usage", "nav:usage"), btn("👥 Groups", "nav:groups")).
-		row(btn("📊 Service status", "nav:status")).
+		row(btn("📊 Stats", "nav:stats"), btn("📈 Credits", "nav:usage")).
+		row(btn("👥 Groups", "nav:groups"), btn("🩺 Service status", "nav:status")).
 		nav("", "")
 	return screen{sb.String(), k.build()}
 }
@@ -793,12 +800,19 @@ func (b *Bot) navScreen(ctx context.Context, uid int64, name string) screen {
 		return b.statusScreen(ctx)
 	case "usage":
 		return b.usageScreen(ctx, uid)
-	case "admin", "groups":
+	case "profile":
+		return b.profileScreen(uid)
+	case "invite":
+		return b.inviteScreen(uid)
+	case "admin", "groups", "stats":
 		if !b.isOwner(uid) {
 			return b.homeScreen(uid)
 		}
-		if name == "groups" {
+		switch name {
+		case "groups":
 			return b.groupsScreen(ctx)
+		case "stats":
+			return b.statsScreen(ctx)
 		}
 		return b.adminScreen(ctx)
 	case "reset":

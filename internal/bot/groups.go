@@ -61,6 +61,7 @@ var GroupAdminCommands = append(append([]telegram.BotCommand{}, GroupCommands...
 var deepLinks = map[string]bool{
 	"studio": true, "voices": true, "myvoices": true, "voice": true,
 	"style": true, "clone": true, "dicts": true, "help": true,
+	"profile": true, "invite": true,
 }
 
 type chatUser struct{ chat, user int64 }
@@ -714,6 +715,10 @@ func (b *Bot) openDeepLink(ctx context.Context, m *telegram.Message, payload str
 		b.sendScreen(ctx, chat, 0, b.dictsScreen(ctx, uid))
 	case "help":
 		b.sendScreen(ctx, chat, 0, helpScreen(""))
+	case "profile":
+		b.sendScreen(ctx, chat, 0, b.profileScreen(uid))
+	case "invite":
+		b.sendScreen(ctx, chat, 0, b.inviteScreen(uid))
 	default:
 		b.sendScreen(ctx, chat, 0, b.homeScreen(uid))
 	}

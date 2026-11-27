@@ -100,7 +100,7 @@ func (b *Bot) spendSecs(uid int64, n int) (bool, Usage) {
 
 func (b *Bot) refund(uid int64, chars, secs int) {
 	if !b.isAdmin(uid) {
-		b.store.Refund(uid, today(), chars, secs)
+		b.store.Refund(uid, today(), chars, secs, b.cfg.DailyChars)
 	}
 }
 
@@ -140,7 +140,15 @@ func (b *Bot) limitScreen(speech bool, u Usage, need int) screen {
 		}
 	}
 	body += "\n\n🔄 Your allowance refreshes in <b>" + fmtWait(untilReset()) + "</b> (midnight UTC)."
-	k := (&keys{}).row(btn(icSettings+" Studio", "nav:studio")).nav("", "")
+	k := &keys{}
+	if speech && b.referrals() {
+		if u.Bonus > 0 {
+			body += "\n🎁 You have <b>" + fmtInt(u.Bonus) + "</b> bonus characters, not enough for this message."
+		}
+		body += "\n🤝 Can't wait? Invite a friend and you both get <b>+" + fmtInt(b.cfg.ReferralBonus) + "</b> bonus characters."
+		k.row(btn("🤝 Invite friends", "nav:invite"))
+	}
+	k.row(btn("👤 Profile", "nav:profile")).nav("", "")
 	return screen{header("🎟", "Daily limit reached", "") + body, k.build()}
 }
 

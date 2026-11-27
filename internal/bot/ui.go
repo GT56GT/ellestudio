@@ -194,6 +194,7 @@ func (b *Bot) homeScreen(uid int64) screen {
 		"\n💬 <i>Send any text to hear it · 🎤 send audio to transcribe it</i>"
 	k := (&keys{}).
 		row(btn(icVoices+" Voices", "nav:voices"), btn(icStyle+" Style", "nav:style")).
+		row(btn("👤 Profile", "nav:profile"), btn("🤝 Invite friends", "nav:invite")).
 		row(btn(icPlay+" Hear a sample", "do:sample"), btn(icListen+" Transcribe", "do:transcribe")).
 		row(btn(icCreate+" Create", "nav:create"), btn(icDict+" Pronunciation", "nav:dicts")).
 		row(btn(icSettings+" Studio", "nav:studio"), btn(icHelp+" Help", "nav:help"))

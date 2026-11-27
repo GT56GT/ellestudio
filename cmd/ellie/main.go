@@ -75,9 +75,10 @@ func run(log *slog.Logger) error {
 		Model:   envOr("DEFAULT_MODEL", cartesia.DefaultTTSModel),
 	}
 	var (
-		store  *bot.Store
-		owners bot.Owners
-		chats  bot.Chats
+		store   *bot.Store
+		owners  bot.Owners
+		chats   bot.Chats
+		metrics bot.Metrics // nil keeps stats in memory
 	)
 	if dbURL := os.Getenv("DATABASE_URL"); dbURL != "" {
 		db, err := bot.OpenDatabase(ctx, dbURL)
@@ -90,6 +91,7 @@ func run(log *slog.Logger) error {
 		}
 		owners = db.Owners()
 		chats = db.Chats()
+		metrics = db.Metrics()
 		log.Info("settings stored in Postgres")
 	} else {
 		dir := envOr("DATA_DIR", "data")
@@ -154,7 +156,12 @@ func run(log *slog.Logger) error {
 		GroupNoticeTTL:   time.Duration(envLimit("GROUP_NOTICE_SECONDS", 45)) * time.Second,
 		GuestStorageChat: guestStorage,
 		GuestAccess:      guestAccess,
+		ReferralBonus:    envLimit("REFERRAL_BONUS_CHARS", 1000),
+		ReferralDailyCap: envLimit("REFERRAL_DAILY_LIMIT", 5),
 	}, log)
+	if metrics != nil {
+		b.SetMetrics(metrics)
+	}
 	log.Info("Ellie Studio starting", "cartesia_version", cartesia.APIVersion, "default_voice", store.Defaults().VoiceName)
 	return b.Run(ctx)
 }

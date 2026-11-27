@@ -296,8 +296,14 @@ func (b *Bot) lastTranscript(uid int64) string {
 
 // ---------------------------------------------------------------- text-to-speech
 
-func (b *Bot) speak(ctx context.Context, m *telegram.Message, text string) {
+func (b *Bot) speak(ctx context.Context, m *telegram.Message, raw string) {
 	uid := m.From.ID
+	text := speakable(raw)
+	if text == "" {
+		b.replyNotice(ctx, m, noticeScreen(icWarn, "Nothing to read",
+			"I skip links, @usernames and emoji so you aren't charged for them, and that left nothing to say. Send some words and I'll read them."))
+		return
+	}
 	if n, limit := utf8.RuneCountInString(text), b.maxChars(ctx, m); n > limit {
 		s := noticeScreen(icWarn, "That's a lot of text", fmt.Sprintf(
 			"It's <b>%d</b> characters. I can read up to <b>%d</b> at a time, so split it into smaller messages.", n, limit))
@@ -345,7 +351,14 @@ func (b *Bot) speak(ctx context.Context, m *telegram.Message, text string) {
 		return
 	}
 	b.remember(uid, func(r *recent) { r.spoken = text })
+	b.store.Spoke(uid, chars)
+	source := "private"
+	if isGroupChat(m.Chat.ID) {
+		source = "group"
+	}
+	b.track(ctx, uid, evReading, source, chars)
 	b.sendSpeech(ctx, m, s, text, audio)
+	b.languageTip(ctx, m, s, text)
 }
 
 // ttsRequest reads text in the user's chosen voice and style.
@@ -391,8 +404,12 @@ func (b *Bot) ttsWithRetry(ctx context.Context, req cartesia.TTSRequest) ([]byte
 }
 
 func (b *Bot) sendSpeech(ctx context.Context, m *telegram.Message, s Settings, text string, audio []byte) {
+	caption := speechCaption(s)
+	if line := b.leftLine(m.From.ID); line != "" && !isGroupChat(m.Chat.ID) {
+		caption += "\n" + line // never in groups: usage stays private
+	}
 	p := telegram.MediaParams{
-		ChatID: m.Chat.ID, ReplyTo: m.MessageID, ThreadID: m.Thread(), Caption: speechCaption(s),
+		ChatID: m.Chat.ID, ReplyTo: m.MessageID, ThreadID: m.Thread(), Caption: caption,
 		Filename: "ellie-studio.mp3", Data: audio, ReplyMarkup: b.markupFor(m.Chat.ID, afterSpeech()),
 	}
 	if !s.AsFile {
@@ -476,7 +493,7 @@ func (b *Bot) settleAudio(m *telegram.Message, claimed int, actual float64) {
 			b.log.Warn("save usage", "err", err)
 		}
 	case diff < 0:
-		b.store.Refund(uid, today(), 0, -diff)
+		b.store.Refund(uid, today(), 0, -diff, b.cfg.DailyChars)
 	}
 }
 
@@ -517,6 +534,7 @@ func (b *Bot) transcribe(ctx context.Context, m *telegram.Message, a audioRef) {
 		return
 	}
 	b.settleAudio(m, claimed, tr.Duration)
+	b.track(ctx, m.From.ID, evTranscribe, "", int(tr.Duration+0.5))
 	text := strings.TrimSpace(tr.Text)
 	if text == "" {
 		pr.finish(ctx, m.Chat.ID, screen{

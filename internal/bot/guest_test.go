@@ -19,7 +19,7 @@ func guestFixture(t *testing.T, cfg Config) *fixture {
 	t.Helper()
 	fx := groupFixture(t, cfg)
 	for _, uid := range []int64{7, groupAdmin} {
-		if err := fx.bot.store.Join(uid); err != nil {
+		if err := fx.bot.store.Join(uid, today()); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -252,12 +252,15 @@ func TestGuestModeServesOnlyJoinedUsers(t *testing.T) {
 	fx := groupFixture(t, Config{}) // user 42 has never opened the private chat
 	fx.bot.handleUpdate(ctx, guest(42, "@EllieStudioBot hello"))
 	res := guestAnswer(t, fx)
-	if !strings.Contains(noticeText(res), "Start Ellie first") || fx.ttsIn != nil {
-		t.Fatalf("a stranger got %v (tts %v), want the start notice", res, fx.ttsIn)
+	if !strings.Contains(noticeText(res), "Make Ellie read for you") || fx.ttsIn != nil {
+		t.Fatalf("a stranger got %v (tts %v), want the invite", res, fx.ttsIn)
 	}
 	raw, _ := json.Marshal(res["reply_markup"])
-	if !strings.Contains(string(raw), "t.me/EllieStudioBot") {
-		t.Errorf("the notice should link to the private chat: %s", raw)
+	if !strings.Contains(string(raw), "t.me/EllieStudioBot?start=g") {
+		t.Errorf("the invite should link to the private chat, tagged as from guest mode: %s", raw)
+	}
+	if days, _ := fx.bot.metrics.Days(ctx, time.Time{}); len(days) != 1 || days[0].GuestInvites != 1 {
+		t.Errorf("the invite wasn't counted: %+v", days)
 	}
 
 	// Group use alone doesn't make someone a user.
@@ -341,9 +344,6 @@ func TestGuestMentionWithOnlyUsernamesReadsTheReply(t *testing.T) {
 	fx.bot.handleUpdate(context.Background(), u)
 	if fx.ttsIn == nil || fx.ttsIn["transcript"] != "Read this one out" {
 		t.Fatalf("tts request = %v, want the replied message, not the username", fx.ttsIn)
-	}
-	if onlyMentions("@a hi") || !onlyMentions(" @a  @b ") || onlyMentions("") || onlyMentions("@") {
-		t.Error("onlyMentions is wrong")
 	}
 }
 

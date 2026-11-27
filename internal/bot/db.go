@@ -58,6 +58,17 @@ var migrations = []string{
 	CREATE INDEX ellie_chats_by_usage ON ellie_chats (usage_day, chars DESC) WHERE chat_id <> 0`,
 	// 4: each group's own settings, chosen by its admins ('{}' = defaults).
 	`ALTER TABLE ellie_chats ADD COLUMN settings JSONB NOT NULL DEFAULT '{}'`,
+	// 5: usage events for the admin Stats screen (see metrics.go), pruned
+	// after 90 days.
+	`CREATE TABLE ellie_events (
+		id      BIGSERIAL   PRIMARY KEY,
+		at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+		user_id BIGINT      NOT NULL,
+		kind    TEXT        NOT NULL,
+		source  TEXT        NOT NULL DEFAULT '',
+		n       INT         NOT NULL DEFAULT 0
+	);
+	CREATE INDEX ellie_events_by_time ON ellie_events (at)`,
 }
 
 // migrationLock is the advisory lock key ("ellie") that serialises
@@ -278,6 +289,74 @@ func (p pgOwners) Release(ctx context.Context, kind, id string) error {
 // Chats returns the group registry. Like Owners it reads the database on
 // every call, so instances running side by side during a deploy agree.
 func (d *DB) Chats() Chats { return pgChats{d.pool, allGroups} }
+
+// Metrics returns the Postgres-backed usage events.
+func (d *DB) Metrics() Metrics { return pgMetrics{d.pool} }
+
+type pgMetrics struct{ pool *pgxpool.Pool }
+
+func (p pgMetrics) Record(ctx context.Context, e Event) error {
+	ctx, cancel := context.WithTimeout(ctx, pgTimeout)
+	defer cancel()
+	_, err := p.pool.Exec(ctx, `INSERT INTO ellie_events (at, user_id, kind, source, n) VALUES ($1, $2, $3, $4, $5)`,
+		e.At, e.User, e.Kind, e.Source, e.N)
+	if err != nil {
+		return fmt.Errorf("database: record event: %w", err)
+	}
+	return nil
+}
+
+func (p pgMetrics) Days(ctx context.Context, since time.Time) ([]DayStats, error) {
+	ctx, cancel := context.WithTimeout(ctx, pgTimeout)
+	defer cancel()
+	rows, err := p.pool.Query(ctx, `SELECT to_char(at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day,
+			count(DISTINCT user_id) FILTER (WHERE kind IN ('start', 'reading', 'transcribe')),
+			count(*) FILTER (WHERE kind = 'start'),
+			count(*) FILTER (WHERE kind = 'start' AND source IN ('group', 'guest')),
+			count(*) FILTER (WHERE kind = 'start' AND source = 'referral'),
+			count(*) FILTER (WHERE kind = 'reading'),
+			COALESCE(sum(n) FILTER (WHERE kind = 'reading'), 0),
+			count(DISTINCT user_id) FILTER (WHERE kind = 'limit'),
+			count(*) FILTER (WHERE kind = 'guest_invite')
+		FROM ellie_events WHERE at >= $1 GROUP BY day ORDER BY day DESC`, since)
+	if err != nil {
+		return nil, fmt.Errorf("database: summarise events: %w", err)
+	}
+	defer rows.Close()
+	var out []DayStats
+	for rows.Next() {
+		var d DayStats
+		if err := rows.Scan(&d.Day, &d.Active, &d.New, &d.FromGroups, &d.FromInvites,
+			&d.Readings, &d.Chars, &d.LimitUsers, &d.GuestInvites); err != nil {
+			return nil, fmt.Errorf("database: summarise events: %w", err)
+		}
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("database: summarise events: %w", err)
+	}
+	return out, nil
+}
+
+func (p pgMetrics) Active(ctx context.Context, since time.Time) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, pgTimeout)
+	defer cancel()
+	var n int
+	err := p.pool.QueryRow(ctx, `SELECT count(DISTINCT user_id) FROM ellie_events
+		WHERE at >= $1 AND kind IN ('start', 'reading', 'transcribe')`, since).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("database: count active users: %w", err)
+	}
+	return n, nil
+}
+
+func (p pgMetrics) Prune(ctx context.Context, before time.Time) error {
+	_, err := p.pool.Exec(ctx, `DELETE FROM ellie_events WHERE at < $1`, before)
+	if err != nil {
+		return fmt.Errorf("database: prune events: %w", err)
+	}
+	return nil
+}
 
 type pgChats struct {
 	pool  *pgxpool.Pool

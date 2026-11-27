@@ -38,7 +38,7 @@ const (
 
 // join records that uid uses the private chat, which admits them to guest mode.
 func (b *Bot) join(uid int64) {
-	if err := b.store.Join(uid); err != nil {
+	if err := b.store.Join(uid, today()); err != nil {
 		b.log.Warn("save joined", "user", uid, "err", err)
 	}
 }
@@ -68,11 +68,12 @@ func (b *Bot) handleGuest(ctx context.Context, m *telegram.Message) {
 		b.log.Info("guest reply to Ellie ignored, no mention", "chat", chat, "user", uid)
 		return
 	}
-	if onlyMentions(text) {
-		text = "" // "@EllieStudioBot @friend" in a reply: read the reply, not the names
-	}
+	// Links, @usernames and emoji are never read; "@EllieStudioBot @friend"
+	// in a reply reads the replied message, not the names.
+	text = speakable(text)
 	if text == "" {
-		text, _ = b.stripMention(repliedText(m))
+		replied, _ := b.stripMention(repliedText(m))
+		text = speakable(replied)
 	}
 	// A group that once had Ellie keeps its own settings: guest mentions
 	// obey them just like /say would.
@@ -154,6 +155,8 @@ func (b *Bot) handleGuest(ctx context.Context, m *telegram.Message) {
 	}
 	b.log.Info("guest reply sent", "chat", chat, "chat_type", m.Chat.Type, "user", uid, "chars", chars)
 	b.remember(uid, func(r *recent) { r.spoken = text })
+	b.store.Spoke(uid, chars)
+	b.track(ctx, uid, evReading, srcGuest, chars)
 }
 
 // guestLimit is the longest text a guest mention may ask for.
@@ -197,9 +200,8 @@ func (b *Bot) guestRefusal(ctx context.Context, m *telegram.Message, text string
 	case !b.allowed(uid):
 		return noticeScreen(icWarn, "Ellie is private", "This studio is open to invited people only."), true
 	case b.cfg.GuestAccess != GuestEveryone && !b.isOwner(uid) && !b.store.Get(uid).Joined:
-		return noticeScreen(icStudio, "Start Ellie first",
-			"I read out loud in other chats for people who use Ellie Studio. "+
-				"Tap the button below, press <b>Start</b>, then mention me again."), true
+		b.track(ctx, uid, evGuestInvite, "", 0)
+		return b.guestInviteScreen(), true
 	case b.cfg.GroupMode == GroupsOff, b.cfg.GroupMode == GroupsAdmins && !b.isOwner(uid):
 		return noticeScreen(icWarn, "Not available here", "Ellie only works in our private chat right now."), true
 	case b.cfg.GuestStorageChat == 0:
@@ -276,17 +278,6 @@ func (b *Bot) isOwnMessage(r *telegram.Message) bool {
 	return r.GuestBotCallerUser != nil || me(r.From) || me(r.ViaBot)
 }
 
-// onlyMentions reports whether text is nothing but @usernames.
-func onlyMentions(text string) bool {
-	words := strings.Fields(text)
-	for _, w := range words {
-		if len(w) < 2 || w[0] != '@' {
-			return false
-		}
-	}
-	return len(words) > 0
-}
-
 // firstLine is a notice's title as plain text, for the logs.
 func firstLine(s string) string {
 	s, _, _ = strings.Cut(strings.TrimSpace(s), "\n")
@@ -295,14 +286,15 @@ func firstLine(s string) string {
 
 var htmlTagRe = regexp.MustCompile(`<[^>]*>`)
 
-// guestKeys links to the private chat, the only button a guest reply carries.
-func (b *Bot) guestKeys() *telegram.InlineKeyboardMarkup {
-	link := b.startLink("")
+// guestKeys links to the private chat, the only button a guest reply
+// carries. The "g" start payload counts who joins from guest mode.
+func (b *Bot) guestKeys(label string) *telegram.InlineKeyboardMarkup {
+	link := b.startLink("g")
 	if link == "" {
 		return nil
 	}
 	return &telegram.InlineKeyboardMarkup{InlineKeyboard: [][]telegram.InlineKeyboardButton{
-		{{Text: "🎙 Open Ellie Studio", URL: link}},
+		{{Text: label, URL: link}},
 	}}
 }
 
@@ -311,7 +303,7 @@ func (b *Bot) answerGuestText(ctx context.Context, m *telegram.Message, s screen
 	res := telegram.InlineQueryResultArticle{
 		Type: "article", ID: "ellie-notice", Title: "Ellie Studio",
 		InputMessageContent: telegram.InputTextMessageContent{MessageText: strings.TrimSpace(s.text), ParseMode: "HTML"},
-		ReplyMarkup:         b.guestKeys(),
+		ReplyMarkup:         b.guestKeys("🎁 Start Ellie, it's free"),
 	}
 	if _, err := b.tg.AnswerGuestQuery(ctx, m.GuestQueryID, res); err != nil {
 		b.log.Warn("guest notice", "chat", m.Chat.ID, "err", err)
@@ -340,6 +332,8 @@ func (b *Bot) answerGuestVoice(ctx context.Context, m *telegram.Message, s Setti
 	_, err = b.tg.AnswerGuestQuery(ctx, m.GuestQueryID, telegram.InlineQueryResultCachedVoice{
 		Type: "voice", ID: "ellie-voice", VoiceFileID: up.Voice.FileID,
 		Title: truncate(text, 60), Caption: speechCaption(s),
+		// Everyone in the chat hears it; the button lets them make their own.
+		ReplyMarkup: b.guestKeys("🎙 Make your own voice notes"),
 	})
 	return err
 }

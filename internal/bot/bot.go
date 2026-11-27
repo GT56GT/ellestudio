@@ -62,6 +62,11 @@ type Config struct {
 	// GuestAccess says who guest mentions serve: GuestMembers (default,
 	// people who have used the private chat) or GuestEveryone.
 	GuestAccess string
+	// ReferralBonus is the bonus characters a new user and the friend who
+	// invited them each get (0 turns referrals off). An inviter earns it at
+	// most ReferralDailyCap times a UTC day (0 = no cap).
+	ReferralBonus    int
+	ReferralDailyCap int
 	// GroupCooldown is how long one person waits between requests in a group.
 	GroupCooldown time.Duration
 	// GroupConcurrency caps the jobs running at once in one group.
@@ -78,8 +83,10 @@ type Bot struct {
 	store  *Store
 	owners Owners // who created each voice and dictionary
 	chats  Chats  // groups the bot is in, and their shared allowance
-	cfg    Config
-	log    *slog.Logger
+	// metrics records usage events for the admin Stats screen.
+	metrics Metrics
+	cfg     Config
+	log     *slog.Logger
 
 	cartesiaSlots chan struct{} // bounds concurrent Cartesia work
 	inflight      chan struct{} // bounds concurrent update handlers
@@ -146,6 +153,7 @@ func New(tg *telegram.Client, ct *cartesia.Client, store *Store, owners Owners, 
 		store:         store,
 		owners:        owners,
 		chats:         chats,
+		metrics:       newMemMetrics(),
 		cfg:           cfg,
 		log:           log,
 		cartesiaSlots: make(chan struct{}, cfg.Concurrency),
@@ -169,6 +177,8 @@ var Commands = []telegram.BotCommand{
 	{Command: "menu", Description: "Home screen"},
 	{Command: "voices", Description: "Browse and pick a voice"},
 	{Command: "style", Description: "Emotion, speed, volume, language"},
+	{Command: "profile", Description: "Your allowance, bonus and stats"},
+	{Command: "invite", Description: "Invite friends, both get bonus characters"},
 	{Command: "help", Description: "How everything works"},
 	{Command: "cancel", Description: "Stop what you're doing"},
 }
@@ -226,6 +236,8 @@ func (b *Bot) Run(ctx context.Context) error {
 		b.log.Warn("setMyShortDescription failed", "err", err)
 	}
 	b.importLegacyOwners(ctx)
+	b.wg.Add(1)
+	go func() { defer b.wg.Done(); b.pruneMetrics(ctx) }()
 
 	var offset int64
 	backoff := time.Second
