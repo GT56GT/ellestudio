@@ -336,9 +336,15 @@ type Update struct {
 }
 
 type InlineKeyboardButton struct {
-	Text         string `json:"text"`
-	CallbackData string `json:"callback_data,omitempty"`
-	URL          string `json:"url,omitempty"`
+	Text         string      `json:"text"`
+	CallbackData string      `json:"callback_data,omitempty"`
+	URL          string      `json:"url,omitempty"`
+	WebApp       *WebAppInfo `json:"web_app,omitempty"` // private chats only
+}
+
+// WebAppInfo opens a Mini App (an HTTPS page) inside Telegram.
+type WebAppInfo struct {
+	URL string `json:"url"`
 }
 
 type InlineKeyboardMarkup struct {

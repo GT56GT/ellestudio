@@ -77,6 +77,35 @@ var migrations = []string{
 		secs       INT         NOT NULL DEFAULT 0 CHECK (secs >= 0),
 		updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 	)`,
+	// 7: the admin panel: bot heartbeats (status.go), panel sign-in
+	// sessions (stored as token hashes) and the audit log of admin actions.
+	`CREATE TABLE ellie_status (
+		instance   TEXT        PRIMARY KEY,
+		started_at TIMESTAMPTZ NOT NULL,
+		at         TIMESTAMPTZ NOT NULL,
+		info       JSONB       NOT NULL
+	);
+	CREATE TABLE ellie_admin_sessions (
+		token_hash BYTEA       PRIMARY KEY,
+		admin_id   BIGINT      NOT NULL,
+		name       TEXT        NOT NULL DEFAULT '',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+		last_seen  TIMESTAMPTZ NOT NULL DEFAULT now(),
+		expires_at TIMESTAMPTZ NOT NULL,
+		user_agent TEXT        NOT NULL DEFAULT '',
+		ip         TEXT        NOT NULL DEFAULT ''
+	);
+	CREATE INDEX ellie_admin_sessions_by_admin ON ellie_admin_sessions (admin_id);
+	CREATE TABLE ellie_admin_audit (
+		id       BIGSERIAL   PRIMARY KEY,
+		at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+		admin_id BIGINT      NOT NULL,
+		action   TEXT        NOT NULL,
+		target   TEXT        NOT NULL DEFAULT '',
+		detail   JSONB       NOT NULL DEFAULT '{}',
+		ip       TEXT        NOT NULL DEFAULT ''
+	);
+	CREATE INDEX ellie_admin_audit_by_time ON ellie_admin_audit (at DESC)`,
 }
 
 // migrationLock is the advisory lock key ("ellie") that serialises

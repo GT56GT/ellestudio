@@ -200,13 +200,46 @@ These endpoint groups are documented but intentionally not wired into the bot, b
 - **Errors.** Cartesia's structured errors (`error_code`, `request_id`) become friendly messages that include the request ID for support.
 - **Safety.** Preview downloads only send the API key to the Cartesia host. Bot-token URLs are scrubbed from error logs. File settings are written atomically with mode `0600`. Database errors never include the connection password.
 
+## Admin panel
+
+A web panel for studio admins, deployed as its own Render web service next to the bot (`Dockerfile.admin`). It reads the bot's Postgres database and shows:
+
+- **Overview:** whether Ellie is live, today's studio-wide usage as a level meter, voice jobs running and waiting, the last 30 days of readings and active people, where new people came from, and the daily limits in force.
+- **Users:** everyone who has used Ellie, searchable by Telegram user ID and sortable, with a page per user (allowance, lifetime totals, referrals, voices made, 30 days of activity).
+- **Groups:** every chat Ellie reads in, with today's usage and status.
+- **Audit log** and **Sessions** (see below).
+
+Message text is never shown; the panel only sees the counts Ellie already stores. The bot reports its live state (the waiting line, a pause, its limits) every 15 seconds to `ellie_status`, which is how the panel knows whether Ellie is up.
+
+**Signing in.** There are no passwords. In a browser, admins use Telegram's Login Widget; inside Telegram, `/admin` → **Open admin panel** signs them in at once (a Mini App). Either way the server checks Telegram's signature with the bot token, rejects proofs older than 10 minutes, and admits only IDs in `ADMIN_USER_IDS`.
+
+**Security.**
+
+- Sessions are random 256-bit tokens. The database stores only their SHA-256, and a session ends after 12 hours, or 2 hours without activity. Removing someone from `ADMIN_USER_IDS` locks them out at once.
+- In a browser the token is a `__Host-` cookie (HttpOnly, Secure, SameSite=Strict). Inside Telegram, where cookies can be blocked, it's an `Authorization` header kept only in page memory.
+- Writes signed in by cookie must come from the panel's own origin and carry a custom header, so cross-site forms can't forge them.
+- A strict Content-Security-Policy (scripts only from the panel and telegram.org), HSTS, `nosniff`, no referrer, and frames only inside Telegram Web. Sign-in is rate-limited per IP, and request bodies are capped.
+- Every sign-in, refused sign-in, sign-out and session revocation goes to the audit log (`ellie_admin_audit`). Admins can see their devices and sign any of them out.
+
+**Setting it up on Render**
+
+1. Create a web service from this repository with **Dockerfile path** `./Dockerfile.admin`, in the same region as the database.
+2. Set `DATABASE_URL` (the database's Internal connection string), `TELEGRAM_BOT_TOKEN` and `ADMIN_USER_IDS`. `PUBLIC_URL` defaults to the service's Render URL.
+3. In @BotFather, send `/setdomain`, choose the bot and enter the panel's domain (for example `ellie-admin.onrender.com`), so the Login Widget works there.
+4. On the bot's service, set `ADMIN_PANEL_URL` to the panel's `https://` address. `/admin` then shows **Open admin panel**.
+
+**Working on the UI locally:** run the panel with `PUBLIC_URL` unset (for example `go run ./cmd/ellie-admin` with a local database), then `cd admin-ui && npm install && npm run dev`, which proxies `/api` to it. `npm run build` writes the UI to `internal/admin/dist`, and `go build -tags embedui ./cmd/ellie-admin` embeds it. Without the tag, the panel serves the API alone.
+
 ## Layout
 
 ```
-cmd/ellie/            entry point, env/.env config
+cmd/ellie/            the bot's entry point, env/.env config
+cmd/ellie-admin/      the admin panel's entry point
 internal/cartesia/    Cartesia REST client (TTS, STT, voices, accents, models, infill, watermark, dictionaries, usage)
 internal/telegram/    minimal Bot API client (long polling, messages, keyboards, uploads, downloads)
 internal/bot/         Ellie Studio commands, buttons, per-user settings (file or Postgres)
+internal/admin/       admin panel: Telegram sign-in, sessions, audit log, JSON API
+admin-ui/             admin panel UI (React + TypeScript + Vite), embedded into the panel binary
 docs/                 scraped Cartesia API reference
 ```
 

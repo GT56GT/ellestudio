@@ -46,6 +46,7 @@ const (
 // jobLine hands out a fixed number of slots in arrival order.
 type jobLine struct {
 	mu      sync.Mutex
+	slots   int
 	free    int
 	limit   int // most callers that may wait; 0 = no cap
 	waiting []*ticket
@@ -55,7 +56,7 @@ type jobLine struct {
 type ticket struct{ ready chan struct{} }
 
 func newJobLine(slots, limit int) *jobLine {
-	return &jobLine{free: max(slots, 1), limit: limit}
+	return &jobLine{slots: max(slots, 1), free: max(slots, 1), limit: limit}
 }
 
 // wait takes a slot, queuing behind earlier callers. If the caller is still
@@ -137,6 +138,13 @@ func (l *jobLine) leave(t *ticket) bool {
 		}
 	}
 	return false
+}
+
+// load is how many slots are in use and how many callers are waiting.
+func (l *jobLine) load() (running, queued int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.slots - l.free, len(l.waiting)
 }
 
 // queued is how many callers are waiting.

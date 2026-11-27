@@ -75,11 +75,12 @@ func run(log *slog.Logger) error {
 		Model:   envOr("DEFAULT_MODEL", cartesia.DefaultTTSModel),
 	}
 	var (
-		store   *bot.Store
-		owners  bot.Owners
-		chats   bot.Chats
-		metrics bot.Metrics // nil keeps stats in memory
-		budget  bot.Budget  // nil keeps the studio-wide count in memory
+		store    *bot.Store
+		owners   bot.Owners
+		chats    bot.Chats
+		metrics  bot.Metrics        // nil keeps stats in memory
+		budget   bot.Budget         // nil keeps the studio-wide count in memory
+		reporter bot.StatusReporter // nil: no heartbeat for the admin panel
 	)
 	if dbURL := os.Getenv("DATABASE_URL"); dbURL != "" {
 		db, err := bot.OpenDatabase(ctx, dbURL)
@@ -94,6 +95,7 @@ func run(log *slog.Logger) error {
 		chats = db.Chats()
 		metrics = db.Metrics()
 		budget = db.Budget()
+		reporter = db
 		log.Info("settings stored in Postgres")
 	} else {
 		dir := envOr("DATA_DIR", "data")
@@ -145,6 +147,7 @@ func run(log *slog.Logger) error {
 		// Studio-wide caps across everyone (0 = none).
 		StudioDailyChars:     envLimit("STUDIO_DAILY_CHAR_LIMIT", 0),
 		StudioDailyAudioSecs: envLimit("STUDIO_DAILY_TRANSCRIBE_MINUTES", 0) * 60,
+		AdminPanelURL:        adminPanelURL(),
 		DailyChars:           envLimit("DAILY_CHAR_LIMIT", 2000),
 		DailyAudioSecs:       envLimit("DAILY_TRANSCRIBE_MINUTES", 10) * 60,
 		DailyCreations:       envLimit("DAILY_VOICE_CREATIONS", 3),
@@ -169,6 +172,10 @@ func run(log *slog.Logger) error {
 		b.SetMetrics(metrics)
 	}
 	b.SetBudget(budget)
+	if reporter != nil {
+		host, _ := os.Hostname()
+		b.SetStatusReporter(reporter, envOr("RENDER_INSTANCE_ID", host), shortCommit(os.Getenv("RENDER_GIT_COMMIT")))
+	}
 	log.Info("Ellie Studio starting", "cartesia_version", cartesia.APIVersion, "default_voice", store.Defaults().VoiceName)
 	return b.Run(ctx)
 }
@@ -278,6 +285,24 @@ func envLimit(k string, d int) int {
 		return v
 	}
 	return d
+}
+
+// shortCommit trims a git commit hash for display.
+func shortCommit(c string) string {
+	if len(c) > 7 {
+		return c[:7]
+	}
+	return c
+}
+
+// adminPanelURL reads ADMIN_PANEL_URL; only https:// addresses can open
+// inside Telegram, so anything else is ignored.
+func adminPanelURL() string {
+	u := strings.TrimSpace(os.Getenv("ADMIN_PANEL_URL"))
+	if !strings.HasPrefix(u, "https://") {
+		return ""
+	}
+	return u
 }
 
 // queueLimit reads JOB_QUEUE_LIMIT for bot.Config.QueueLimit: unset keeps

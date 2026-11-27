@@ -51,3 +51,28 @@ jobs:
 
       - name: Tests (race detector, with Postgres)
         run: go test -race -count=1 ./...
+
+  admin-ui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: admin-ui/package-lock.json
+
+      - name: Type-check and build the admin UI
+        working-directory: admin-ui
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build the admin panel with the UI embedded
+        run: go build -tags embedui -o /dev/null ./cmd/ellie-admin

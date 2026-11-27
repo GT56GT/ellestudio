@@ -4,3 +4,5 @@ data/
 /ellie
 *.test
 docs/
+admin-ui/node_modules/
+internal/admin/dist/

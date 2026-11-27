@@ -2,3 +2,7 @@
 data/
 /ellie
 *.test
+/ellie-admin
+admin-ui/node_modules/
+internal/admin/dist/
+.DS_Store

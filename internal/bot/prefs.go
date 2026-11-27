@@ -543,8 +543,11 @@ func (b *Bot) adminScreen(ctx context.Context) screen {
 		"/unblockgroup <code>id</code> · let a group add Ellie again\n" +
 		"/stats · active users, readings, growth\n" +
 		"/status · service status")
-	k := (&keys{}).
-		row(btn("📊 Stats", "nav:stats"), btn("📈 Credits", "nav:usage")).
+	k := &keys{}
+	if b.cfg.AdminPanelURL != "" {
+		k.row(telegram.InlineKeyboardButton{Text: "🖥 Open admin panel", WebApp: &telegram.WebAppInfo{URL: b.cfg.AdminPanelURL}})
+	}
+	k.row(btn("📊 Stats", "nav:stats"), btn("📈 Credits", "nav:usage")).
 		row(btn("👥 Groups", "nav:groups"), btn("🩺 Service status", "nav:status")).
 		nav("", "")
 	return screen{sb.String(), k.build()}

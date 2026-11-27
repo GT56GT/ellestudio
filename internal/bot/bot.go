@@ -42,6 +42,9 @@ type Config struct {
 	// no cap.
 	StudioDailyChars     int
 	StudioDailyAudioSecs int
+	// AdminPanelURL is the admin panel's address; when set, /admin offers a
+	// button that opens it inside Telegram.
+	AdminPanelURL string
 	// PollTimeout is the getUpdates long-poll duration.
 	PollTimeout time.Duration
 	// DailyChars caps characters spoken per user per UTC day (0 = unlimited).
@@ -106,6 +109,12 @@ type Bot struct {
 
 	alertMu sync.Mutex
 	alerted map[string]time.Time // last admin alert of each kind
+
+	// Heartbeat for the admin panel (see status.go).
+	reporter StatusReporter
+	instance string
+	version  string
+	started  time.Time
 
 	sessMu   sync.Mutex
 	sessions map[int64]*browseSession
@@ -218,6 +227,7 @@ func New(tg *telegram.Client, ct *cartesia.Client, store *Store, owners Owners, 
 		jobs:       newJobLine(cfg.Concurrency, queueLimit(cfg.QueueLimit)),
 		inflight:   make(chan struct{}, maxHandlers),
 		alerted:    map[string]time.Time{},
+		started:    time.Now().UTC(),
 		sessions:   map[int64]*browseSession{},
 		flows:      map[int64]*flow{},
 		recent:     map[int64]*recent{},
@@ -300,6 +310,8 @@ func (b *Bot) Run(ctx context.Context) error {
 	go func() { defer b.wg.Done(); b.pruneMetrics(ctx) }()
 	b.wg.Add(1)
 	go func() { defer b.wg.Done(); b.sweepLoop(ctx) }()
+	b.wg.Add(1)
+	go func() { defer b.wg.Done(); b.heartbeat(ctx) }()
 
 	var offset int64
 	backoff := time.Second
