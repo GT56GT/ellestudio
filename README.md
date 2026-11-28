@@ -210,6 +210,12 @@ A web panel for studio admins, deployed as its own Render web service next to th
 - **Voices:** every voice and dictionary made through Ellie, with who made it, filterable by person.
 - **Audit log** and **Sessions** (see below).
 
+**Control room.**
+
+- **Settings:** change any daily limit live (per person, everyone together, groups, invites). Empty fields use the env var defaults. The bot reloads the overrides (`ellie_config`) every 30 seconds and swaps them in atomically, so handlers always see one consistent set, and its heartbeat reports both the defaults and the limits in force.
+- **Emergency pause:** one switch stops all new voice work (readings, transcriptions, clones) within 30 seconds. People see "Ellie is taking a short break" and aren't charged. The status light shows the pause.
+- **Announcements:** write a message, preview it, send a test to yourself, then send it to everyone who uses the private chat or only people active in the last 30 days. The bot sends it at about 10 a second, leaving room for normal replies. It records progress after every 50 people, so a restart resumes where it stopped, and an admin can cancel it at any time. Every announcement carries a "Stop these messages" button. Opted-out and banned people are skipped, and only one announcement goes out at a time.
+
 **Changes admins can make.** Each one opens a dialog that says exactly what will happen and needs a reason, and each goes in the audit log with what it was before and after.
 
 - **Users:** give bonus characters (optionally telling them in Telegram), reset today's allowance, ban for 1, 7 or 30 days or until lifted, and lift a ban. Banned people get one short "access paused" message, then Ellie ignores them in the private chat, groups, guest replies and buttons. The bot refreshes its ban list every 30 seconds. Admins can't be banned. User changes take the same per-user database lock as the bot, so nothing the bot writes at that moment is lost.

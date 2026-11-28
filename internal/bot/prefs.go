@@ -407,14 +407,14 @@ func (b *Bot) dictsScreen(ctx context.Context, uid int64) screen {
 func (b *Bot) createDict(ctx context.Context, m *telegram.Message, name string, items []cartesia.PronunciationItem) {
 	uid := m.From.ID
 	if !b.isAdmin(uid) {
-		ok, used, err := b.store.SpendDict(uid, today(), b.cfg.DailyDicts)
+		ok, used, err := b.store.SpendDict(uid, today(), b.lim().DailyDicts)
 		if err != nil {
 			b.log.Warn("save usage", "err", err)
 		}
 		if !ok {
 			s := noticeScreen("🎟", "Daily dictionary limit reached", fmt.Sprintf(
 				"You've created <b>%d</b> of your <b>%d</b> dictionaries for today. You can make more in <b>%s</b> (midnight UTC).",
-				used, b.cfg.DailyDicts, fmtWait(untilReset())))
+				used, b.lim().DailyDicts, fmtWait(untilReset())))
 			b.replyHTML(ctx, m, s.text, s.kb)
 			return
 		}
@@ -535,7 +535,7 @@ func (b *Bot) adminScreen(ctx context.Context) screen {
 	} else {
 		b.log.Warn("group totals unavailable", "err", err)
 	}
-	sb.WriteString(field("🎟", "Each user per day", fmtInt(b.cfg.DailyChars)+" characters · "+fmtMinutes(b.cfg.DailyAudioSecs)+" transcribed"))
+	sb.WriteString(field("🎟", "Each user per day", fmtInt(b.lim().DailyChars)+" characters · "+fmtMinutes(b.lim().DailyAudioSecs)+" transcribed"))
 	sb.WriteString("\n<b>Commands</b>\n" +
 		"/usage · Cartesia credit usage\n" +
 		"/groups · today's busiest groups and their settings\n" +
@@ -638,6 +638,8 @@ func (b *Bot) dispatchCallback(ctx context.Context, q *telegram.CallbackQuery) {
 	as := &telegram.Message{From: &q.From, Chat: q.Message.Chat}
 
 	switch kind {
+	case "news":
+		b.setNews(ctx, q, val == "on")
 	case "nav":
 		ack("")
 		b.show(ctx, q, b.navScreen(ctx, uid, val))

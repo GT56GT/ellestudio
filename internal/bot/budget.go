@@ -236,7 +236,7 @@ func (b *Bot) SetBudget(bu Budget) {
 }
 
 func (b *Bot) studioCapped() bool {
-	return b.cfg.StudioDailyChars > 0 || b.cfg.StudioDailyAudioSecs > 0
+	return b.lim().StudioDailyChars > 0 || b.lim().StudioDailyAudioSecs > 0
 }
 
 // spendStudio takes chars and secs from today's studio-wide budget. While
@@ -250,7 +250,7 @@ func (b *Bot) spendStudio(chars, secs int) (ok, unknown bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), pgTimeout)
 	defer cancel()
 	day := today()
-	ok, err := b.budget.Spend(ctx, day, chars, secs, b.cfg.StudioDailyChars, b.cfg.StudioDailyAudioSecs)
+	ok, err := b.budget.Spend(ctx, day, chars, secs, b.lim().StudioDailyChars, b.lim().StudioDailyAudioSecs)
 	if err != nil {
 		b.log.Warn("studio budget database unreachable; using the local count", "allowed", ok, "err", err)
 	}
@@ -297,12 +297,12 @@ func (b *Bot) studioLines(ctx context.Context) string {
 	out := ""
 	if chars, secs, err := b.budget.Used(ctx, today()); err == nil && b.studioCapped() {
 		c := fmtInt(chars)
-		if b.cfg.StudioDailyChars > 0 {
-			c += " of " + fmtInt(b.cfg.StudioDailyChars)
+		if b.lim().StudioDailyChars > 0 {
+			c += " of " + fmtInt(b.lim().StudioDailyChars)
 		}
 		a := fmtMinutes(secs)
-		if b.cfg.StudioDailyAudioSecs > 0 {
-			a += " of " + fmtMinutes(b.cfg.StudioDailyAudioSecs)
+		if b.lim().StudioDailyAudioSecs > 0 {
+			a += " of " + fmtMinutes(b.lim().StudioDailyAudioSecs)
 		}
 		out += field("🎟", "Studio today", c+" characters · "+a)
 	}

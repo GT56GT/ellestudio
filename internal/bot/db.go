@@ -122,6 +122,30 @@ var migrations = []string{
 	);
 	CREATE UNIQUE INDEX ellie_admin_jobs_one_open ON ellie_admin_jobs (kind, target) WHERE status IN ('pending', 'running');
 	CREATE INDEX ellie_admin_jobs_open ON ellie_admin_jobs (id) WHERE status IN ('pending', 'running')`,
+	// 9: limits admins changed in the panel (limits.go), and announcements
+	// (broadcast.go). At most one broadcast is queued or sending at a time.
+	`CREATE TABLE ellie_config (
+		key        TEXT        PRIMARY KEY,
+		value      JSONB       NOT NULL,
+		updated_by BIGINT      NOT NULL DEFAULT 0,
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+	);
+	CREATE TABLE ellie_broadcasts (
+		id          BIGSERIAL   PRIMARY KEY,
+		text        TEXT        NOT NULL CHECK (text <> ''),
+		audience    TEXT        NOT NULL CHECK (audience IN ('everyone', 'active_30d')),
+		created_by  BIGINT      NOT NULL,
+		status      TEXT        NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'sending', 'done', 'cancelled')),
+		total       INT         NOT NULL DEFAULT 0,
+		sent        INT         NOT NULL DEFAULT 0,
+		failed      INT         NOT NULL DEFAULT 0,
+		cursor      BIGINT      NOT NULL DEFAULT 0,
+		created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+		started_at  TIMESTAMPTZ,
+		finished_at TIMESTAMPTZ,
+		updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+	);
+	CREATE UNIQUE INDEX ellie_broadcasts_one_open ON ellie_broadcasts ((true)) WHERE status IN ('queued', 'sending')`,
 }
 
 // migrationLock is the advisory lock key ("ellie") that serialises

@@ -46,14 +46,14 @@ func parseReferral(payload string) (int64, bool) {
 }
 
 // referrals reports whether invites earn bonus characters.
-func (b *Bot) referrals() bool { return b.cfg.ReferralBonus > 0 && b.username != "" }
+func (b *Bot) referrals() bool { return b.lim().ReferralBonus > 0 && b.username != "" }
 
 func (b *Bot) inviteLink(uid int64) string { return b.startLink("r_" + strconv.FormatInt(uid, 10)) }
 
 // shareURL opens Telegram's "share to a chat" sheet with the invite.
 func (b *Bot) shareURL(uid int64) string {
 	text := "I turn my texts into voice notes with Ellie 🎙 Join with my link and we both get " +
-		fmtInt(b.cfg.ReferralBonus) + " free bonus characters."
+		fmtInt(b.lim().ReferralBonus) + " free bonus characters."
 	return "https://t.me/share/url?url=" + url.QueryEscape(b.inviteLink(uid)) + "&text=" + url.QueryEscape(text)
 }
 
@@ -65,7 +65,7 @@ func (b *Bot) applyReferral(ctx context.Context, m *telegram.Message, payload st
 	if !ok || !b.referrals() || !b.allowed(inviter) {
 		return 0
 	}
-	applied, rewarded, err := b.store.Referral(inviter, m.From.ID, today(), b.cfg.ReferralBonus, b.cfg.ReferralDailyCap)
+	applied, rewarded, err := b.store.Referral(inviter, m.From.ID, today(), b.lim().ReferralBonus, b.lim().ReferralDailyCap)
 	if err != nil {
 		b.log.Warn("save referral", "err", err)
 	}
@@ -74,7 +74,7 @@ func (b *Bot) applyReferral(ctx context.Context, m *telegram.Message, payload st
 	}
 	b.log.Info("referral", "inviter", inviter, "user", m.From.ID, "rewarded", rewarded)
 	name := html.EscapeString(orDefault(m.From.FirstName, "A friend"))
-	body := "You got <b>+" + fmtInt(b.cfg.ReferralBonus) + " bonus characters</b>. " +
+	body := "You got <b>+" + fmtInt(b.lim().ReferralBonus) + " bonus characters</b>. " +
 		"They're used after your daily allowance and never expire."
 	if !rewarded {
 		body = "You've reached today's limit of invite rewards. Friends who join tomorrow earn you bonus characters again."
@@ -82,7 +82,7 @@ func (b *Bot) applyReferral(ctx context.Context, m *telegram.Message, payload st
 	s := screen{header("🎉", name+" joined Ellie from your invite!", "") + body,
 		(&keys{}).row(btn("👤 My profile", "nav:profile")).build()}
 	b.sendScreen(ctx, inviter, 0, s)
-	return b.cfg.ReferralBonus
+	return b.lim().ReferralBonus
 }
 
 // ---------------------------------------------------------------- first visit
@@ -111,14 +111,14 @@ func (b *Bot) firstVisitText(name string, bonus int) string {
 // freeAllowance lists the daily allowance, or "" when nothing is limited.
 func (b *Bot) freeAllowance() string {
 	var parts []string
-	if b.cfg.DailyChars > 0 {
-		parts = append(parts, fmtInt(b.cfg.DailyChars)+" characters")
+	if b.lim().DailyChars > 0 {
+		parts = append(parts, fmtInt(b.lim().DailyChars)+" characters")
 	}
-	if b.cfg.DailyAudioSecs > 0 {
-		parts = append(parts, fmtMinutes(b.cfg.DailyAudioSecs)+" of transcription")
+	if b.lim().DailyAudioSecs > 0 {
+		parts = append(parts, fmtMinutes(b.lim().DailyAudioSecs)+" of transcription")
 	}
-	if b.cfg.DailyCreations > 0 {
-		parts = append(parts, strconv.Itoa(b.cfg.DailyCreations)+" new voices")
+	if b.lim().DailyCreations > 0 {
+		parts = append(parts, strconv.Itoa(b.lim().DailyCreations)+" new voices")
 	}
 	return strings.Join(parts, " · ")
 }
@@ -169,14 +169,14 @@ func (b *Bot) profileScreen(uid int64) screen {
 		sb.WriteString(field("🎟", "Allowance", "unlimited"))
 	} else {
 		u := b.store.UsageOn(uid, today())
-		if c := b.cfg.DailyChars; c > 0 {
+		if c := b.lim().DailyChars; c > 0 {
 			left := max(0, c-u.Chars)
 			sb.WriteString("🎟 Speech: " + bar(left, c) + " <b>" + fmtInt(left) + "</b> of " + fmtInt(c) + " characters left\n")
 		}
-		if a := b.cfg.DailyAudioSecs; a > 0 {
+		if a := b.lim().DailyAudioSecs; a > 0 {
 			sb.WriteString(field(icListen, "Transcription left", fmtMinutes(max(0, a-u.Secs))+" of "+fmtMinutes(a)))
 		}
-		if n := b.cfg.DailyCreations; n > 0 {
+		if n := b.lim().DailyCreations; n > 0 {
 			sb.WriteString(field(icCreate, "New voices left", strconv.Itoa(max(0, n-u.Makes))+" of "+strconv.Itoa(n)))
 		}
 		sb.WriteString("🔄 Refreshes in <b>" + fmtWait(untilReset()) + "</b> (midnight UTC)\n")
@@ -194,7 +194,7 @@ func (b *Bot) profileScreen(uid int64) screen {
 
 	k := &keys{}
 	if b.referrals() {
-		sb.WriteString("\n🤝 <b>Invite friends:</b> you both get <b>+" + fmtInt(b.cfg.ReferralBonus) + "</b> bonus characters.")
+		sb.WriteString("\n🤝 <b>Invite friends:</b> you both get <b>+" + fmtInt(b.lim().ReferralBonus) + "</b> bonus characters.")
 		k.row(telegram.InlineKeyboardButton{Text: "📨 Invite friends", URL: b.shareURL(uid)}, btn("🔗 My invite link", "nav:invite"))
 	}
 	k.row(btn(icVoices+" Voices", "nav:voices"), btn(icStyle+" Style", "nav:style")).nav("", "")
@@ -207,11 +207,11 @@ func (b *Bot) inviteScreen(uid int64) screen {
 	}
 	s := b.store.Get(uid)
 	text := header("🤝", "Invite friends", "You both get bonus characters") +
-		"When a friend starts Ellie with your link, you each get <b>+" + fmtInt(b.cfg.ReferralBonus) + " bonus characters</b>. " +
+		"When a friend starts Ellie with your link, you each get <b>+" + fmtInt(b.lim().ReferralBonus) + " bonus characters</b>. " +
 		"Bonus characters are used after your daily allowance and never expire.\n\n" +
 		"Your link:\n<code>" + html.EscapeString(b.inviteLink(uid)) + "</code>\n\n" +
 		field("🤝", "Friends invited so far", fmtInt(s.Referrals))
-	if c := b.cfg.ReferralDailyCap; c > 0 {
+	if c := b.lim().ReferralDailyCap; c > 0 {
 		text += "<i>You can earn up to " + strconv.Itoa(c) + " invite rewards a day.</i>"
 	}
 	k := (&keys{}).
@@ -223,19 +223,19 @@ func (b *Bot) inviteScreen(uid int64) screen {
 // leftLine is the plain-text "characters left" line under a private reading,
 // or "" for people without a limit.
 func (b *Bot) leftLine(uid int64) string {
-	if !b.limited(uid) || b.cfg.DailyChars <= 0 {
+	if !b.limited(uid) || b.lim().DailyChars <= 0 {
 		return ""
 	}
 	u := b.store.UsageOn(uid, today())
-	left := max(0, b.cfg.DailyChars-u.Chars)
-	line := "🎟 " + fmtInt(left) + " of " + fmtInt(b.cfg.DailyChars) + " characters left today"
+	left := max(0, b.lim().DailyChars-u.Chars)
+	line := "🎟 " + fmtInt(left) + " of " + fmtInt(b.lim().DailyChars) + " characters left today"
 	if left == 0 {
 		line = "🎟 Daily allowance used"
 	}
 	if u.Bonus > 0 {
 		line += " · 🎁 " + fmtInt(u.Bonus) + " bonus"
 	}
-	if left*5 < b.cfg.DailyChars && b.referrals() {
+	if left*5 < b.lim().DailyChars && b.referrals() {
 		line += " · /invite for more"
 	}
 	return line

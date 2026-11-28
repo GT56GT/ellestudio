@@ -10,14 +10,58 @@ export interface BotStatus {
   queued: number;
   queue_limit: number;
   paused_until?: string;
-  limits: {
-    user_chars: number;
-    user_audio_secs: number;
-    studio_chars: number;
-    studio_audio_secs: number;
-    group_chars: number;
-    groups_total_chars: number;
-  };
+  admin_paused?: boolean;
+  limits: StatusLimits;
+  defaults?: StatusLimits;
+}
+
+export interface StatusLimits {
+  user_chars: number;
+  user_audio_secs: number;
+  user_creations: number;
+  user_dicts: number;
+  max_tts_chars: number;
+  studio_chars: number;
+  studio_audio_secs: number;
+  group_chars: number;
+  group_secs: number;
+  groups_total_chars: number;
+  groups_total_secs: number;
+  group_cooldown_secs: number;
+  referral_bonus: number;
+  referral_daily_cap: number;
+}
+
+// Overrides an admin saved; a missing key means the server default.
+export type Overrides = Partial<Record<OverrideKey, number>> & { paused?: boolean };
+export type OverrideKey =
+  | "daily_chars"
+  | "daily_audio_secs"
+  | "daily_creations"
+  | "daily_dicts"
+  | "max_tts_chars"
+  | "studio_daily_chars"
+  | "studio_daily_audio_secs"
+  | "group_chars"
+  | "group_secs"
+  | "groups_total_chars"
+  | "groups_total_secs"
+  | "group_cooldown_secs"
+  | "referral_bonus"
+  | "referral_daily_cap";
+
+export interface BroadcastRow {
+  id: number;
+  text: string;
+  audience: "everyone" | "active_30d";
+  created_by: number;
+  status: "queued" | "sending" | "done" | "cancelled";
+  total: number;
+  sent: number;
+  failed: number;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
 }
 
 export interface Day {

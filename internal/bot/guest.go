@@ -172,7 +172,7 @@ func (b *Bot) handleGuest(ctx context.Context, m *telegram.Message) {
 
 // guestLimit is the longest text a guest mention may ask for.
 func (b *Bot) guestLimit(gs GroupSettings) int {
-	return effCap(min(guestMaxChars, b.cfg.MaxTTSChars), gs.MaxChars)
+	return effCap(min(guestMaxChars, b.lim().MaxTTSChars), gs.MaxChars)
 }
 
 // guestTurn applies the group cooldown and per-chat job limit to a guest
@@ -185,7 +185,7 @@ func (b *Bot) guestTurn(chat, uid int64) (done func(), wait time.Duration, ok bo
 	key, now := chatUser{chat, uid}, time.Now()
 	b.groupMu.Lock()
 	defer b.groupMu.Unlock()
-	if cd := b.cfg.GroupCooldown; cd > 0 {
+	if cd := b.lim().GroupCooldown; cd > 0 {
 		if since := now.Sub(b.lastUse[key]); since < cd {
 			return nil, cd - since, false
 		}
@@ -255,7 +255,7 @@ func (b *Bot) spendGuestChat(ctx context.Context, m *telegram.Message, chars int
 	if b.isOwner(m.From.ID) {
 		return false, screen{}, true
 	}
-	l := b.cfg.GroupLimits
+	l := b.lim().GroupLimits
 	l.Chars = effCap(l.Chars, gs.DailyChars)
 	err := b.chats.Spend(ctx, m.Chat.ID, today(), chars, 0, l)
 	switch {

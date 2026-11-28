@@ -66,6 +66,9 @@ type Settings struct {
 	// Ban, set from the admin panel, keeps the user out of Ellie. Kept
 	// across /reset.
 	Ban *Ban `json:"ban,omitempty"`
+
+	// NoNews turns off the admins' announcements (the button under each).
+	NoNews bool `json:"no_news,omitempty"`
 }
 
 // Ban is an admin's decision to keep a user out.

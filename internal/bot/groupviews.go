@@ -55,7 +55,7 @@ func effCap(studio, group int) int {
 // groupLimits are the caps for the request in ctx: the studio's, lowered by
 // the group's own daily allowance.
 func (b *Bot) groupLimits(ctx context.Context) GroupLimits {
-	l := b.cfg.GroupLimits
+	l := b.lim().GroupLimits
 	l.Chars = effCap(l.Chars, groupSettingsOf(ctx).DailyChars)
 	return l
 }
@@ -63,9 +63,9 @@ func (b *Bot) groupLimits(ctx context.Context) GroupLimits {
 // maxChars is the longest text one request may speak.
 func (b *Bot) maxChars(ctx context.Context, m *telegram.Message) int {
 	if !isGroupChat(m.Chat.ID) {
-		return b.cfg.MaxTTSChars
+		return b.lim().MaxTTSChars
 	}
-	return effCap(b.cfg.MaxTTSChars, groupSettingsOf(ctx).MaxChars)
+	return effCap(b.lim().MaxTTSChars, groupSettingsOf(ctx).MaxChars)
 }
 
 // groupMayRun applies a group's own settings to a /say or /transcribe.
@@ -461,7 +461,7 @@ func (b *Bot) groupMenu(ctx context.Context, chat, uid int64, view string) scree
 		field(icStyle, "Style", styleSummary(s)) +
 		"\n" + b.allowanceLines(uid)
 	if info, _, err := b.chats.Get(ctx, chat); err == nil {
-		if c := effCap(b.cfg.GroupLimits.Chars, info.Settings.DailyChars); c > 0 {
+		if c := effCap(b.lim().GroupLimits.Chars, info.Settings.DailyChars); c > 0 {
 			used, _ := info.usageOn(today())
 			text += field("👥", "Group allowance left today", fmtInt(max(0, c-used))+" of "+fmtInt(c)+" characters")
 		}
@@ -545,8 +545,8 @@ func (b *Bot) groupSettingsScreen(ctx context.Context, chat int64) screen {
 		field("👥", "Who can use it", who) +
 		field("🗣", "Speaking (/say)", onOff(!gs.NoSpeak)) +
 		field(icListen, "Transcribing", onOff(!gs.NoTranscribe)) +
-		field("🎟", "Shared daily allowance", charsLabel(b.cfg.GroupLimits.Chars, gs.DailyChars)) +
-		field("✂️", "Longest message", charsLabel(b.cfg.MaxTTSChars, gs.MaxChars)) +
+		field("🎟", "Shared daily allowance", charsLabel(b.lim().GroupLimits.Chars, gs.DailyChars)) +
+		field("✂️", "Longest message", charsLabel(b.lim().MaxTTSChars, gs.MaxChars)) +
 		field("📊", "Spoken here today", fmtInt(used)+" characters")
 	pause, admins := "⏸ Pause Ellie", "🛡 Admins only"
 	if gs.Paused {
@@ -602,9 +602,9 @@ func (b *Bot) groupSettingsPress(ctx context.Context, q *telegram.CallbackQuery,
 		case "tr":
 			gs.NoTranscribe = !gs.NoTranscribe
 		case "cap":
-			gs.DailyChars = nextPreset(gs.DailyChars, dailyPresets, b.cfg.GroupLimits.Chars)
+			gs.DailyChars = nextPreset(gs.DailyChars, dailyPresets, b.lim().GroupLimits.Chars)
 		case "len":
-			gs.MaxChars = nextPreset(gs.MaxChars, lengthPresets, b.cfg.MaxTTSChars)
+			gs.MaxChars = nextPreset(gs.MaxChars, lengthPresets, b.lim().MaxTTSChars)
 		default:
 			ack("")
 			return

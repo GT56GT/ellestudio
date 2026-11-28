@@ -13,6 +13,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"ellestudio/internal/cartesia"
@@ -110,9 +111,13 @@ type Bot struct {
 	alertMu sync.Mutex
 	alerted map[string]time.Time // last admin alert of each kind
 
-	// Admin panel work (see adminwork.go).
+	// Admin panel work (see adminwork.go) and live limits (limits.go).
 	adminQueue AdminQueue
 	bans       banList
+	config     ConfigSource
+	broadcasts BroadcastQueue
+	base       Limits                 // from the env vars
+	limits     atomic.Pointer[Limits] // base plus the panel's overrides
 
 	// Heartbeat for the admin panel (see status.go).
 	reporter StatusReporter
@@ -218,7 +223,7 @@ func New(tg *telegram.Client, ct *cartesia.Client, store *Store, owners Owners, 
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Bot{
+	b := &Bot{
 		tg:         tg,
 		ct:         ct,
 		store:      store,
@@ -242,6 +247,9 @@ func New(tg *telegram.Client, ct *cartesia.Client, store *Store, owners Owners, 
 		adminCache: map[chatUser]adminEntry{},
 		noticeAt:   map[noticeKey]time.Time{},
 	}
+	b.base = limitsFrom(cfg)
+	b.applyOverrides(LimitOverrides{})
+	return b
 }
 
 // Commands is the short menu Telegram shows; every other command still works
@@ -310,7 +318,7 @@ func (b *Bot) Run(ctx context.Context) error {
 		b.log.Warn("setMyShortDescription failed", "err", err)
 	}
 	b.importLegacyOwners(ctx)
-	b.refreshBans()
+	b.refreshLive(ctx)
 	b.wg.Add(1)
 	go func() { defer b.wg.Done(); b.pruneMetrics(ctx) }()
 	b.wg.Add(1)
@@ -321,6 +329,8 @@ func (b *Bot) Run(ctx context.Context) error {
 	go func() { defer b.wg.Done(); b.banLoop(ctx) }()
 	b.wg.Add(1)
 	go func() { defer b.wg.Done(); b.adminJobs(ctx) }()
+	b.wg.Add(1)
+	go func() { defer b.wg.Done(); b.broadcastLoop(ctx) }()
 
 	var offset int64
 	backoff := time.Second

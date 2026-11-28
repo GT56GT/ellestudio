@@ -31,17 +31,38 @@ type Status struct {
 	Queued      int          `json:"queued"`  // jobs waiting in line
 	QueueLimit  int          `json:"queue_limit"`
 	PausedUntil *time.Time   `json:"paused_until,omitempty"` // breaker open
-	Limits      StatusLimits `json:"limits"`
+	AdminPaused bool         `json:"admin_paused,omitempty"` // the panel's emergency switch
+	Limits      StatusLimits `json:"limits"`                 // in force
+	Defaults    StatusLimits `json:"defaults"`               // from the env vars
 }
 
 // StatusLimits are the daily limits the bot runs with.
 type StatusLimits struct {
-	UserChars        int `json:"user_chars"`
-	UserAudioSecs    int `json:"user_audio_secs"`
-	StudioChars      int `json:"studio_chars"`
-	StudioAudioSecs  int `json:"studio_audio_secs"`
-	GroupChars       int `json:"group_chars"`
-	GroupsTotalChars int `json:"groups_total_chars"`
+	UserChars         int `json:"user_chars"`
+	UserAudioSecs     int `json:"user_audio_secs"`
+	UserCreations     int `json:"user_creations"`
+	UserDicts         int `json:"user_dicts"`
+	MaxTTSChars       int `json:"max_tts_chars"`
+	StudioChars       int `json:"studio_chars"`
+	StudioAudioSecs   int `json:"studio_audio_secs"`
+	GroupChars        int `json:"group_chars"`
+	GroupSecs         int `json:"group_secs"`
+	GroupsTotalChars  int `json:"groups_total_chars"`
+	GroupsTotalSecs   int `json:"groups_total_secs"`
+	GroupCooldownSecs int `json:"group_cooldown_secs"`
+	ReferralBonus     int `json:"referral_bonus"`
+	ReferralDailyCap  int `json:"referral_daily_cap"`
+}
+
+func statusLimits(l Limits) StatusLimits {
+	return StatusLimits{
+		UserChars: l.DailyChars, UserAudioSecs: l.DailyAudioSecs, UserCreations: l.DailyCreations, UserDicts: l.DailyDicts,
+		MaxTTSChars: l.MaxTTSChars, StudioChars: l.StudioDailyChars, StudioAudioSecs: l.StudioDailyAudioSecs,
+		GroupChars: l.GroupLimits.Chars, GroupSecs: l.GroupLimits.Secs,
+		GroupsTotalChars: l.GroupLimits.AllChars, GroupsTotalSecs: l.GroupLimits.AllSecs,
+		GroupCooldownSecs: int(l.GroupCooldown / time.Second),
+		ReferralBonus:     l.ReferralBonus, ReferralDailyCap: l.ReferralDailyCap,
+	}
 }
 
 // StatusReporter stores heartbeats (the database's, in production).
@@ -61,11 +82,7 @@ func (b *Bot) status(now time.Time) Status {
 	s := Status{
 		Instance: b.instance, Version: b.version, StartedAt: b.started, At: now,
 		Running: running, Slots: b.cfg.Concurrency, Queued: queued, QueueLimit: b.jobs.limit,
-		Limits: StatusLimits{
-			UserChars: b.cfg.DailyChars, UserAudioSecs: b.cfg.DailyAudioSecs,
-			StudioChars: b.cfg.StudioDailyChars, StudioAudioSecs: b.cfg.StudioDailyAudioSecs,
-			GroupChars: b.cfg.GroupLimits.Chars, GroupsTotalChars: b.cfg.GroupLimits.AllChars,
-		},
+		Limits: statusLimits(b.lim()), Defaults: statusLimits(b.base), AdminPaused: b.lim().Paused,
 	}
 	if open, left := b.breaker.isOpen(); open {
 		until := now.Add(left)

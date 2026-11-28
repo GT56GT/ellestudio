@@ -31,6 +31,20 @@ export const IconVoices = () => (
     <path d="M6 11.5a6 6 0 0 0 12 0M12 17.5V20.5" />
   </svg>
 );
+export const IconSettings = () => (
+  <svg {...base}>
+    <path d="M5 7h9M18 7h1M5 12h3M12 12h7M5 17h11M19 17h0" />
+    <circle cx="16" cy="7" r="2" />
+    <circle cx="10" cy="12" r="2" />
+    <circle cx="17.5" cy="17" r="1.6" />
+  </svg>
+);
+export const IconBroadcast = () => (
+  <svg {...base}>
+    <path d="M4 10v4h3l6 4V6L7 10z" />
+    <path d="M16.5 9a4 4 0 0 1 0 6M19 6.5a7.5 7.5 0 0 1 0 11" />
+  </svg>
+);
 export const IconAudit = () => (
   <svg {...base}>
     <path d="M7 4h8l3 3v13H7z" />

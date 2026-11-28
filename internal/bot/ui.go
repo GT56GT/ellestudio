@@ -205,7 +205,7 @@ func (b *Bot) speakPrompt(uid int64) screen {
 	s := b.store.Get(uid)
 	text := header(icStudio, "Speak", "") +
 		"Type anything and I'll say it with <b>" + html.EscapeString(orDefault(s.VoiceName, "your voice")) + "</b>.\n" +
-		"<i>Up to " + strconv.Itoa(b.cfg.MaxTTSChars) + " characters per message.</i>"
+		"<i>Up to " + strconv.Itoa(b.lim().MaxTTSChars) + " characters per message.</i>"
 	k := (&keys{}).row(btn(icVoices+" Change voice", "nav:voices"), btn(icStyle+" Style", "nav:style")).nav("", "")
 	return screen{text, k.build()}
 }
@@ -330,9 +330,9 @@ func (b *Bot) createScreen(uid int64) screen {
 		"📖 <b>Pronunciation</b> teaches me how to say names and brands.\n\n" +
 		"🔒 What you make shows up only in <b>your</b> library.\n" +
 		"🔗 To let someone else use a voice, tap <b>Share</b> on it and send them the link or ID."
-	if !b.isAdmin(uid) && b.cfg.DailyCreations > 0 {
-		left := max(0, b.cfg.DailyCreations-b.store.UsageOn(uid, today()).Makes)
-		text += fmt.Sprintf("\n\n🎟 New voices left today: <b>%d of %d</b>", left, b.cfg.DailyCreations)
+	if !b.isAdmin(uid) && b.lim().DailyCreations > 0 {
+		left := max(0, b.lim().DailyCreations-b.store.UsageOn(uid, today()).Makes)
+		text += fmt.Sprintf("\n\n🎟 New voices left today: <b>%d of %d</b>", left, b.lim().DailyCreations)
 	}
 	k := (&keys{}).
 		row(btn(icCreate+" Clone a voice", "do:clone"), btn(icLocalize+" Localize voice", "nav:localize")).

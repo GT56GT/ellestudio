@@ -47,7 +47,7 @@ func fmtMinutes(secs int) string {
 }
 
 func (b *Bot) limited(uid int64) bool {
-	return !b.isAdmin(uid) && (b.cfg.DailyChars > 0 || b.cfg.DailyAudioSecs > 0 || b.cfg.DailyCreations > 0)
+	return !b.isAdmin(uid) && (b.lim().DailyChars > 0 || b.lim().DailyAudioSecs > 0 || b.lim().DailyCreations > 0)
 }
 
 // spendMake reserves one voice creation; on refusal it returns the screen.
@@ -55,14 +55,14 @@ func (b *Bot) spendMake(uid int64) (bool, screen) {
 	if b.isAdmin(uid) {
 		return true, screen{}
 	}
-	ok, u, err := b.store.SpendMake(uid, today(), b.cfg.DailyCreations)
+	ok, u, err := b.store.SpendMake(uid, today(), b.lim().DailyCreations)
 	if err != nil {
 		b.log.Warn("save usage", "err", err)
 	}
 	if ok {
 		return true, screen{}
 	}
-	body := fmt.Sprintf("You've created <b>%d</b> of your <b>%d</b> voices for today.", u.Makes, b.cfg.DailyCreations) +
+	body := fmt.Sprintf("You've created <b>%d</b> of your <b>%d</b> voices for today.", u.Makes, b.lim().DailyCreations) +
 		"\n\n🔄 You can make more in <b>" + fmtWait(untilReset()) + "</b> (midnight UTC). Your existing voices still work."
 	k := (&keys{}).row(btn("🗂 My voices", "do:mine")).nav("", "")
 	return false, screen{header("🎟", "Daily voice limit reached", "") + body, k.build()}
@@ -79,13 +79,13 @@ func (b *Bot) spendChars(uid int64, n int) (bool, Usage) {
 	if b.isAdmin(uid) {
 		return true, Usage{}
 	}
-	ok, u, err := b.store.Spend(uid, today(), n, 0, b.cfg.DailyChars, 0)
+	ok, u, err := b.store.Spend(uid, today(), n, 0, b.lim().DailyChars, 0)
 	if err != nil {
 		b.log.Warn("save usage", "err", err)
 	}
 	if ok {
 		if sok, unknown := b.spendStudio(n, 0); !sok {
-			b.store.Refund(uid, today(), n, 0, b.cfg.DailyChars)
+			b.store.Refund(uid, today(), n, 0, b.lim().DailyChars)
 			return false, Usage{Studio: true, StudioUnknown: unknown}
 		}
 	}
@@ -97,13 +97,13 @@ func (b *Bot) spendSecs(uid int64, n int) (bool, Usage) {
 	if b.isAdmin(uid) {
 		return true, Usage{}
 	}
-	ok, u, err := b.store.Spend(uid, today(), 0, n, 0, b.cfg.DailyAudioSecs)
+	ok, u, err := b.store.Spend(uid, today(), 0, n, 0, b.lim().DailyAudioSecs)
 	if err != nil {
 		b.log.Warn("save usage", "err", err)
 	}
 	if ok {
 		if sok, unknown := b.spendStudio(0, n); !sok {
-			b.store.Refund(uid, today(), 0, n, b.cfg.DailyChars)
+			b.store.Refund(uid, today(), 0, n, b.lim().DailyChars)
 			return false, Usage{Studio: true, StudioUnknown: unknown}
 		}
 	}
@@ -113,7 +113,7 @@ func (b *Bot) spendSecs(uid int64, n int) (bool, Usage) {
 // refund gives back a user's spend and the studio-wide share of it.
 func (b *Bot) refund(uid int64, chars, secs int) {
 	if !b.isAdmin(uid) {
-		b.store.Refund(uid, today(), chars, secs, b.cfg.DailyChars)
+		b.store.Refund(uid, today(), chars, secs, b.lim().DailyChars)
 		b.refundStudio(chars, secs)
 	}
 }
@@ -125,14 +125,14 @@ func (b *Bot) allowanceLines(uid int64) string {
 	}
 	u := b.store.UsageOn(uid, today())
 	out := ""
-	if b.cfg.DailyChars > 0 {
-		out += field("🎟", "Speech left today", fmtInt(max(0, b.cfg.DailyChars-u.Chars))+" of "+fmtInt(b.cfg.DailyChars)+" characters")
+	if b.lim().DailyChars > 0 {
+		out += field("🎟", "Speech left today", fmtInt(max(0, b.lim().DailyChars-u.Chars))+" of "+fmtInt(b.lim().DailyChars)+" characters")
 	}
-	if b.cfg.DailyAudioSecs > 0 {
-		out += field("🎟", "Transcription left today", fmtMinutes(max(0, b.cfg.DailyAudioSecs-u.Secs))+" of "+fmtMinutes(b.cfg.DailyAudioSecs))
+	if b.lim().DailyAudioSecs > 0 {
+		out += field("🎟", "Transcription left today", fmtMinutes(max(0, b.lim().DailyAudioSecs-u.Secs))+" of "+fmtMinutes(b.lim().DailyAudioSecs))
 	}
-	if b.cfg.DailyCreations > 0 {
-		out += field("🎟", "New voices left today", strconv.Itoa(max(0, b.cfg.DailyCreations-u.Makes))+" of "+strconv.Itoa(b.cfg.DailyCreations))
+	if b.lim().DailyCreations > 0 {
+		out += field("🎟", "New voices left today", strconv.Itoa(max(0, b.lim().DailyCreations-u.Makes))+" of "+strconv.Itoa(b.lim().DailyCreations))
 	}
 	return out
 }
@@ -141,14 +141,14 @@ func (b *Bot) allowanceLines(uid int64) string {
 func (b *Bot) limitScreen(speech bool, u Usage, need int) screen {
 	var body string
 	if speech {
-		left := max(0, b.cfg.DailyChars-u.Chars)
-		body = fmt.Sprintf("You've used <b>%s</b> of your <b>%s</b> characters today.", fmtInt(u.Chars), fmtInt(b.cfg.DailyChars))
+		left := max(0, b.lim().DailyChars-u.Chars)
+		body = fmt.Sprintf("You've used <b>%s</b> of your <b>%s</b> characters today.", fmtInt(u.Chars), fmtInt(b.lim().DailyChars))
 		if left > 0 {
 			body += fmt.Sprintf("\nThat message needs %s, and <b>%s</b> are left, so a shorter one still fits.", fmtInt(need), fmtInt(left))
 		}
 	} else {
-		left := max(0, b.cfg.DailyAudioSecs-u.Secs)
-		body = fmt.Sprintf("You've used <b>%s</b> of your <b>%s</b> of transcription today.", fmtMinutes(u.Secs), fmtMinutes(b.cfg.DailyAudioSecs))
+		left := max(0, b.lim().DailyAudioSecs-u.Secs)
+		body = fmt.Sprintf("You've used <b>%s</b> of your <b>%s</b> of transcription today.", fmtMinutes(u.Secs), fmtMinutes(b.lim().DailyAudioSecs))
 		if left > 0 {
 			body += fmt.Sprintf("\nThat recording is %s, and <b>%s</b> is left, so a shorter one still fits.", fmtMinutes(need), fmtMinutes(left))
 		}
@@ -159,7 +159,7 @@ func (b *Bot) limitScreen(speech bool, u Usage, need int) screen {
 		if u.Bonus > 0 {
 			body += "\n🎁 You have <b>" + fmtInt(u.Bonus) + "</b> bonus characters, not enough for this message."
 		}
-		body += "\n🤝 Can't wait? Invite a friend and you both get <b>+" + fmtInt(b.cfg.ReferralBonus) + "</b> bonus characters."
+		body += "\n🤝 Can't wait? Invite a friend and you both get <b>+" + fmtInt(b.lim().ReferralBonus) + "</b> bonus characters."
 		k.row(btn("🤝 Invite friends", "nav:invite"))
 	}
 	k.row(btn("👤 Profile", "nav:profile")).nav("", "")

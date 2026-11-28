@@ -568,7 +568,7 @@ func (b *Bot) transcribe(ctx context.Context, m *telegram.Message, a audioRef) {
 		})
 		return
 	}
-	b.remember(uid, func(r *recent) { r.transcript = truncate(text, b.cfg.MaxTTSChars) })
+	b.remember(uid, func(r *recent) { r.transcript = truncate(text, b.lim().MaxTTSChars) })
 
 	var meta []string
 	if tr.Duration > 0 {

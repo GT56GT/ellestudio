@@ -3,13 +3,15 @@ import { ApiError, get, signInWithTelegramApp, signOut, whenSignedOut } from "./
 import type { Me } from "./types";
 import { go, useRoute } from "./router";
 import { Tally } from "./components/Tally";
-import { IconAudit, IconGroups, IconOverview, IconSessions, IconUsers, IconVoices, Logo } from "./components/Icons";
+import { IconAudit, IconGroups, IconOverview, IconSessions, IconUsers, IconVoices, IconBroadcast, IconSettings, Logo } from "./components/Icons";
 import { Failed, Loading } from "./components/States";
 import { Overview } from "./pages/Overview";
 import { Users } from "./pages/Users";
 import { UserDetail } from "./pages/UserDetail";
 import { Groups } from "./pages/Groups";
 import { Voices } from "./pages/Voices";
+import { Settings } from "./pages/Settings";
+import { Broadcasts } from "./pages/Broadcasts";
 import { Audit } from "./pages/Audit";
 import { Sessions } from "./pages/Sessions";
 import { SignIn } from "./pages/SignIn";
@@ -21,6 +23,8 @@ const pages = [
   { path: "/users", label: "Users", title: "Users", lede: "Everyone who has used Ellie, newest activity first.", icon: IconUsers },
   { path: "/groups", label: "Groups", title: "Groups", lede: "Chats Ellie reads in, busiest today first.", icon: IconGroups },
   { path: "/voices", label: "Voices", title: "Voices", lede: "Voices and dictionaries people made through Ellie, newest first.", icon: IconVoices },
+  { path: "/broadcasts", label: "Announcements", title: "Announcements", lede: "Send a message to everyone who uses Ellie.", icon: IconBroadcast },
+  { path: "/settings", label: "Settings", title: "Settings", lede: "Change Ellie's limits live, or pause voice work in an emergency.", icon: IconSettings },
   { path: "/audit", label: "Audit log", title: "Audit log", lede: "Every sign-in and admin action, newest first.", icon: IconAudit },
   { path: "/sessions", label: "Sessions", title: "Sessions", lede: "Where you're signed in to this panel.", icon: IconSessions },
 ];
@@ -126,6 +130,10 @@ export function App() {
           <Groups route={route} />
         ) : section === "/voices" ? (
           <Voices route={route} />
+        ) : section === "/broadcasts" ? (
+          <Broadcasts />
+        ) : section === "/settings" ? (
+          <Settings />
         ) : section === "/audit" ? (
           <Audit />
         ) : section === "/sessions" ? (

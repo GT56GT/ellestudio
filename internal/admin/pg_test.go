@@ -239,3 +239,86 @@ func TestPGActionsEndToEnd(t *testing.T) {
 		}
 	}
 }
+
+func TestPGControlRoom(t *testing.T) {
+	s, db := testStore(t)
+	ctx := context.Background()
+	p := db.Pool()
+	users := []int64{9_000_000_001, 9_000_000_002, 9_000_000_003}
+	cleanup := func() {
+		_, _ = p.Exec(ctx, `DELETE FROM ellie_config WHERE key = 'limits'`)
+		_, _ = p.Exec(ctx, `DELETE FROM ellie_broadcasts`)
+		_, _ = p.Exec(ctx, `DELETE FROM ellie_user_settings WHERE user_id = ANY($1)`, users)
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	n := 1234
+	if _, err := s.SaveOverrides(ctx, bot.LimitOverrides{DailyChars: &n, Paused: true}, 1); err != nil {
+		t.Fatal(err)
+	}
+	o, err := db.LoadOverrides(ctx)
+	if err != nil || o.DailyChars == nil || *o.DailyChars != 1234 || !o.Paused {
+		t.Fatalf("overrides = %+v %v", o, err)
+	}
+
+	// Two people use the private chat; one opted out of announcements.
+	day := time.Now().UTC().Format("2006-01-02")
+	for i, uid := range users {
+		if err := s.settings.Join(uid, day); err != nil {
+			t.Fatal(err)
+		}
+		if i == 2 {
+			if _, err := s.settings.Update(uid, func(v *bot.Settings) { v.NoNews = true }); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if size, err := s.AudienceSize(ctx, bot.AudienceEveryone); err != nil || size < 2 {
+		t.Fatalf("audience = %d %v", size, err)
+	}
+	id, err := s.CreateBroadcast(ctx, "Hello everyone", bot.AudienceEveryone, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateBroadcast(ctx, "Another", bot.AudienceEveryone, 1); err != ErrBusy {
+		t.Fatalf("second broadcast: %v, want ErrBusy", err)
+	}
+
+	q := db.Broadcasts()
+	bc, ok, err := q.ClaimBroadcast(ctx)
+	if err != nil || !ok || bc.ID != id {
+		t.Fatalf("claim: %+v %v %v", bc, ok, err)
+	}
+	if _, ok, _ := q.ClaimBroadcast(ctx); ok {
+		t.Fatal("a sending broadcast was claimed twice")
+	}
+	ids, err := q.Recipients(ctx, bc, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[int64]bool{}
+	for _, u := range ids {
+		got[u] = true
+	}
+	if !got[users[0]] || !got[users[1]] || got[users[2]] {
+		t.Fatalf("recipients = %v: the opted-out user must be skipped", ids)
+	}
+	if cancelled, err := q.Progress(ctx, bc.ID, ids[len(ids)-1], len(ids), 0); err != nil || cancelled {
+		t.Fatalf("progress: %v %v", cancelled, err)
+	}
+	bc.Cursor = ids[len(ids)-1]
+	if rest, _ := q.Recipients(ctx, bc, 100); len(rest) != 0 {
+		t.Fatalf("recipients after the cursor: %v", rest)
+	}
+	if err := q.FinishBroadcast(ctx, bc.ID); err != nil {
+		t.Fatal(err)
+	}
+	list, err := s.Broadcasts(ctx, 5)
+	if err != nil || len(list) == 0 || list[0].Status != "done" || list[0].Sent != len(ids) {
+		t.Fatalf("broadcasts = %+v %v", list, err)
+	}
+	if ok, _ := s.CancelBroadcast(ctx, id); ok {
+		t.Fatal("cancelled a finished broadcast")
+	}
+}

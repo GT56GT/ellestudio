@@ -255,6 +255,9 @@ func cartesiaFault(err error) (fault, credits bool) {
 // waited a moment. It returns errServiceDown while Cartesia is paused,
 // errLineFull when the line is full, or ctx's error.
 func (b *Bot) acquire(ctx context.Context, waiting func(pos int)) error {
+	if b.lim().Paused {
+		return errAdminPause
+	}
 	if open, _ := b.breaker.isOpen(); open {
 		return errServiceDown
 	}
@@ -320,6 +323,10 @@ func lineScreen(pos int) screen {
 
 // busyScreen explains why a job couldn't start.
 func busyScreen(err error) screen {
+	if errors.Is(err, errAdminPause) {
+		return noticeScreen(icWait, "Ellie is taking a short break",
+			"Voice work is paused for a little while. Nothing was charged. Please try again later.")
+	}
 	if errors.Is(err, errServiceDown) {
 		return noticeScreen(icWarn, "Voices are taking a short break",
 			"Ellie's voice service is having trouble right now. Nothing was charged. Please try again in a few minutes.")

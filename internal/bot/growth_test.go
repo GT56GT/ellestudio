@@ -294,7 +294,8 @@ func TestLanguageTipIsASuggestionOnceADay(t *testing.T) {
 
 func TestLimitScreenOffersInvites(t *testing.T) {
 	fx := referralFixture(t, 5)
-	fx.bot.cfg.DailyChars = 3
+	three := 3
+	fx.bot.applyOverrides(LimitOverrides{DailyChars: &three})
 	fx.bot.handleUpdate(context.Background(), msg(7, "hello"))
 	text := fx.tg.lastText()
 	if !strings.Contains(text, "Daily limit reached") || !strings.Contains(text, "Invite a friend") {

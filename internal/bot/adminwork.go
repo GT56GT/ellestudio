@@ -209,7 +209,7 @@ func (b *Bot) banLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			b.refreshBans()
+			b.refreshLive(ctx)
 		}
 	}
 }

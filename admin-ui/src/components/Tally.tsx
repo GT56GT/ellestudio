@@ -23,6 +23,14 @@ export function Tally() {
       </span>
     );
   }
+  if (bot.admin_paused) {
+    return (
+      <span className="tally" data-state="paused">
+        <span className="lamp" />
+        Voices paused <span className="muted">by an admin</span>
+      </span>
+    );
+  }
   if (bot.paused_until) {
     return (
       <span className="tally" data-state="paused">

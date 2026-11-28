@@ -152,6 +152,7 @@ type Store interface {
 	Groups(ctx context.Context, offset, limit int, today string) ([]GroupRow, int, error)
 
 	Actions
+	Live
 }
 
 // botOnlineWithin is how recent a heartbeat must be to call the bot online.

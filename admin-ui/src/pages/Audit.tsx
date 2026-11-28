@@ -40,6 +40,16 @@ function describe(e: AuditEntry) {
       return `Admin ${e.admin_id} unblocked ${(e.detail.title as string) || target(e)}`;
     case "group_settings":
       return `Admin ${e.admin_id} changed the settings of ${(e.detail.title as string) || target(e)}`;
+    case "limits_changed":
+      return `Admin ${e.admin_id} changed Ellie's limits`;
+    case "voice_paused":
+      return `Admin ${e.admin_id} paused voice work`;
+    case "voice_resumed":
+      return `Admin ${e.admin_id} resumed voice work`;
+    case "broadcast_queued":
+      return `Admin ${e.admin_id} sent an announcement to ${e.detail.recipients ?? "everyone"} people`;
+    case "broadcast_cancelled":
+      return `Admin ${e.admin_id} cancelled an announcement`;
     case "delete_requested":
       return `Admin ${e.admin_id} deleted ${e.target.startsWith("dict:") ? "dictionary" : "voice"} ${(e.detail.name as string) || e.target.split(":")[1]}`;
     default:

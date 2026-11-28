@@ -356,7 +356,7 @@ func (b *Bot) groupHelpScreen(gs GroupSettings) screen {
 	}
 	text += "\n🎛 Everyone has their own voice, style and daily allowance. Tap <b>My voice &amp; style</b>, or send " +
 		"<code>/voices</code> or <code>/style</code> from the command menu, to change yours. Only you will see it."
-	if c := effCap(b.cfg.GroupLimits.Chars, gs.DailyChars); c > 0 {
+	if c := effCap(b.lim().GroupLimits.Chars, gs.DailyChars); c > 0 {
 		text += "\n🎟 This group shares <b>" + fmtInt(c) + "</b> spoken characters a day."
 	}
 	return screen{text, b.groupKeys("home", "", "")}
@@ -405,7 +405,7 @@ func (b *Bot) groupTurn(ctx context.Context, m *telegram.Message) (done func(), 
 	}
 
 	b.groupMu.Lock()
-	if cd := b.cfg.GroupCooldown; !exempt && cd > 0 {
+	if cd := b.lim().GroupCooldown; !exempt && cd > 0 {
 		if since := now.Sub(b.lastUse[key]); since < cd {
 			notify := now.Sub(b.lastNotice[key]) >= cd // one reminder per cooldown, not one per message
 			if notify {
@@ -422,7 +422,7 @@ func (b *Bot) groupTurn(ctx context.Context, m *telegram.Message) (done func(), 
 	}
 	if n := b.cfg.GroupConcurrency; n > 0 && b.groupJobs[chat] >= n {
 		b.groupMu.Unlock()
-		if b.noticeDue(chat, uid, "busy", b.cfg.GroupCooldown) {
+		if b.noticeDue(chat, uid, "busy", b.lim().GroupCooldown) {
 			s := noticeScreen(icWait, "I'm a bit busy here", "I'm already working on a few requests in this group. Try again in a moment.")
 			b.groupNotice(ctx, m, s, nil)
 		}
@@ -432,7 +432,7 @@ func (b *Bot) groupTurn(ctx context.Context, m *telegram.Message) (done func(), 
 	b.lastUse[key] = now
 	if len(b.lastUse) > 20000 { // forget cooldowns that have long passed
 		for k, t := range b.lastUse {
-			if now.Sub(t) > b.cfg.GroupCooldown {
+			if now.Sub(t) > b.lim().GroupCooldown {
 				delete(b.lastUse, k)
 				delete(b.lastNotice, k)
 			}
@@ -649,7 +649,7 @@ func (b *Bot) groupsScreen(ctx context.Context) screen {
 	tc, ts := total.usageOn(day)
 	var sb strings.Builder
 	sb.WriteString(header("👥", "Groups today", "mode: "+orDefault(b.cfg.GroupMode, GroupsOpen)))
-	l := b.cfg.GroupLimits
+	l := b.lim().GroupLimits
 	fmt.Fprintf(&sb, "All groups: <b>%s</b> chars · <b>%s</b> transcribed\n", fmtInt(tc), fmtMinutes(ts))
 	fmt.Fprintf(&sb, "<i>Caps: %s chars and %s per group, %s chars and %s in total (0 = none)</i>\n\n",
 		fmtInt(l.Chars), fmtMinutes(l.Secs), fmtInt(l.AllChars), fmtMinutes(l.AllSecs))

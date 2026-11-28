@@ -94,6 +94,57 @@ type memStore struct {
 	groups map[int64]bot.ChatInfo
 	voices map[string]VoiceRow // by kind:id
 	jobs   []JobRow
+
+	overrides  bot.LimitOverrides
+	broadcasts []BroadcastRow
+}
+
+func (m *memStore) Overrides(context.Context) (bot.LimitOverrides, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.overrides, nil
+}
+
+func (m *memStore) SaveOverrides(_ context.Context, o bot.LimitOverrides, _ int64) (bot.LimitOverrides, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	before := m.overrides
+	m.overrides = o
+	return before, nil
+}
+
+func (m *memStore) Broadcasts(context.Context, int) ([]BroadcastRow, error) { return m.broadcasts, nil }
+
+func (m *memStore) AudienceSize(_ context.Context, audience string) (int, error) {
+	if audience == bot.AudienceEveryone {
+		return 120, nil
+	}
+	return 45, nil
+}
+
+func (m *memStore) CreateBroadcast(_ context.Context, text, audience string, by int64) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, b := range m.broadcasts {
+		if b.Status == "queued" || b.Status == "sending" {
+			return 0, ErrBusy
+		}
+	}
+	id := int64(len(m.broadcasts) + 1)
+	m.broadcasts = append(m.broadcasts, BroadcastRow{ID: id, Text: text, Audience: audience, CreatedBy: by, Status: "queued"})
+	return id, nil
+}
+
+func (m *memStore) CancelBroadcast(_ context.Context, id int64) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, b := range m.broadcasts {
+		if b.ID == id && (b.Status == "queued" || b.Status == "sending") {
+			m.broadcasts[i].Status = "cancelled"
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func newMemStore() *memStore {

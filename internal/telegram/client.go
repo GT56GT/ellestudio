@@ -643,6 +643,11 @@ func (c *Client) EditMessageText(ctx context.Context, p SendMessageParams) error
 	return c.call(ctx, "editMessageText", p.payload(), nil)
 }
 
+// EditMessageReplyMarkup replaces a message's buttons.
+func (c *Client) EditMessageReplyMarkup(ctx context.Context, chatID, messageID int64, kb *InlineKeyboardMarkup) error {
+	return c.call(ctx, "editMessageReplyMarkup", map[string]any{"chat_id": chatID, "message_id": messageID, "reply_markup": kb}, nil)
+}
+
 // AnswerCallbackQuery acknowledges a button press, optionally with a toast.
 func (c *Client) AnswerCallbackQuery(ctx context.Context, id, text string) error {
 	return c.call(ctx, "answerCallbackQuery", map[string]any{"callback_query_id": id, "text": text}, nil)
