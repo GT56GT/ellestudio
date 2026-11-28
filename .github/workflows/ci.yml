@@ -50,7 +50,9 @@ jobs:
         run: go vet ./...
 
       - name: Tests (race detector, with Postgres)
-        run: go test -race -count=1 ./...
+        # -p 1: the Postgres tests of internal/store and internal/admin share
+        # the same tables, so packages run one at a time.
+        run: go test -race -count=1 -p 1 ./...
 
   admin-ui:
     runs-on: ubuntu-latest
