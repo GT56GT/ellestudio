@@ -158,10 +158,11 @@ func (b *Bot) setNews(ctx context.Context, q *telegram.CallbackQuery, on bool) {
 // ---------------------------------------------------------------- Postgres
 
 // recipientsWhere picks who gets a broadcast: people who use the private
-// chat, haven't opted out and aren't banned ($1 = audience).
+// chat, haven't opted out and aren't banned ($1 = audience). Every test is
+// NULL-safe: a NOT over a NULL would silently drop the row.
 const recipientsWhere = `(settings->>'joined')::boolean
 	AND NOT COALESCE((settings->>'no_news')::boolean, false)
-	AND NOT (jsonb_typeof(settings->'ban') = 'object'
+	AND NOT (COALESCE(jsonb_typeof(settings->'ban'), '') = 'object'
 	         AND (settings->'ban'->'until' IS NULL OR (settings->'ban'->>'until')::timestamptz > now()))
 	AND ($1 = 'everyone' OR user_id IN (
 	     SELECT user_id FROM ellie_events WHERE at > now() - interval '30 days'))`
