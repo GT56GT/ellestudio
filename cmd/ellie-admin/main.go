@@ -77,7 +77,7 @@ func run(log *slog.Logger) error {
 	if dir := os.Getenv("ADMIN_UI_DIR"); dir != "" {
 		ui = os.DirFS(dir)
 	}
-	settings, err := db.SettingsStore(ctx, bot.Settings{})
+	settings, err := bot.NewSettingsStore(ctx, db, bot.Settings{})
 	if err != nil {
 		return err
 	}

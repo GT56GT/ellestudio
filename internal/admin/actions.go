@@ -132,7 +132,7 @@ func (p *PGStore) Group(ctx context.Context, id int64) (bot.ChatInfo, error) {
 	if id == 0 {
 		return bot.ChatInfo{}, ErrNotFound // row 0 is the all-groups total
 	}
-	c, ok, err := p.db.Chats().Get(ctx, id)
+	c, ok, err := bot.NewChats(p.db).Get(ctx, id)
 	if err != nil {
 		return bot.ChatInfo{}, err
 	}
@@ -143,15 +143,15 @@ func (p *PGStore) Group(ctx context.Context, id int64) (bot.ChatInfo, error) {
 }
 
 func (p *PGStore) SetGroupBlocked(ctx context.Context, id int64, blocked bool) error {
-	return p.db.Chats().SetBlocked(ctx, id, blocked)
+	return bot.NewChats(p.db).SetBlocked(ctx, id, blocked)
 }
 
 func (p *PGStore) MarkGroupLeft(ctx context.Context, id int64) error {
-	return p.db.Chats().Upsert(ctx, bot.ChatInfo{ID: id, Status: "left"})
+	return bot.NewChats(p.db).Upsert(ctx, bot.ChatInfo{ID: id, Status: "left"})
 }
 
 func (p *PGStore) SetGroupSettings(ctx context.Context, id int64, gs bot.GroupSettings) error {
-	return p.db.Chats().SetSettings(ctx, id, gs)
+	return bot.NewChats(p.db).SetSettings(ctx, id, gs)
 }
 
 // ---------------------------------------------------------------- voices

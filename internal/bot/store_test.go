@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"ellestudio/internal/store/storetest"
 )
 
 // exerciseStore runs the same changes against any backend and reopens it to
@@ -68,57 +70,22 @@ func TestFileStorePersists(t *testing.T) {
 	}
 }
 
-// testDB opens TEST_DATABASE_URL or skips. The Postgres tests use negative
-// user IDs and "test-" resource IDs (never real data) and remove them.
-func testDB(t *testing.T) *DB {
-	t.Helper()
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
-		t.Skip("set TEST_DATABASE_URL to test the Postgres backend")
-	}
-	db, err := OpenDatabase(context.Background(), url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(db.Close)
-	return db
-}
-
 func TestPostgresStorePersists(t *testing.T) {
-	db := testDB(t)
+	db := storetest.TestDB(t)
 	const a, b = -9001, -9002
 	ctx := context.Background()
 	cleanup := func() {
-		_, _ = db.pool.Exec(ctx, `DELETE FROM ellie_user_settings WHERE user_id IN ($1, $2)`, a, b)
+		_, _ = db.Pool().Exec(ctx, `DELETE FROM ellie_user_settings WHERE user_id IN ($1, $2)`, a, b)
 	}
 	cleanup()
 	t.Cleanup(cleanup)
 	exerciseStore(t, func() *Store {
-		s, err := db.SettingsStore(ctx, Settings{Model: "sonic-3.6"})
+		s, err := NewSettingsStore(ctx, db, Settings{Model: "sonic-3.6"})
 		if err != nil {
 			t.Fatal(err)
 		}
 		return s
 	}, a, b)
-}
-
-func TestMigrationsAreIdempotent(t *testing.T) {
-	db := testDB(t)
-	ctx := context.Background()
-	// Two instances starting at once (as during a deploy) must both succeed.
-	errs := make(chan error, 2)
-	for range 2 {
-		go func() { errs <- migrate(ctx, db.pool) }()
-	}
-	for range 2 {
-		if err := <-errs; err != nil {
-			t.Fatal(err)
-		}
-	}
-	var v int
-	if err := db.pool.QueryRow(ctx, `SELECT max(version) FROM ellie_schema_migrations`).Scan(&v); err != nil || v != len(migrations) {
-		t.Fatalf("schema version = %d (%v), want %d", v, err, len(migrations))
-	}
 }
 
 // exerciseOwners checks the registry contract on any backend.
@@ -206,14 +173,14 @@ func TestFileOwners(t *testing.T) {
 }
 
 func TestPostgresOwners(t *testing.T) {
-	db := testDB(t)
+	db := storetest.TestDB(t)
 	ctx := context.Background()
 	prefix := fmt.Sprintf("test-%d-", time.Now().UnixNano())
 	cleanup := func() {
-		_, _ = db.pool.Exec(ctx, `DELETE FROM ellie_ownership WHERE resource_id LIKE $1`, prefix+"%")
+		_, _ = db.Pool().Exec(ctx, `DELETE FROM ellie_ownership WHERE resource_id LIKE $1`, prefix+"%")
 	}
 	t.Cleanup(cleanup)
-	o := db.Owners()
+	o := NewOwners(db)
 	// Postgres stamps created_at itself; space the claims so order is defined.
 	slow := slowClaims{o}
 	exerciseOwners(t, slow, -9001, -9002, func(s string) string { return prefix + s })
@@ -350,19 +317,19 @@ func testChats(t *testing.T, db *DB, n int) (pgChats, []int64) {
 		ids[i] = base - int64(i)
 	}
 	t.Cleanup(func() {
-		_, _ = db.pool.Exec(context.Background(), `DELETE FROM ellie_chats WHERE chat_id = ANY($1)`, ids)
+		_, _ = db.Pool().Exec(context.Background(), `DELETE FROM ellie_chats WHERE chat_id = ANY($1)`, ids)
 	})
-	return pgChats{db.pool, ids[0]}, ids[1:]
+	return pgChats{db.Pool(), ids[0]}, ids[1:]
 }
 
 func TestPostgresChats(t *testing.T) {
-	db := testDB(t)
+	db := storetest.TestDB(t)
 	c, ids := testChats(t, db, 3)
 	exerciseChats(t, c, ids[0], ids[1], ids[2], "1999-01-01", "1999-01-02")
 }
 
 func TestPostgresChatSpendsAreAtomic(t *testing.T) {
-	db := testDB(t)
+	db := storetest.TestDB(t)
 	c, ids := testChats(t, db, 1)
 	ctx := context.Background()
 	// 20 instances race for a cap of 10: exactly 10 may win.

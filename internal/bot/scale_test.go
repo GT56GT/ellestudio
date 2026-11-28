@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"ellestudio/internal/store/storetest"
 )
 
 // exerciseBudget checks the studio-wide counter contract on any backend.
@@ -56,13 +58,13 @@ func exerciseBudget(t *testing.T, bu Budget, day string) {
 func TestMemBudget(t *testing.T) { exerciseBudget(t, newMemBudget(), "2026-11-27") }
 
 func TestPostgresBudget(t *testing.T) {
-	db := testDB(t)
+	db := storetest.TestDB(t)
 	const day = "2001-01-01" // never a real day, so tests can't touch live rows
 	ctx := context.Background()
-	cleanup := func() { _, _ = db.pool.Exec(ctx, `DELETE FROM ellie_studio_usage WHERE day = $1`, day) }
+	cleanup := func() { _, _ = db.Pool().Exec(ctx, `DELETE FROM ellie_studio_usage WHERE day = $1`, day) }
 	cleanup()
 	t.Cleanup(cleanup)
-	exerciseBudget(t, db.Budget(), day)
+	exerciseBudget(t, NewBudget(db), day)
 }
 
 func TestStudioCapStopsEveryoneAndRefunds(t *testing.T) {
@@ -129,16 +131,16 @@ func TestFileStoreConcurrentSpends(t *testing.T) {
 // Two instances share the database during a deploy; neither may overwrite
 // the other's changes.
 func TestPostgresStoreSharedByTwoInstances(t *testing.T) {
-	db := testDB(t)
+	db := storetest.TestDB(t)
 	ctx := context.Background()
 	const uid, inviter, inviteeA = -9101, -9102, -9103
 	cleanup := func() {
-		_, _ = db.pool.Exec(ctx, `DELETE FROM ellie_user_settings WHERE user_id = ANY($1)`, []int64{uid, inviter, inviteeA})
+		_, _ = db.Pool().Exec(ctx, `DELETE FROM ellie_user_settings WHERE user_id = ANY($1)`, []int64{uid, inviter, inviteeA})
 	}
 	cleanup()
 	t.Cleanup(cleanup)
 	open := func() *Store {
-		s, err := db.SettingsStore(ctx, Settings{})
+		s, err := NewSettingsStore(ctx, db, Settings{})
 		if err != nil {
 			t.Fatal(err)
 		}

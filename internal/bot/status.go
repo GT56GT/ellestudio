@@ -113,9 +113,14 @@ func (b *Bot) heartbeat(ctx context.Context) {
 
 // ---------------------------------------------------------------- Postgres
 
+type dbReporter struct{ d *DB }
+
+// NewStatusReporter returns the StatusReporter backed by d.
+func NewStatusReporter(d *DB) StatusReporter { return dbReporter{d} }
+
 // ReportStatus upserts this instance's heartbeat and forgets instances
 // silent for a day (old deploys).
-func (d *DB) ReportStatus(ctx context.Context, s Status) error {
+func (r dbReporter) ReportStatus(ctx context.Context, s Status) error {
 	raw, err := json.Marshal(s)
 	if err != nil {
 		return err
@@ -124,7 +129,7 @@ func (d *DB) ReportStatus(ctx context.Context, s Status) error {
 	batch.Queue(`INSERT INTO ellie_status (instance, started_at, at, info) VALUES ($1, $2, $3, $4)
 		ON CONFLICT (instance) DO UPDATE SET at = EXCLUDED.at, info = EXCLUDED.info`, s.Instance, s.StartedAt, s.At, raw)
 	batch.Queue(`DELETE FROM ellie_status WHERE at < now() - interval '1 day'`)
-	if err := d.pool.SendBatch(ctx, batch).Close(); err != nil {
+	if err := r.d.Pool().SendBatch(ctx, batch).Close(); err != nil {
 		return fmt.Errorf("database: report status: %w", err)
 	}
 	return nil
@@ -146,7 +151,3 @@ func LatestStatus(ctx context.Context, pool *pgxpool.Pool) (Status, bool, error)
 	}
 	return s, true, nil
 }
-
-// Pool exposes the connection pool to the admin panel, which runs its own
-// read queries against the same database.
-func (d *DB) Pool() *pgxpool.Pool { return d.pool }

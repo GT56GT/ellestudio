@@ -79,8 +79,8 @@ func (m *memBudget) Used(_ context.Context, day string) (int, int, error) {
 
 // ---------------------------------------------------------------- Postgres
 
-// Budget returns the studio-wide counter, shared by every instance.
-func (d *DB) Budget() Budget { return pgBudget{d.pool} }
+// NewBudget returns the studio-wide counter, shared by every instance.
+func NewBudget(d *DB) Budget { return pgBudget{d.Pool()} }
 
 type pgBudget struct{ pool *pgxpool.Pool }
 

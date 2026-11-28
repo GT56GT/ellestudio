@@ -277,7 +277,7 @@ func (b *Bot) turnAway(ctx context.Context, u telegram.Update, uid int64, ban Ba
 // ---------------------------------------------------------------- Postgres
 
 // AdminQueue returns the database's job queue and name registry.
-func (d *DB) AdminQueue() AdminQueue { return pgAdminQueue{d.pool} }
+func NewAdminQueue(d *DB) AdminQueue { return pgAdminQueue{d.Pool()} }
 
 type pgAdminQueue struct{ pool *pgxpool.Pool }
 

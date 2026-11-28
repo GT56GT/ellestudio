@@ -91,16 +91,16 @@ func run(log *slog.Logger) error {
 			return err
 		}
 		defer db.Close()
-		if store, err = db.SettingsStore(ctx, defaults); err != nil {
+		if store, err = bot.NewSettingsStore(ctx, db, defaults); err != nil {
 			return err
 		}
-		owners = db.Owners()
-		chats = db.Chats()
-		metrics = db.Metrics()
-		budget = db.Budget()
-		reporter = db
-		queue = db.AdminQueue()
-		config, bcasts = db, db.Broadcasts()
+		owners = bot.NewOwners(db)
+		chats = bot.NewChats(db)
+		metrics = bot.NewMetrics(db)
+		budget = bot.NewBudget(db)
+		reporter = bot.NewStatusReporter(db)
+		queue = bot.NewAdminQueue(db)
+		config, bcasts = bot.NewConfigSource(db), bot.NewBroadcasts(db)
 		log.Info("settings stored in Postgres")
 	} else {
 		dir := envOr("DATA_DIR", "data")

@@ -178,7 +178,7 @@ func CountRecipients(ctx context.Context, pool *pgxpool.Pool, audience string) (
 }
 
 // Broadcasts returns the database's broadcast queue.
-func (d *DB) Broadcasts() BroadcastQueue { return pgBroadcasts{d.pool} }
+func NewBroadcasts(d *DB) BroadcastQueue { return pgBroadcasts{d.Pool()} }
 
 type pgBroadcasts struct{ pool *pgxpool.Pool }
 

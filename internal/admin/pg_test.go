@@ -22,7 +22,7 @@ func testStore(t *testing.T) (*PGStore, *bot.DB) {
 		t.Fatal(err)
 	}
 	t.Cleanup(db.Close)
-	settings, err := db.SettingsStore(context.Background(), bot.Settings{})
+	settings, err := bot.NewSettingsStore(context.Background(), db, bot.Settings{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +92,7 @@ func TestPGReadViews(t *testing.T) {
 	cleanup()
 	t.Cleanup(cleanup)
 
-	store, err := db.SettingsStore(ctx, bot.Settings{})
+	store, err := bot.NewSettingsStore(ctx, db, bot.Settings{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,7 @@ func TestPGReadViews(t *testing.T) {
 	if _, _, err := store.Spend(uid, today, 120, 0, 0, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Chats().Upsert(ctx, bot.ChatInfo{ID: gid, Type: "supergroup", Title: "Test group", Status: "member"}); err != nil {
+	if err := bot.NewChats(db).Upsert(ctx, bot.ChatInfo{ID: gid, Type: "supergroup", Title: "Test group", Status: "member"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -188,7 +188,7 @@ func TestPGActionsEndToEnd(t *testing.T) {
 		t.Fatalf("the bot doesn't see the ban: %v %v", bans[uid], err)
 	}
 
-	if err := db.Chats().Upsert(ctx, bot.ChatInfo{ID: gid, Title: "Test group", Status: "member"}); err != nil {
+	if err := bot.NewChats(db).Upsert(ctx, bot.ChatInfo{ID: gid, Title: "Test group", Status: "member"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.SetGroupBlocked(ctx, gid, true); err != nil {
@@ -202,10 +202,10 @@ func TestPGActionsEndToEnd(t *testing.T) {
 	}
 
 	// The panel queues a delete; the bot claims, does and finishes it.
-	if err := db.Owners().Claim(ctx, "voice", voice, uid); err != nil {
+	if err := bot.NewOwners(db).Claim(ctx, "voice", voice, uid); err != nil {
 		t.Fatal(err)
 	}
-	q := db.AdminQueue()
+	q := bot.NewAdminQueue(db)
 	if err := q.SetNames(ctx, "voice", map[string]string{voice: "Test Voice"}); err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +220,7 @@ func TestPGActionsEndToEnd(t *testing.T) {
 	if err != nil || !ok || claimed.ID != job || claimed.Kind != bot.JobDeleteVoice {
 		t.Fatalf("claim: %+v %v %v", claimed, ok, err)
 	}
-	if err := db.Owners().Release(ctx, "voice", voice); err != nil {
+	if err := bot.NewOwners(db).Release(ctx, "voice", voice); err != nil {
 		t.Fatal(err)
 	}
 	if err := q.Finish(ctx, job, nil); err != nil {
@@ -257,7 +257,7 @@ func TestPGControlRoom(t *testing.T) {
 	if _, err := s.SaveOverrides(ctx, bot.LimitOverrides{DailyChars: &n, Paused: true}, 1); err != nil {
 		t.Fatal(err)
 	}
-	o, err := db.LoadOverrides(ctx)
+	o, err := bot.NewConfigSource(db).LoadOverrides(ctx)
 	if err != nil || o.DailyChars == nil || *o.DailyChars != 1234 || !o.Paused {
 		t.Fatalf("overrides = %+v %v", o, err)
 	}
@@ -285,7 +285,7 @@ func TestPGControlRoom(t *testing.T) {
 		t.Fatalf("second broadcast: %v, want ErrBusy", err)
 	}
 
-	q := db.Broadcasts()
+	q := bot.NewBroadcasts(db)
 	bc, ok, err := q.ClaimBroadcast(ctx)
 	if err != nil || !ok || bc.ID != id {
 		t.Fatalf("claim: %+v %v %v", bc, ok, err)

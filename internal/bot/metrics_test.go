@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"ellestudio/internal/store/storetest"
 )
 
 // exerciseMetrics runs the same checks against any Metrics. Events are
@@ -66,16 +68,16 @@ func TestMemMetrics(t *testing.T) {
 }
 
 func TestPostgresMetrics(t *testing.T) {
-	db := testDB(t)
+	db := storetest.TestDB(t)
 	ctx := context.Background()
 	// Test events live in January 2001 with negative user IDs: no real
 	// event can be there, and they are all removed afterwards.
 	cleanup := func() {
-		_, _ = db.pool.Exec(ctx, `DELETE FROM ellie_events WHERE at < '2001-02-01' AND user_id < 0`)
+		_, _ = db.Pool().Exec(ctx, `DELETE FROM ellie_events WHERE at < '2001-02-01' AND user_id < 0`)
 	}
 	cleanup()
 	t.Cleanup(cleanup)
-	exerciseMetrics(t, db.Metrics(), time.Date(2001, 1, 2, 10, 0, 0, 0, time.UTC))
+	exerciseMetrics(t, NewMetrics(db), time.Date(2001, 1, 2, 10, 0, 0, 0, time.UTC))
 }
 
 func TestMemMetricsKeepsTheNewest(t *testing.T) {
