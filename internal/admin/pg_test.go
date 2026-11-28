@@ -22,7 +22,7 @@ func testStore(t *testing.T) (*PGStore, *bot.DB) {
 		t.Fatal(err)
 	}
 	t.Cleanup(db.Close)
-	settings, err := bot.NewSettingsStore(context.Background(), db, bot.Settings{})
+	settings, err := db.SettingsStore(context.Background(), bot.Settings{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +92,7 @@ func TestPGReadViews(t *testing.T) {
 	cleanup()
 	t.Cleanup(cleanup)
 
-	store, err := bot.NewSettingsStore(ctx, db, bot.Settings{})
+	store, err := db.SettingsStore(ctx, bot.Settings{})
 	if err != nil {
 		t.Fatal(err)
 	}

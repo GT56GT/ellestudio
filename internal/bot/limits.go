@@ -171,9 +171,10 @@ var errAdminPause = errors.New("bot: voice work is paused by an admin")
 // configKey is the ellie_config row holding the overrides.
 const configKey = "limits"
 
-// dbConfig reads the overrides (none if never saved).
+// dbConfig is the ConfigSource backed by the database.
 type dbConfig struct{ d *DB }
 
+// LoadOverrides reads the overrides (none if never saved).
 func (c dbConfig) LoadOverrides(ctx context.Context) (LimitOverrides, error) {
 	return LoadOverrides(ctx, c.d.Pool())
 }

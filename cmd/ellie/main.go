@@ -91,7 +91,7 @@ func run(log *slog.Logger) error {
 			return err
 		}
 		defer db.Close()
-		if store, err = bot.NewSettingsStore(ctx, db, defaults); err != nil {
+		if store, err = db.SettingsStore(ctx, defaults); err != nil {
 			return err
 		}
 		owners = bot.NewOwners(db)

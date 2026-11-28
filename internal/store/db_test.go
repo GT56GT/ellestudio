@@ -34,3 +34,20 @@ func TestMigrationsAreIdempotent(t *testing.T) {
 		t.Fatalf("schema version = %d (%v), want %d", v, err, len(migrations))
 	}
 }
+
+// testDB opens the test database, or skips without TEST_DATABASE_URL. It is
+// storetest.TestDB for in-package tests (which would otherwise be an import
+// cycle).
+func testDB(t *testing.T) *DB {
+	t.Helper()
+	url := os.Getenv("TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("set TEST_DATABASE_URL to test the Postgres backend")
+	}
+	db, err := OpenDatabase(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(db.Close)
+	return db
+}
