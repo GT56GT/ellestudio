@@ -1,4 +1,4 @@
-package bot
+package store
 
 // owners.go records who created each voice and dictionary.
 //
@@ -19,16 +19,19 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Kinds of resource a user can own.
 const (
-	kindVoice = "voice"
-	kindDict  = "dict"
+	KindVoice = "voice"
+	KindDict  = "dict"
 )
 
-// errAlreadyOwned means a claim was made on a resource someone else owns.
-var errAlreadyOwned = errors.New("ownership: resource belongs to another user")
+// ErrAlreadyOwned means a claim was made on a resource someone else owns.
+var ErrAlreadyOwned = errors.New("ownership: resource belongs to another user")
 
 // Owned is one resource in an owner's list.
 type Owned struct {
@@ -45,8 +48,8 @@ type Cursor struct {
 
 func (c Cursor) IsZero() bool { return c.ID == "" }
 
-// cursorOf is the position just after o.
-func cursorOf(o Owned) Cursor { return Cursor{o.Created, o.ID} }
+// CursorOf is the position just after o.
+func CursorOf(o Owned) Cursor { return Cursor{o.Created, o.ID} }
 
 // String encodes the cursor for a browse session.
 func (c Cursor) String() string {
@@ -56,8 +59,8 @@ func (c Cursor) String() string {
 	return strconv.FormatInt(c.Created.UnixMicro(), 10) + "|" + c.ID
 }
 
-// parseCursor reverses Cursor.String. Anything malformed is the start.
-func parseCursor(s string) Cursor {
+// ParseCursor reverses Cursor.String. Anything malformed is the start.
+func ParseCursor(s string) Cursor {
 	us, id, ok := strings.Cut(s, "|")
 	n, err := strconv.ParseInt(us, 10, 64)
 	if !ok || err != nil || id == "" {
@@ -84,7 +87,7 @@ type Owners interface {
 	List(ctx context.Context, kind string, owner int64, after Cursor, limit int) ([]Owned, error)
 	// Claim records owner as the creator of id. Claiming again for the same
 	// owner is a no-op; claiming someone else's resource fails with
-	// errAlreadyOwned.
+	// ErrAlreadyOwned.
 	Claim(ctx context.Context, kind, id string, owner int64) error
 	// Adopt records owner only if id has no owner yet, and reports whether it
 	// did. It is used to import ownership from older versions of the bot.
@@ -156,12 +159,12 @@ func (f *fileOwners) List(_ context.Context, kind string, owner int64, after Cur
 	for _, r := range f.rows {
 		if r.Kind == kind && r.Owner == owner {
 			o := Owned{r.ID, r.Created}
-			if after.IsZero() || before(after, cursorOf(o)) {
+			if after.IsZero() || before(after, CursorOf(o)) {
 				all = append(all, o)
 			}
 		}
 	}
-	sort.Slice(all, func(i, j int) bool { return before(cursorOf(all[i]), cursorOf(all[j])) })
+	sort.Slice(all, func(i, j int) bool { return before(CursorOf(all[i]), CursorOf(all[j])) })
 	if len(all) > limit {
 		all = all[:limit]
 	}
@@ -174,7 +177,7 @@ func (f *fileOwners) Claim(_ context.Context, kind, id string, owner int64) erro
 	k := ownerKey{kind, id}
 	if r, ok := f.rows[k]; ok {
 		if r.Owner != owner {
-			return errAlreadyOwned
+			return ErrAlreadyOwned
 		}
 		return nil
 	}
@@ -236,4 +239,99 @@ func (f *fileOwners) saveLocked() error {
 		return err
 	}
 	return writeFileAtomic(f.path, raw)
+}
+
+// ---------------------------------------------------------------- Postgres
+
+// Owners returns the ownership registry. It reads the database on every call
+// (no cache), so instances running side by side during a deploy always agree.
+func (d *DB) Owners() Owners { return pgOwners{d.Pool()} }
+
+type pgOwners struct{ pool *pgxpool.Pool }
+
+func (p pgOwners) Lookup(ctx context.Context, kind string, ids []string) (map[string]int64, error) {
+	out := map[string]int64{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, PgTimeout)
+	defer cancel()
+	rows, err := p.pool.Query(ctx,
+		`SELECT resource_id, owner_id FROM ellie_ownership WHERE kind = $1 AND resource_id = ANY($2)`, kind, ids)
+	if err != nil {
+		return nil, fmt.Errorf("database: lookup owners: %w", err)
+	}
+	var id string
+	var owner int64
+	if _, err := pgx.ForEachRow(rows, []any{&id, &owner}, func() error { out[id] = owner; return nil }); err != nil {
+		return nil, fmt.Errorf("database: lookup owners: %w", err)
+	}
+	return out, nil
+}
+
+func (p pgOwners) List(ctx context.Context, kind string, owner int64, after Cursor, limit int) ([]Owned, error) {
+	ctx, cancel := context.WithTimeout(ctx, PgTimeout)
+	defer cancel()
+	var rows pgx.Rows
+	var err error
+	if after.IsZero() {
+		rows, err = p.pool.Query(ctx, `SELECT resource_id, created_at FROM ellie_ownership
+			WHERE owner_id = $1 AND kind = $2
+			ORDER BY created_at DESC, resource_id DESC LIMIT $3`, owner, kind, limit)
+	} else {
+		rows, err = p.pool.Query(ctx, `SELECT resource_id, created_at FROM ellie_ownership
+			WHERE owner_id = $1 AND kind = $2 AND (created_at, resource_id) < ($3, $4)
+			ORDER BY created_at DESC, resource_id DESC LIMIT $5`, owner, kind, after.Created, after.ID, limit)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("database: list owned: %w", err)
+	}
+	var out []Owned
+	var o Owned
+	if _, err := pgx.ForEachRow(rows, []any{&o.ID, &o.Created}, func() error {
+		o.Created = o.Created.UTC()
+		out = append(out, o)
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("database: list owned: %w", err)
+	}
+	return out, nil
+}
+
+func (p pgOwners) Claim(ctx context.Context, kind, id string, owner int64) error {
+	ctx, cancel := context.WithTimeout(ctx, PgTimeout)
+	defer cancel()
+	// The no-op update makes RETURNING report the existing owner on conflict,
+	// so one statement both claims and detects someone else's claim.
+	var got int64
+	err := p.pool.QueryRow(ctx, `INSERT INTO ellie_ownership (kind, resource_id, owner_id) VALUES ($1, $2, $3)
+		ON CONFLICT (kind, resource_id) DO UPDATE SET owner_id = ellie_ownership.owner_id
+		RETURNING owner_id`, kind, id, owner).Scan(&got)
+	if err != nil {
+		return fmt.Errorf("database: claim: %w", err)
+	}
+	if got != owner {
+		return ErrAlreadyOwned
+	}
+	return nil
+}
+
+func (p pgOwners) Adopt(ctx context.Context, kind, id string, owner int64) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, PgTimeout)
+	defer cancel()
+	tag, err := p.pool.Exec(ctx, `INSERT INTO ellie_ownership (kind, resource_id, owner_id) VALUES ($1, $2, $3)
+		ON CONFLICT (kind, resource_id) DO NOTHING`, kind, id, owner)
+	if err != nil {
+		return false, fmt.Errorf("database: adopt: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+func (p pgOwners) Release(ctx context.Context, kind, id string) error {
+	ctx, cancel := context.WithTimeout(ctx, PgTimeout)
+	defer cancel()
+	if _, err := p.pool.Exec(ctx, `DELETE FROM ellie_ownership WHERE kind = $1 AND resource_id = $2`, kind, id); err != nil {
+		return fmt.Errorf("database: release: %w", err)
+	}
+	return nil
 }

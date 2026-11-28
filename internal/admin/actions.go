@@ -12,7 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"ellestudio/internal/bot"
+	"ellestudio/internal/store"
 )
 
 // ErrNotFound means the user, group or resource doesn't exist.
@@ -68,12 +68,12 @@ type Actions interface {
 	ResetToday(ctx context.Context, uid int64, today string) (Allowance, error)
 	// SetBan bans uid (ban != nil) or lifts the ban (nil), returning the
 	// previous one.
-	SetBan(ctx context.Context, uid int64, ban *bot.Ban) (*bot.Ban, error)
+	SetBan(ctx context.Context, uid int64, ban *store.Ban) (*store.Ban, error)
 
-	Group(ctx context.Context, id int64) (bot.ChatInfo, error)
+	Group(ctx context.Context, id int64) (store.ChatInfo, error)
 	SetGroupBlocked(ctx context.Context, id int64, blocked bool) error
 	MarkGroupLeft(ctx context.Context, id int64) error
-	SetGroupSettings(ctx context.Context, id int64, gs bot.GroupSettings) error
+	SetGroupSettings(ctx context.Context, id int64, gs store.GroupSettings) error
 
 	Voices(ctx context.Context, q VoiceQuery) ([]VoiceRow, int, error)
 	// QueueDelete asks the bot to delete a resource. created is false when
@@ -87,7 +87,7 @@ type Actions interface {
 // existing applies fn to an existing user's settings, under the same
 // per-user lock the bot uses, so nothing the bot writes at the same moment
 // is lost.
-func (p *PGStore) existing(uid int64, fn func(*bot.Settings)) error {
+func (p *PGStore) existing(uid int64, fn func(*store.Settings)) error {
 	if !p.settings.Known(uid) {
 		return ErrNotFound
 	}
@@ -97,7 +97,7 @@ func (p *PGStore) existing(uid int64, fn func(*bot.Settings)) error {
 
 func (p *PGStore) GiveBonus(_ context.Context, uid int64, amount int) (int, int, error) {
 	var before, after int
-	err := p.existing(uid, func(v *bot.Settings) {
+	err := p.existing(uid, func(v *store.Settings) {
 		before = v.Bonus
 		v.Bonus += amount
 		after = v.Bonus
@@ -107,7 +107,7 @@ func (p *PGStore) GiveBonus(_ context.Context, uid int64, amount int) (int, int,
 
 func (p *PGStore) ResetToday(_ context.Context, uid int64, today string) (Allowance, error) {
 	var was Allowance
-	err := p.existing(uid, func(v *bot.Settings) {
+	err := p.existing(uid, func(v *store.Settings) {
 		if v.UsageDay != today {
 			was = Allowance{}
 			return
@@ -118,9 +118,9 @@ func (p *PGStore) ResetToday(_ context.Context, uid int64, today string) (Allowa
 	return was, err
 }
 
-func (p *PGStore) SetBan(_ context.Context, uid int64, ban *bot.Ban) (*bot.Ban, error) {
-	var was *bot.Ban
-	err := p.existing(uid, func(v *bot.Settings) {
+func (p *PGStore) SetBan(_ context.Context, uid int64, ban *store.Ban) (*store.Ban, error) {
+	var was *store.Ban
+	err := p.existing(uid, func(v *store.Settings) {
 		was, v.Ban = v.Ban, ban
 	})
 	return was, err
@@ -128,16 +128,16 @@ func (p *PGStore) SetBan(_ context.Context, uid int64, ban *bot.Ban) (*bot.Ban, 
 
 // ---------------------------------------------------------------- groups
 
-func (p *PGStore) Group(ctx context.Context, id int64) (bot.ChatInfo, error) {
+func (p *PGStore) Group(ctx context.Context, id int64) (store.ChatInfo, error) {
 	if id == 0 {
-		return bot.ChatInfo{}, ErrNotFound // row 0 is the all-groups total
+		return store.ChatInfo{}, ErrNotFound // row 0 is the all-groups total
 	}
 	c, ok, err := p.db.Chats().Get(ctx, id)
 	if err != nil {
-		return bot.ChatInfo{}, err
+		return store.ChatInfo{}, err
 	}
 	if !ok {
-		return bot.ChatInfo{}, ErrNotFound
+		return store.ChatInfo{}, ErrNotFound
 	}
 	return c, nil
 }
@@ -147,10 +147,10 @@ func (p *PGStore) SetGroupBlocked(ctx context.Context, id int64, blocked bool) e
 }
 
 func (p *PGStore) MarkGroupLeft(ctx context.Context, id int64) error {
-	return p.db.Chats().Upsert(ctx, bot.ChatInfo{ID: id, Status: "left"})
+	return p.db.Chats().Upsert(ctx, store.ChatInfo{ID: id, Status: "left"})
 }
 
-func (p *PGStore) SetGroupSettings(ctx context.Context, id int64, gs bot.GroupSettings) error {
+func (p *PGStore) SetGroupSettings(ctx context.Context, id int64, gs store.GroupSettings) error {
 	return p.db.Chats().SetSettings(ctx, id, gs)
 }
 

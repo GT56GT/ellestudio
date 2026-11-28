@@ -13,7 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"ellestudio/internal/bot"
+	"ellestudio/internal/store"
 )
 
 // Session is one signed-in browser or Telegram app.
@@ -58,16 +58,16 @@ type Day struct {
 
 // Overview is the dashboard.
 type Overview struct {
-	Bot         *bot.Status `json:"bot"` // nil: the bot has never reported
-	BotOnline   bool        `json:"bot_online"`
-	StudioChars int         `json:"studio_chars"` // used today, everyone together
-	StudioSecs  int         `json:"studio_secs"`
-	GroupsChars int         `json:"groups_chars"` // used today in all groups
-	Days        []Day       `json:"days"`         // oldest first
-	WeekActive  int         `json:"week_active"`
-	Users       int         `json:"users"`
-	Joined      int         `json:"joined"`
-	Groups      int         `json:"groups"`
+	Bot         *store.Status `json:"bot"` // nil: the bot has never reported
+	BotOnline   bool          `json:"bot_online"`
+	StudioChars int           `json:"studio_chars"` // used today, everyone together
+	StudioSecs  int           `json:"studio_secs"`
+	GroupsChars int           `json:"groups_chars"` // used today in all groups
+	Days        []Day         `json:"days"`         // oldest first
+	WeekActive  int           `json:"week_active"`
+	Users       int           `json:"users"`
+	Joined      int           `json:"joined"`
+	Groups      int           `json:"groups"`
 }
 
 // UserRow is one user in the users list.
@@ -90,7 +90,7 @@ type UserRow struct {
 type UserDetail struct {
 	UserRow
 	ReferredBy int64         `json:"referred_by"`
-	Ban        *bot.Ban      `json:"ban,omitempty"`
+	Ban        *store.Ban    `json:"ban,omitempty"`
 	Language   string        `json:"language"`
 	Model      string        `json:"model"`
 	Emotion    string        `json:"emotion"`
@@ -145,7 +145,7 @@ type Store interface {
 	AuditLog(ctx context.Context, before int64, limit int) ([]AuditEntry, error)
 
 	// BotStatus is the latest heartbeat (nil if none) and whether it is recent.
-	BotStatus(ctx context.Context, now time.Time) (*bot.Status, bool, error)
+	BotStatus(ctx context.Context, now time.Time) (*store.Status, bool, error)
 	Overview(ctx context.Context, now time.Time) (Overview, error)
 	Users(ctx context.Context, q UserQuery, today string) ([]UserRow, int, error)
 	User(ctx context.Context, id int64, today string) (UserDetail, bool, error)
@@ -162,14 +162,14 @@ const botOnlineWithin = time.Minute
 
 // PGStore is the Store on the bot's Postgres database.
 type PGStore struct {
-	db       *bot.DB
-	settings *bot.Store // the bot's own settings store, for user changes
+	db       *store.DB
+	settings *store.SettingsStore // the bot's own settings store, for user changes
 }
 
-// NewPGStore uses db (opened, and migrated, with bot.OpenDatabase) and
+// NewPGStore uses db (opened, and migrated, with store.OpenDatabase) and
 // settings (db.SettingsStore), so user changes take the same per-user locks
 // as the bot.
-func NewPGStore(db *bot.DB, settings *bot.Store) *PGStore { return &PGStore{db, settings} }
+func NewPGStore(db *store.DB, settings *store.SettingsStore) *PGStore { return &PGStore{db, settings} }
 
 func (p *PGStore) CreateSession(ctx context.Context, hash []byte, s Session) error {
 	_, err := p.db.Pool().Exec(ctx, `INSERT INTO ellie_admin_sessions
@@ -277,8 +277,8 @@ func (p *PGStore) AuditLog(ctx context.Context, before int64, limit int) ([]Audi
 	return out, nil
 }
 
-func (p *PGStore) BotStatus(ctx context.Context, now time.Time) (*bot.Status, bool, error) {
-	st, ok, err := bot.LatestStatus(ctx, p.db.Pool())
+func (p *PGStore) BotStatus(ctx context.Context, now time.Time) (*store.Status, bool, error) {
+	st, ok, err := store.LatestStatus(ctx, p.db.Pool())
 	if err != nil || !ok {
 		return nil, false, err
 	}
@@ -312,7 +312,7 @@ func (p *PGStore) Overview(ctx context.Context, now time.Time) (Overview, error)
 	if err != nil {
 		return o, err
 	}
-	byDay := map[string]bot.DayStats{}
+	byDay := map[string]store.DayStats{}
 	for _, d := range days {
 		byDay[d.Day] = d
 	}
@@ -337,7 +337,7 @@ var userOrder = map[string]string{
 	"bonus":    "COALESCE((settings->>'bonus')::int, 0) DESC, updated_at DESC",
 }
 
-func userRow(id int64, v bot.Settings, updated time.Time, today string) UserRow {
+func userRow(id int64, v store.Settings, updated time.Time, today string) UserRow {
 	r := UserRow{
 		ID: id, Joined: v.Joined, JoinedAt: v.JoinedAt, Voice: v.VoiceName, Readings: v.Readings,
 		SpokenChars: v.SpokenChars, Bonus: v.Bonus, Referrals: v.Referrals, UpdatedAt: updated,
@@ -368,7 +368,7 @@ func (p *PGStore) Users(ctx context.Context, q UserQuery, today string) ([]UserR
 	var raw []byte
 	var updated time.Time
 	_, err = pgx.ForEachRow(rows, []any{&id, &raw, &updated, &total}, func() error {
-		var v bot.Settings
+		var v store.Settings
 		if err := json.Unmarshal(raw, &v); err != nil {
 			return fmt.Errorf("user %d: %w", id, err)
 		}
@@ -392,7 +392,7 @@ func (p *PGStore) User(ctx context.Context, id int64, today string) (UserDetail,
 	if err != nil {
 		return UserDetail{}, false, fmt.Errorf("admin: user: %w", err)
 	}
-	var v bot.Settings
+	var v store.Settings
 	if err := json.Unmarshal(raw, &v); err != nil {
 		return UserDetail{}, false, fmt.Errorf("admin: user %d: %w", id, err)
 	}

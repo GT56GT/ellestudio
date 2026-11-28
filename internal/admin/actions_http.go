@@ -15,7 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"ellestudio/internal/bot"
+	"ellestudio/internal/store"
 )
 
 // Messenger is how the panel reaches Telegram: to tell a user about a
@@ -34,11 +34,11 @@ const (
 
 // actionIn is the body of every change.
 type actionIn struct {
-	Reason   string             `json:"reason"`
-	Amount   int                `json:"amount"`
-	Days     int                `json:"days"`
-	Notify   bool               `json:"notify"`
-	Settings *bot.GroupSettings `json:"settings"`
+	Reason   string               `json:"reason"`
+	Amount   int                  `json:"amount"`
+	Days     int                  `json:"days"`
+	Notify   bool                 `json:"notify"`
+	Settings *store.GroupSettings `json:"settings"`
 }
 
 // readAction decodes the body and checks the reason, which every change needs.
@@ -155,7 +155,7 @@ func (s *Server) banUser(w http.ResponseWriter, r *http.Request, a authCtx) {
 		return
 	}
 	now := s.now().UTC()
-	ban := &bot.Ban{Reason: in.Reason, By: a.session.AdminID, At: now}
+	ban := &store.Ban{Reason: in.Reason, By: a.session.AdminID, At: now}
 	if in.Days > 0 {
 		until := now.Add(time.Duration(in.Days) * 24 * time.Hour)
 		ban.Until = &until

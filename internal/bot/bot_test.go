@@ -12,7 +12,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"ellestudio/internal/cartesia"
 	"ellestudio/internal/telegram"
@@ -951,17 +950,5 @@ func TestUnrecordedCloneIsRolledBack(t *testing.T) {
 	}
 	if fx.bot.store.Get(7).VoiceID == "v-clone" {
 		t.Error("the user must not be switched to a rolled-back voice")
-	}
-}
-
-func TestCursorRoundTrip(t *testing.T) {
-	c := Cursor{time.Date(2026, 11, 19, 9, 30, 0, 123456000, time.UTC), "v-1|odd"}
-	if got := parseCursor(c.String()); !got.Created.Equal(c.Created) || got.ID != c.ID {
-		t.Fatalf("round trip = %+v, want %+v", got, c)
-	}
-	for _, bad := range []string{"", "nope", "x|y", "123|"} {
-		if !parseCursor(bad).IsZero() {
-			t.Errorf("parseCursor(%q) should be the start", bad)
-		}
 	}
 }

@@ -19,7 +19,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
-	"ellestudio/internal/bot"
+	"ellestudio/internal/store"
 )
 
 // ErrBusy means another broadcast is already queued or sending.
@@ -42,8 +42,8 @@ type BroadcastRow struct {
 
 // Live is the control-room side of the Store.
 type Live interface {
-	Overrides(ctx context.Context) (bot.LimitOverrides, error)
-	SaveOverrides(ctx context.Context, o bot.LimitOverrides, by int64) (before bot.LimitOverrides, err error)
+	Overrides(ctx context.Context) (store.LimitOverrides, error)
+	SaveOverrides(ctx context.Context, o store.LimitOverrides, by int64) (before store.LimitOverrides, err error)
 	Broadcasts(ctx context.Context, limit int) ([]BroadcastRow, error)
 	AudienceSize(ctx context.Context, audience string) (int, error)
 	CreateBroadcast(ctx context.Context, text, audience string, by int64) (int64, error)
@@ -52,12 +52,12 @@ type Live interface {
 
 // ---------------------------------------------------------------- Postgres
 
-func (p *PGStore) Overrides(ctx context.Context) (bot.LimitOverrides, error) {
-	return bot.LoadOverrides(ctx, p.db.Pool())
+func (p *PGStore) Overrides(ctx context.Context) (store.LimitOverrides, error) {
+	return store.LoadOverrides(ctx, p.db.Pool())
 }
 
-func (p *PGStore) SaveOverrides(ctx context.Context, o bot.LimitOverrides, by int64) (bot.LimitOverrides, error) {
-	return bot.SaveOverrides(ctx, p.db.Pool(), o, by)
+func (p *PGStore) SaveOverrides(ctx context.Context, o store.LimitOverrides, by int64) (store.LimitOverrides, error) {
+	return store.SaveOverrides(ctx, p.db.Pool(), o, by)
 }
 
 func (p *PGStore) Broadcasts(ctx context.Context, limit int) ([]BroadcastRow, error) {
@@ -74,7 +74,7 @@ func (p *PGStore) Broadcasts(ctx context.Context, limit int) ([]BroadcastRow, er
 }
 
 func (p *PGStore) AudienceSize(ctx context.Context, audience string) (int, error) {
-	return bot.CountRecipients(ctx, p.db.Pool(), audience)
+	return store.CountRecipients(ctx, p.db.Pool(), audience)
 }
 
 func (p *PGStore) CreateBroadcast(ctx context.Context, text, audience string, by int64) (int64, error) {
@@ -122,8 +122,8 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request, _ authCtx) {
 
 // limitsIn is the body of a limits change.
 type limitsIn struct {
-	Reason    string             `json:"reason"`
-	Overrides bot.LimitOverrides `json:"overrides"`
+	Reason    string               `json:"reason"`
+	Overrides store.LimitOverrides `json:"overrides"`
 }
 
 func (s *Server) saveSettings(w http.ResponseWriter, r *http.Request, a authCtx) {
@@ -205,7 +205,7 @@ func validBroadcast(w http.ResponseWriter, text, audience string) bool {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("Write a message of 1 to %d characters.", maxBroadcast))
 		return false
 	}
-	if audience != bot.AudienceEveryone && audience != bot.AudienceActive {
+	if audience != store.AudienceEveryone && audience != store.AudienceActive {
 		writeError(w, http.StatusBadRequest, "Choose who gets it.")
 		return false
 	}
@@ -219,7 +219,7 @@ func (s *Server) broadcasts(w http.ResponseWriter, r *http.Request, _ authCtx) {
 		return
 	}
 	sizes := map[string]int{}
-	for _, a := range []string{bot.AudienceEveryone, bot.AudienceActive} {
+	for _, a := range []string{store.AudienceEveryone, store.AudienceActive} {
 		if sizes[a], err = s.store.AudienceSize(r.Context(), a); err != nil {
 			s.fail(w, "audience", err)
 			return
@@ -236,10 +236,10 @@ func (s *Server) testBroadcast(w http.ResponseWriter, r *http.Request, a authCtx
 		writeError(w, http.StatusBadRequest, "That request wasn't understood.")
 		return
 	}
-	if !validBroadcast(w, in.Text, bot.AudienceEveryone) {
+	if !validBroadcast(w, in.Text, store.AudienceEveryone) {
 		return
 	}
-	ok, msg := s.notify(r.Context(), a.session.AdminID, bot.BroadcastHTML(in.Text)+"\n\n<i>Test: only you got this.</i>")
+	ok, msg := s.notify(r.Context(), a.session.AdminID, store.BroadcastHTML(in.Text)+"\n\n<i>Test: only you got this.</i>")
 	if !ok {
 		writeError(w, http.StatusBadGateway, orDefault(msg, "Couldn't send the test.")+" Start a chat with Ellie first.")
 		return

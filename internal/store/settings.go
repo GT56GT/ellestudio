@@ -1,4 +1,4 @@
-package bot
+package store
 
 import (
 	"encoding/json"
@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// persister is where a Store keeps its data between restarts: a JSON file
+// persister is where a SettingsStore keeps its data between restarts: a JSON file
 // (the default) or Postgres (when DATABASE_URL is set, which also makes it
 // a sharedStore). save is given every user and the ones that just changed.
 type persister interface {
@@ -114,7 +114,7 @@ func overLimit(used, limit int) int {
 
 // ---------------------------------------------------------------- the store
 
-// Store keeps per-user Settings.
+// SettingsStore keeps per-user Settings.
 //
 // With a file (or nothing) behind it, every user lives in memory and the
 // file is rewritten after each change. With Postgres behind it, the database
@@ -123,7 +123,7 @@ func overLimit(used, limit int) int {
 // instances running side by side during a deploy can't overwrite each
 // other), and reads come from the database. The memory copy then only
 // stands in while the database is unreachable.
-type Store struct {
+type SettingsStore struct {
 	mu       sync.Mutex
 	backend  persister // nil = memory only
 	shared   sharedStore
@@ -171,8 +171,8 @@ func (t *userTx) put(uid int64, v Settings) {
 }
 
 // OpenStore loads path if it exists. An empty path keeps settings in memory.
-func OpenStore(path string, defaults Settings) (*Store, error) {
-	s := &Store{defaults: defaults, data: map[int64]Settings{}}
+func OpenStore(path string, defaults Settings) (*SettingsStore, error) {
+	s := &SettingsStore{defaults: defaults, data: map[int64]Settings{}}
 	if path == "" {
 		return s, nil
 	}
@@ -191,7 +191,7 @@ func OpenStore(path string, defaults Settings) (*Store, error) {
 }
 
 // Close releases the backend (the database pool, if any).
-func (s *Store) Close() error {
+func (s *SettingsStore) Close() error {
 	if s.backend == nil {
 		return nil
 	}
@@ -201,7 +201,7 @@ func (s *Store) Close() error {
 // mutate applies fn to uids' settings and persists what it changed. If the
 // shared store is unreachable it carries on from the memory copy (so the bot
 // keeps working) and returns the error.
-func (s *Store) mutate(uids []int64, fn func(*userTx)) error {
+func (s *SettingsStore) mutate(uids []int64, fn func(*userTx)) error {
 	if s.shared != nil {
 		saved, err := s.shared.mutate(uids, fn)
 		s.mu.Lock()
@@ -225,7 +225,7 @@ func (s *Store) mutate(uids []int64, fn func(*userTx)) error {
 }
 
 // applyLocked runs fn against the memory copy. Callers hold s.mu.
-func (s *Store) applyLocked(uids []int64, fn func(*userTx)) []int64 {
+func (s *SettingsStore) applyLocked(uids []int64, fn func(*userTx)) []int64 {
 	t := newUserTx()
 	for _, uid := range uids {
 		if v, ok := s.data[uid]; ok {
@@ -242,7 +242,7 @@ func (s *Store) applyLocked(uids []int64, fn func(*userTx)) []int64 {
 }
 
 // cacheLocked records what the shared store holds for uid. Callers hold s.mu.
-func (s *Store) cacheLocked(uid int64, v Settings, ok bool) {
+func (s *SettingsStore) cacheLocked(uid int64, v Settings, ok bool) {
 	if !ok {
 		delete(s.data, uid)
 		return
@@ -255,7 +255,7 @@ func (s *Store) cacheLocked(uid int64, v Settings, ok bool) {
 
 // change is mutate for one user: fn edits v (known says whether the user was
 // ever stored) and returns whether to save it.
-func (s *Store) change(uid int64, fn func(v *Settings, known bool) bool) error {
+func (s *SettingsStore) change(uid int64, fn func(v *Settings, known bool) bool) error {
 	return s.mutate([]int64{uid}, func(t *userTx) {
 		v, ok := t.get(uid)
 		if fn(&v, ok) {
@@ -265,7 +265,7 @@ func (s *Store) change(uid int64, fn func(v *Settings, known bool) bool) error {
 }
 
 // lookup returns uid's stored settings, and false if there are none.
-func (s *Store) lookup(uid int64) (Settings, bool) {
+func (s *SettingsStore) lookup(uid int64) (Settings, bool) {
 	if s.shared != nil {
 		if v, ok, err := s.shared.load(uid); err == nil {
 			s.mu.Lock()
@@ -287,7 +287,7 @@ func (s *Store) lookup(uid int64) (Settings, bool) {
 // daily limit are paid from bonus characters while they last. It returns
 // whether the spend happened and the usage afterwards (or as it stands, if
 // refused).
-func (s *Store) Spend(uid int64, day string, chars, secs, charLimit, secLimit int) (bool, Usage, error) {
+func (s *SettingsStore) Spend(uid int64, day string, chars, secs, charLimit, secLimit int) (bool, Usage, error) {
 	var spent bool
 	var u Usage
 	err := s.change(uid, func(v *Settings, _ bool) bool {
@@ -316,7 +316,7 @@ func (s *Store) Spend(uid int64, day string, chars, secs, charLimit, secLimit in
 // Refund gives back an earlier Spend (for example when generation failed),
 // returning bonus characters that Spend took. charLimit must be the limit
 // the Spend used.
-func (s *Store) Refund(uid int64, day string, chars, secs, charLimit int) {
+func (s *SettingsStore) Refund(uid int64, day string, chars, secs, charLimit int) {
 	_ = s.change(uid, func(v *Settings, known bool) bool {
 		if !known || v.UsageDay != day {
 			return false
@@ -330,7 +330,7 @@ func (s *Store) Refund(uid int64, day string, chars, secs, charLimit int) {
 }
 
 // Spoke adds a finished reading to the user's lifetime totals.
-func (s *Store) Spoke(uid int64, chars int) {
+func (s *SettingsStore) Spoke(uid int64, chars int) {
 	_ = s.change(uid, func(v *Settings, _ bool) bool {
 		v.Readings++
 		v.SpokenChars += chars
@@ -339,7 +339,7 @@ func (s *Store) Spoke(uid int64, chars int) {
 }
 
 // MarkTip records that a tip was shown on day; false means one already was.
-func (s *Store) MarkTip(uid int64, day string) bool {
+func (s *SettingsStore) MarkTip(uid int64, day string) bool {
 	var marked bool
 	_ = s.change(uid, func(v *Settings, _ bool) bool {
 		marked = v.TipDay != day
@@ -354,7 +354,7 @@ func (s *Store) MarkTip(uid int64, day string) bool {
 // per UTC day. It does nothing (false, false) unless invitee is new to the
 // studio, inviter has joined it, and they differ. rewarded reports whether
 // the inviter got the bonus.
-func (s *Store) Referral(inviter, invitee int64, day string, bonus, dailyCap int) (applied, rewarded bool, err error) {
+func (s *SettingsStore) Referral(inviter, invitee int64, day string, bonus, dailyCap int) (applied, rewarded bool, err error) {
 	err = s.mutate([]int64{inviter, invitee}, func(t *userTx) {
 		applied, rewarded = false, false
 		from, ok := t.get(inviter)
@@ -379,7 +379,7 @@ func (s *Store) Referral(inviter, invitee int64, day string, bonus, dailyCap int
 
 // SpendMake records one new voice for day unless that would pass limit
 // (0 = unlimited). It returns whether it was recorded and today's usage.
-func (s *Store) SpendMake(uid int64, day string, limit int) (bool, Usage, error) {
+func (s *SettingsStore) SpendMake(uid int64, day string, limit int) (bool, Usage, error) {
 	var spent bool
 	var u Usage
 	err := s.change(uid, func(v *Settings, _ bool) bool {
@@ -400,7 +400,7 @@ func (s *Store) SpendMake(uid int64, day string, limit int) (bool, Usage, error)
 
 // SpendDict records one new dictionary for day unless that would pass limit
 // (0 = unlimited). It returns whether it was recorded and today's count.
-func (s *Store) SpendDict(uid int64, day string, limit int) (bool, int, error) {
+func (s *SettingsStore) SpendDict(uid int64, day string, limit int) (bool, int, error) {
 	var spent bool
 	var n int
 	err := s.change(uid, func(v *Settings, _ bool) bool {
@@ -421,7 +421,7 @@ func (s *Store) SpendDict(uid int64, day string, limit int) (bool, int, error) {
 }
 
 // RefundDict gives back a SpendDict (the creation failed).
-func (s *Store) RefundDict(uid int64, day string) {
+func (s *SettingsStore) RefundDict(uid int64, day string) {
 	_ = s.change(uid, func(v *Settings, known bool) bool {
 		if !known || v.UsageDay != day || v.UsedDicts == 0 {
 			return false
@@ -432,7 +432,7 @@ func (s *Store) RefundDict(uid int64, day string) {
 }
 
 // RefundMake gives back a SpendMake (the creation failed).
-func (s *Store) RefundMake(uid int64, day string) {
+func (s *SettingsStore) RefundMake(uid int64, day string) {
 	_ = s.change(uid, func(v *Settings, known bool) bool {
 		if !known || v.UsageDay != day || v.UsedMakes == 0 {
 			return false
@@ -443,7 +443,7 @@ func (s *Store) RefundMake(uid int64, day string) {
 }
 
 // UsageOn reports a user's usage for day.
-func (s *Store) UsageOn(uid int64, day string) Usage {
+func (s *SettingsStore) UsageOn(uid int64, day string) Usage {
 	v, _ := s.lookup(uid)
 	return usageToday(v, day)
 }
@@ -451,32 +451,32 @@ func (s *Store) UsageOn(uid int64, day string) Usage {
 // ---------------------------------------------------------------- preferences
 
 // Defaults returns the studio-wide defaults.
-func (s *Store) Defaults() Settings {
+func (s *SettingsStore) Defaults() Settings {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.defaults
 }
 
 // SetDefaultVoice changes the fallback voice for users who never chose one.
-func (s *Store) SetDefaultVoice(id, name string) {
+func (s *SettingsStore) SetDefaultVoice(id, name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.defaults.VoiceID, s.defaults.VoiceName = id, name
 }
 
 // Known reports whether the user has used the studio before.
-func (s *Store) Known(uid int64) bool {
+func (s *SettingsStore) Known(uid int64) bool {
 	_, ok := s.lookup(uid)
 	return ok
 }
 
 // Get returns a user's settings with defaults filled in.
-func (s *Store) Get(uid int64) Settings {
+func (s *SettingsStore) Get(uid int64) Settings {
 	v, _ := s.lookup(uid)
 	return s.withDefaults(v)
 }
 
-func (s *Store) withDefaults(v Settings) Settings {
+func (s *SettingsStore) withDefaults(v Settings) Settings {
 	d := s.Defaults()
 	if v.VoiceID == "" {
 		v.VoiceID, v.VoiceName = d.VoiceID, d.VoiceName
@@ -494,7 +494,7 @@ func (s *Store) withDefaults(v Settings) Settings {
 }
 
 // Update applies fn to a user's stored settings and persists the result.
-func (s *Store) Update(uid int64, fn func(*Settings)) (Settings, error) {
+func (s *SettingsStore) Update(uid int64, fn func(*Settings)) (Settings, error) {
 	var out Settings
 	err := s.change(uid, func(v *Settings, _ bool) bool {
 		fn(v)
@@ -506,7 +506,7 @@ func (s *Store) Update(uid int64, fn func(*Settings)) (Settings, error) {
 
 // Reset forgets a user's settings but keeps today's usage, so resetting can't
 // be used to refill a daily allowance.
-func (s *Store) Reset(uid int64) error {
+func (s *SettingsStore) Reset(uid int64) error {
 	return s.change(uid, func(v *Settings, known bool) bool {
 		if !known {
 			return false
@@ -522,7 +522,7 @@ func (s *Store) Reset(uid int64) error {
 
 // Join marks uid as a user of the private chat as of day. It writes only the
 // first time.
-func (s *Store) Join(uid int64, day string) error {
+func (s *SettingsStore) Join(uid int64, day string) error {
 	return s.change(uid, func(v *Settings, _ bool) bool {
 		if v.Joined {
 			return false
@@ -533,10 +533,10 @@ func (s *Store) Join(uid int64, day string) error {
 }
 
 // ForgetVoice clears a voice from every user who selected it (after delete).
-func (s *Store) ForgetVoice(id string) error { return s.forget(voiceRef, id) }
+func (s *SettingsStore) ForgetVoice(id string) error { return s.forget(voiceRef, id) }
 
 // ForgetDict clears a pronunciation dictionary from every user who chose it.
-func (s *Store) ForgetDict(id string) error { return s.forget(dictRef, id) }
+func (s *SettingsStore) ForgetDict(id string) error { return s.forget(dictRef, id) }
 
 // ref names a settings field pair (an ID and its display name) that points
 // at a Cartesia resource.
@@ -551,7 +551,7 @@ var (
 	dictRef  = ref{"dict_id", "dict_name", func(v *Settings) *string { return &v.DictID }, func(v *Settings) *string { return &v.DictName }}
 )
 
-func (s *Store) forget(r ref, id string) error {
+func (s *SettingsStore) forget(r ref, id string) error {
 	if s.shared != nil {
 		uids, err := s.shared.forget(r.idKey, r.nameKey, id)
 		s.mu.Lock()
@@ -573,7 +573,7 @@ func (s *Store) forget(r ref, id string) error {
 	return s.backend.save(s.data, changed)
 }
 
-func (s *Store) forgetLocked(r ref, id string) []int64 {
+func (s *SettingsStore) forgetLocked(r ref, id string) []int64 {
 	var changed []int64
 	for uid, v := range s.data {
 		if *r.id(&v) == id {
@@ -586,7 +586,7 @@ func (s *Store) forgetLocked(r ref, id string) []int64 {
 }
 
 // Banned returns every user with a ban on record (active or expired).
-func (s *Store) Banned() (map[int64]Ban, error) {
+func (s *SettingsStore) Banned() (map[int64]Ban, error) {
 	if s.shared != nil {
 		return s.shared.banned()
 	}

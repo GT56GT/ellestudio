@@ -251,6 +251,7 @@ cmd/ellie-admin/      the admin panel's entry point
 internal/cartesia/    Cartesia REST client (TTS, STT, voices, accents, models, infill, watermark, dictionaries, usage)
 internal/telegram/    minimal Bot API client (long polling, messages, keyboards, uploads, downloads)
 internal/bot/         Ellie Studio commands, buttons, per-user settings (file or Postgres)
+internal/store/       persistence: Postgres and file backends, migrations, data types
 internal/admin/       admin panel: Telegram sign-in, sessions, audit log, JSON API
 admin-ui/             admin panel UI (React + TypeScript + Vite), embedded into the panel binary
 docs/                 scraped Cartesia API reference
