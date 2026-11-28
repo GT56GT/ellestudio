@@ -102,7 +102,7 @@ func TestPGReadViews(t *testing.T) {
 	if _, _, err := store.Spend(uid, today, 120, 0, 0, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := bot.NewChats(db).Upsert(ctx, bot.ChatInfo{ID: gid, Type: "supergroup", Title: "Test group", Status: "member"}); err != nil {
+	if err := db.Chats().Upsert(ctx, bot.ChatInfo{ID: gid, Type: "supergroup", Title: "Test group", Status: "member"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -188,7 +188,7 @@ func TestPGActionsEndToEnd(t *testing.T) {
 		t.Fatalf("the bot doesn't see the ban: %v %v", bans[uid], err)
 	}
 
-	if err := bot.NewChats(db).Upsert(ctx, bot.ChatInfo{ID: gid, Title: "Test group", Status: "member"}); err != nil {
+	if err := db.Chats().Upsert(ctx, bot.ChatInfo{ID: gid, Title: "Test group", Status: "member"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.SetGroupBlocked(ctx, gid, true); err != nil {
@@ -202,7 +202,7 @@ func TestPGActionsEndToEnd(t *testing.T) {
 	}
 
 	// The panel queues a delete; the bot claims, does and finishes it.
-	if err := bot.NewOwners(db).Claim(ctx, "voice", voice, uid); err != nil {
+	if err := db.Owners().Claim(ctx, "voice", voice, uid); err != nil {
 		t.Fatal(err)
 	}
 	q := bot.NewAdminQueue(db)
@@ -220,7 +220,7 @@ func TestPGActionsEndToEnd(t *testing.T) {
 	if err != nil || !ok || claimed.ID != job || claimed.Kind != bot.JobDeleteVoice {
 		t.Fatalf("claim: %+v %v %v", claimed, ok, err)
 	}
-	if err := bot.NewOwners(db).Release(ctx, "voice", voice); err != nil {
+	if err := db.Owners().Release(ctx, "voice", voice); err != nil {
 		t.Fatal(err)
 	}
 	if err := q.Finish(ctx, job, nil); err != nil {

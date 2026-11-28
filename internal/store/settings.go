@@ -611,12 +611,12 @@ func (f fileStore) save(all map[int64]Settings, _ []int64) error {
 	if err != nil {
 		return err
 	}
-	return WriteFileAtomic(f.path, raw)
+	return writeFileAtomic(f.path, raw)
 }
 
-// WriteFileAtomic replaces path with raw (temp file + rename) so a crash never
+// writeFileAtomic replaces path with raw (temp file + rename) so a crash never
 // leaves a half-written file, and keeps it readable by the bot only.
-func WriteFileAtomic(path string, raw []byte) error {
+func writeFileAtomic(path string, raw []byte) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("save %s: %w", filepath.Base(path), err)

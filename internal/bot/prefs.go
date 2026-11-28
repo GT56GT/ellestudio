@@ -530,7 +530,7 @@ func (b *Bot) adminScreen(ctx context.Context) screen {
 	sb.WriteString(field("🔑", "Cartesia admin key", key))
 	sb.WriteString(field("👥", "Who can add Ellie to groups", orDefault(b.cfg.GroupMode, GroupsOpen)))
 	if total, _, err := b.chats.Get(ctx, allGroups); err == nil {
-		c, s := total.usageOn(today())
+		c, s := total.UsageOn(today())
 		sb.WriteString(field("📊", "All groups today", fmtInt(c)+" characters · "+fmtMinutes(s)+" transcribed"))
 	} else {
 		b.log.Warn("group totals unavailable", "err", err)

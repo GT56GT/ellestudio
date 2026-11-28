@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -50,4 +51,14 @@ func testDB(t *testing.T) *DB {
 	}
 	t.Cleanup(db.Close)
 	return db
+}
+
+func TestBadDatabaseURLHidesPassword(t *testing.T) {
+	_, err := OpenDatabase(context.Background(), "postgres://u:s3cret@host:notaport/db")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if got := err.Error(); strings.Contains(got, "s3cret") {
+		t.Errorf("password leaked: %s", got)
+	}
 }

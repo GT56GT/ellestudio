@@ -1,11 +1,9 @@
-package bot
+package store
 
 import (
 	"context"
 	"testing"
 	"time"
-
-	"ellestudio/internal/store/storetest"
 )
 
 // exerciseMetrics runs the same checks against any Metrics. Events are
@@ -15,15 +13,15 @@ func exerciseMetrics(t *testing.T, m Metrics, base time.Time) {
 	ctx := context.Background()
 	day1, day2 := base, base.Add(24*time.Hour)
 	for _, e := range []Event{
-		{At: day1, User: -1, Kind: evStart, Source: srcGuest},
-		{At: day1, User: -1, Kind: evReading, Source: "private", N: 10},
-		{At: day1.Add(time.Minute), User: -1, Kind: evReading, Source: "guest", N: 5},
-		{At: day1, User: -2, Kind: evStart, Source: srcReferral},
-		{At: day1, User: -2, Kind: evLimit, Source: "speech"},
-		{At: day1, User: -2, Kind: evLimit, Source: "speech"}, // the same user twice
-		{At: day1, User: -3, Kind: evGuestInvite},             // shown an invite, never used Ellie
-		{At: day2, User: -3, Kind: evStart, Source: srcGroup},
-		{At: day2, User: -3, Kind: evTranscribe, N: 30},
+		{At: day1, User: -1, Kind: EvStart, Source: SrcGuest},
+		{At: day1, User: -1, Kind: EvReading, Source: "private", N: 10},
+		{At: day1.Add(time.Minute), User: -1, Kind: EvReading, Source: "guest", N: 5},
+		{At: day1, User: -2, Kind: EvStart, Source: SrcReferral},
+		{At: day1, User: -2, Kind: EvLimit, Source: "speech"},
+		{At: day1, User: -2, Kind: EvLimit, Source: "speech"}, // the same user twice
+		{At: day1, User: -3, Kind: EvGuestInvite},             // shown an invite, never used Ellie
+		{At: day2, User: -3, Kind: EvStart, Source: SrcGroup},
+		{At: day2, User: -3, Kind: EvTranscribe, N: 30},
 	} {
 		if err := m.Record(ctx, e); err != nil {
 			t.Fatal(err)
@@ -64,11 +62,11 @@ func exerciseMetrics(t *testing.T, m Metrics, base time.Time) {
 }
 
 func TestMemMetrics(t *testing.T) {
-	exerciseMetrics(t, newMemMetrics(), time.Date(2001, 1, 2, 10, 0, 0, 0, time.UTC))
+	exerciseMetrics(t, NewMemMetrics(), time.Date(2001, 1, 2, 10, 0, 0, 0, time.UTC))
 }
 
 func TestPostgresMetrics(t *testing.T) {
-	db := storetest.TestDB(t)
+	db := testDB(t)
 	ctx := context.Background()
 	// Test events live in January 2001 with negative user IDs: no real
 	// event can be there, and they are all removed afterwards.
@@ -77,14 +75,14 @@ func TestPostgresMetrics(t *testing.T) {
 	}
 	cleanup()
 	t.Cleanup(cleanup)
-	exerciseMetrics(t, NewMetrics(db), time.Date(2001, 1, 2, 10, 0, 0, 0, time.UTC))
+	exerciseMetrics(t, db.Metrics(), time.Date(2001, 1, 2, 10, 0, 0, 0, time.UTC))
 }
 
 func TestMemMetricsKeepsTheNewest(t *testing.T) {
-	m := newMemMetrics()
+	m := NewMemMetrics().(*memMetrics)
 	ctx := context.Background()
 	for i := range memMetricsCap + 5 {
-		_ = m.Record(ctx, Event{At: time.Unix(int64(i), 0), User: int64(i), Kind: evReading})
+		_ = m.Record(ctx, Event{At: time.Unix(int64(i), 0), User: int64(i), Kind: EvReading})
 	}
 	if len(m.events) > memMetricsCap {
 		t.Fatalf("kept %d events, cap %d", len(m.events), memMetricsCap)

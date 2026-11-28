@@ -462,7 +462,7 @@ func (b *Bot) groupMenu(ctx context.Context, chat, uid int64, view string) scree
 		"\n" + b.allowanceLines(uid)
 	if info, _, err := b.chats.Get(ctx, chat); err == nil {
 		if c := effCap(b.lim().GroupLimits.Chars, info.Settings.DailyChars); c > 0 {
-			used, _ := info.usageOn(today())
+			used, _ := info.UsageOn(today())
 			text += field("👥", "Group allowance left today", fmtInt(max(0, c-used))+" of "+fmtInt(c)+" characters")
 		}
 	}
@@ -538,7 +538,7 @@ func (b *Bot) groupSettingsScreen(ctx context.Context, chat int64) screen {
 	if gs.AdminsOnly {
 		who = "admins only"
 	}
-	used, _ := info.usageOn(today())
+	used, _ := info.UsageOn(today())
 	text := header("⚙️", "Group settings", html.EscapeString(info.Title)) +
 		"Only this group's admins can see and change these.\n\n" +
 		field("⏯", "Ellie here", status) +

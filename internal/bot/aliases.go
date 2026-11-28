@@ -18,7 +18,72 @@ type Store = store.SettingsStore
 
 var OpenStore = store.OpenStore
 
-func overLimit(used, limit int) int { return store.OverLimit(used, limit) }
+// Ownership registry.
+type (
+	Owners = store.Owners
+	Owned  = store.Owned
+	Cursor = store.Cursor
+)
 
-// writeFileAtomic is shared by the file-backed registries still in this package.
-var writeFileAtomic = store.WriteFileAtomic
+const (
+	kindVoice = store.KindVoice
+	kindDict  = store.KindDict
+)
+
+var (
+	errAlreadyOwned = store.ErrAlreadyOwned
+	OpenFileOwners  = store.OpenFileOwners
+	cursorOf        = store.CursorOf
+	parseCursor     = store.ParseCursor
+)
+
+// Group registry.
+type (
+	Chats         = store.Chats
+	ChatInfo      = store.ChatInfo
+	GroupSettings = store.GroupSettings
+	GroupLimits   = store.GroupLimits
+)
+
+const (
+	allGroups  = store.AllGroups
+	chatMember = store.ChatMember
+	chatLeft   = store.ChatLeft
+)
+
+var (
+	errGroupLimit  = store.ErrGroupLimit
+	errGroupsLimit = store.ErrGroupsLimit
+	OpenFileChats  = store.OpenFileChats
+)
+
+// Usage events.
+type (
+	Metrics  = store.Metrics
+	Event    = store.Event
+	DayStats = store.DayStats
+)
+
+const (
+	evStart       = store.EvStart
+	evReading     = store.EvReading
+	evTranscribe  = store.EvTranscribe
+	evLimit       = store.EvLimit
+	evGuestInvite = store.EvGuestInvite
+
+	srcDirect   = store.SrcDirect
+	srcGroup    = store.SrcGroup
+	srcGuest    = store.SrcGuest
+	srcReferral = store.SrcReferral
+	srcShared   = store.SrcShared
+)
+
+var newMemMetrics = store.NewMemMetrics
+
+// Studio-wide budget.
+type Budget = store.Budget
+
+var (
+	errBudgetUnknown = store.ErrBudgetUnknown
+	newMemBudget     = store.NewMemBudget
+)

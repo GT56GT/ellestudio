@@ -646,7 +646,7 @@ func (b *Bot) groupsScreen(ctx context.Context) screen {
 	if err != nil {
 		return errorScreen(storageError{err})
 	}
-	tc, ts := total.usageOn(day)
+	tc, ts := total.UsageOn(day)
 	var sb strings.Builder
 	sb.WriteString(header("👥", "Groups today", "mode: "+orDefault(b.cfg.GroupMode, GroupsOpen)))
 	l := b.lim().GroupLimits

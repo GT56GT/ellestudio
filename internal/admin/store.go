@@ -294,7 +294,7 @@ func (p *PGStore) Overview(ctx context.Context, now time.Time) (Overview, error)
 	if o.Bot, o.BotOnline, err = p.BotStatus(ctx, now); err != nil {
 		return o, err
 	}
-	if o.StudioChars, o.StudioSecs, err = bot.NewBudget(p.db).Used(ctx, today); err != nil {
+	if o.StudioChars, o.StudioSecs, err = p.db.Budget().Used(ctx, today); err != nil {
 		return o, err
 	}
 	if err := pool.QueryRow(ctx, `SELECT
@@ -306,7 +306,7 @@ func (p *PGStore) Overview(ctx context.Context, now time.Time) (Overview, error)
 		return o, fmt.Errorf("admin: counts: %w", err)
 	}
 
-	m := bot.NewMetrics(p.db)
+	m := p.db.Metrics()
 	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, -29)
 	days, err := m.Days(ctx, start)
 	if err != nil {

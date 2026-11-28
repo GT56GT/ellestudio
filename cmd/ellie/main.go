@@ -94,10 +94,10 @@ func run(log *slog.Logger) error {
 		if store, err = db.SettingsStore(ctx, defaults); err != nil {
 			return err
 		}
-		owners = bot.NewOwners(db)
-		chats = bot.NewChats(db)
-		metrics = bot.NewMetrics(db)
-		budget = bot.NewBudget(db)
+		owners = db.Owners()
+		chats = db.Chats()
+		metrics = db.Metrics()
+		budget = db.Budget()
 		reporter = bot.NewStatusReporter(db)
 		queue = bot.NewAdminQueue(db)
 		config, bcasts = bot.NewConfigSource(db), bot.NewBroadcasts(db)
