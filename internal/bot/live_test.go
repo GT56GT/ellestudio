@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"ellestudio/internal/store"
 )
 
 type fakeConfig struct{ o LimitOverrides }
@@ -117,7 +119,7 @@ func TestBroadcastReachesEveryoneWithAnOptOut(t *testing.T) {
 	fx := newFixture(t, Config{})
 	q := &memBroadcasts{users: []int64{7, 8, 9}}
 	fx.bot.SetBroadcasts(q)
-	fx.bot.sendBroadcast(context.Background(), Broadcast{ID: 1, Text: "New voices are here <3", Audience: AudienceEveryone})
+	fx.bot.sendBroadcast(context.Background(), Broadcast{ID: 1, Text: "New voices are here <3", Audience: store.AudienceEveryone})
 	if !q.finished || q.sent != 3 || q.failed != 0 {
 		t.Fatalf("finished=%v sent=%d failed=%d", q.finished, q.sent, q.failed)
 	}
@@ -143,7 +145,7 @@ func TestBroadcastStopsWhenCancelled(t *testing.T) {
 	}
 	q := &memBroadcasts{users: users, cancelled: true}
 	fx.bot.SetBroadcasts(q)
-	fx.bot.sendBroadcast(context.Background(), Broadcast{ID: 1, Text: "hi", Audience: AudienceEveryone})
+	fx.bot.sendBroadcast(context.Background(), Broadcast{ID: 1, Text: "hi", Audience: store.AudienceEveryone})
 	if q.batches != 1 || q.finished {
 		t.Fatalf("batches=%d finished=%v: a cancelled broadcast kept going", q.batches, q.finished)
 	}

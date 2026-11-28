@@ -103,9 +103,9 @@ func usageToday(v Settings, day string) Usage {
 	return Usage{Chars: v.UsedChars, Secs: v.UsedSecs, Makes: v.UsedMakes, Bonus: v.Bonus}
 }
 
-// OverLimit is how many of used characters lie past the daily limit: the
+// overLimit is how many of used characters lie past the daily limit: the
 // part paid from bonus characters. A limit of 0 means unlimited.
-func OverLimit(used, limit int) int {
+func overLimit(used, limit int) int {
 	if limit <= 0 {
 		return 0
 	}
@@ -294,7 +294,7 @@ func (s *SettingsStore) Spend(uid int64, day string, chars, secs, charLimit, sec
 		u, spent = usageToday(*v, day), false
 		fromBonus := 0
 		if chars > 0 {
-			fromBonus = OverLimit(u.Chars+chars, charLimit) - OverLimit(u.Chars, charLimit)
+			fromBonus = overLimit(u.Chars+chars, charLimit) - overLimit(u.Chars, charLimit)
 		}
 		if fromBonus > v.Bonus || (secLimit > 0 && secs > 0 && u.Secs+secs > secLimit) {
 			return false
@@ -322,7 +322,7 @@ func (s *SettingsStore) Refund(uid int64, day string, chars, secs, charLimit int
 			return false
 		}
 		after := max(0, v.UsedChars-chars)
-		v.Bonus += OverLimit(v.UsedChars, charLimit) - OverLimit(after, charLimit)
+		v.Bonus += overLimit(v.UsedChars, charLimit) - overLimit(after, charLimit)
 		v.UsedChars = after
 		v.UsedSecs = max(0, v.UsedSecs-secs)
 		return true

@@ -98,9 +98,9 @@ func run(log *slog.Logger) error {
 		chats = db.Chats()
 		metrics = db.Metrics()
 		budget = db.Budget()
-		reporter = bot.NewStatusReporter(db)
-		queue = bot.NewAdminQueue(db)
-		config, bcasts = bot.NewConfigSource(db), bot.NewBroadcasts(db)
+		reporter = db
+		queue = db.AdminQueue()
+		config, bcasts = db, db.Broadcasts()
 		log.Info("settings stored in Postgres")
 	} else {
 		dir := envOr("DATA_DIR", "data")

@@ -17,7 +17,7 @@ import (
 	"testing/fstest"
 	"time"
 
-	"ellestudio/internal/bot"
+	"ellestudio/internal/store"
 )
 
 const testToken = "123456:TEST-token"
@@ -90,22 +90,22 @@ type memStore struct {
 	sessions map[string]Session // by token hash
 	audit    []AuditEntry
 
-	users  map[int64]*bot.Settings
-	groups map[int64]bot.ChatInfo
+	users  map[int64]*store.Settings
+	groups map[int64]store.ChatInfo
 	voices map[string]VoiceRow // by kind:id
 	jobs   []JobRow
 
-	overrides  bot.LimitOverrides
+	overrides  store.LimitOverrides
 	broadcasts []BroadcastRow
 }
 
-func (m *memStore) Overrides(context.Context) (bot.LimitOverrides, error) {
+func (m *memStore) Overrides(context.Context) (store.LimitOverrides, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.overrides, nil
 }
 
-func (m *memStore) SaveOverrides(_ context.Context, o bot.LimitOverrides, _ int64) (bot.LimitOverrides, error) {
+func (m *memStore) SaveOverrides(_ context.Context, o store.LimitOverrides, _ int64) (store.LimitOverrides, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	before := m.overrides
@@ -116,7 +116,7 @@ func (m *memStore) SaveOverrides(_ context.Context, o bot.LimitOverrides, _ int6
 func (m *memStore) Broadcasts(context.Context, int) ([]BroadcastRow, error) { return m.broadcasts, nil }
 
 func (m *memStore) AudienceSize(_ context.Context, audience string) (int, error) {
-	if audience == bot.AudienceEveryone {
+	if audience == store.AudienceEveryone {
 		return 120, nil
 	}
 	return 45, nil
@@ -150,8 +150,8 @@ func (m *memStore) CancelBroadcast(_ context.Context, id int64) (bool, error) {
 func newMemStore() *memStore {
 	return &memStore{
 		sessions: map[string]Session{},
-		users:    map[int64]*bot.Settings{7: {Bonus: 100, UsageDay: testNow.Format("2006-01-02"), UsedChars: 1500}},
-		groups:   map[int64]bot.ChatInfo{-100: {ID: -100, Title: "Book Club", Status: "member"}},
+		users:    map[int64]*store.Settings{7: {Bonus: 100, UsageDay: testNow.Format("2006-01-02"), UsedChars: 1500}},
+		groups:   map[int64]store.ChatInfo{-100: {ID: -100, Title: "Book Club", Status: "member"}},
 		voices:   map[string]VoiceRow{"voice:v1": {Kind: "voice", ID: "v1", Name: "Nova", OwnerID: 7}},
 	}
 }
@@ -180,7 +180,7 @@ func (m *memStore) ResetToday(_ context.Context, uid int64, today string) (Allow
 	return was, nil
 }
 
-func (m *memStore) SetBan(_ context.Context, uid int64, b *bot.Ban) (*bot.Ban, error) {
+func (m *memStore) SetBan(_ context.Context, uid int64, b *store.Ban) (*store.Ban, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	u, ok := m.users[uid]
@@ -192,12 +192,12 @@ func (m *memStore) SetBan(_ context.Context, uid int64, b *bot.Ban) (*bot.Ban, e
 	return was, nil
 }
 
-func (m *memStore) Group(_ context.Context, id int64) (bot.ChatInfo, error) {
+func (m *memStore) Group(_ context.Context, id int64) (store.ChatInfo, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	g, ok := m.groups[id]
 	if !ok {
-		return bot.ChatInfo{}, ErrNotFound
+		return store.ChatInfo{}, ErrNotFound
 	}
 	return g, nil
 }
@@ -220,7 +220,7 @@ func (m *memStore) MarkGroupLeft(_ context.Context, id int64) error {
 	return nil
 }
 
-func (m *memStore) SetGroupSettings(_ context.Context, id int64, gs bot.GroupSettings) error {
+func (m *memStore) SetGroupSettings(_ context.Context, id int64, gs store.GroupSettings) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	g := m.groups[id]
@@ -372,7 +372,7 @@ func (m *memStore) actions() []string {
 }
 
 func (m *memStore) AuditLog(context.Context, int64, int) ([]AuditEntry, error) { return m.audit, nil }
-func (m *memStore) BotStatus(context.Context, time.Time) (*bot.Status, bool, error) {
+func (m *memStore) BotStatus(context.Context, time.Time) (*store.Status, bool, error) {
 	return nil, false, nil
 }
 func (m *memStore) Overview(context.Context, time.Time) (Overview, error) {

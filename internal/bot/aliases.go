@@ -5,8 +5,6 @@ package bot
 
 import "ellestudio/internal/store"
 
-type DB = store.DB
-
 var OpenDatabase = store.OpenDatabase
 
 const pgTimeout = store.PgTimeout
@@ -21,7 +19,6 @@ var OpenStore = store.OpenStore
 // Ownership registry.
 type (
 	Owners = store.Owners
-	Owned  = store.Owned
 	Cursor = store.Cursor
 )
 
@@ -31,10 +28,9 @@ const (
 )
 
 var (
-	errAlreadyOwned = store.ErrAlreadyOwned
-	OpenFileOwners  = store.OpenFileOwners
-	cursorOf        = store.CursorOf
-	parseCursor     = store.ParseCursor
+	OpenFileOwners = store.OpenFileOwners
+	cursorOf       = store.CursorOf
+	parseCursor    = store.ParseCursor
 )
 
 // Group registry.
@@ -87,3 +83,22 @@ var (
 	errBudgetUnknown = store.ErrBudgetUnknown
 	newMemBudget     = store.NewMemBudget
 )
+
+// Panel-facing data.
+type (
+	Status         = store.Status
+	StatusLimits   = store.StatusLimits
+	Limits         = store.Limits
+	LimitOverrides = store.LimitOverrides
+	AdminJob       = store.AdminJob
+	AdminQueue     = store.AdminQueue
+	Broadcast      = store.Broadcast
+	BroadcastQueue = store.BroadcastQueue
+)
+
+const (
+	JobDeleteVoice = store.JobDeleteVoice
+	JobDeleteDict  = store.JobDeleteDict
+)
+
+var BroadcastHTML = store.BroadcastHTML

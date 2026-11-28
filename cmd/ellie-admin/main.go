@@ -25,7 +25,7 @@ import (
 	"time"
 
 	"ellestudio/internal/admin"
-	"ellestudio/internal/bot"
+	"ellestudio/internal/store"
 	"ellestudio/internal/telegram"
 )
 
@@ -59,7 +59,7 @@ func run(log *slog.Logger) error {
 		log.Warn("PUBLIC_URL is not https: running for local development (insecure cookies)")
 	}
 
-	db, err := bot.OpenDatabase(ctx, dbURL)
+	db, err := store.OpenDatabase(ctx, dbURL)
 	if err != nil {
 		return err
 	}
@@ -77,7 +77,7 @@ func run(log *slog.Logger) error {
 	if dir := os.Getenv("ADMIN_UI_DIR"); dir != "" {
 		ui = os.DirFS(dir)
 	}
-	settings, err := db.SettingsStore(ctx, bot.Settings{})
+	settings, err := db.SettingsStore(ctx, store.Settings{})
 	if err != nil {
 		return err
 	}
